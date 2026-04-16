@@ -1,0 +1,330 @@
+"""Wav2Lip FastAPI server — in-process model loading, face-detection cache.
+
+Key optimizations vs v1:
+  1. Load Wav2Lip + RetinaFace ONCE at server startup, keep in GPU memory.
+  2. Cache face-detection bounding boxes per source video (hashed by sha256).
+     State videos never change → face detection runs exactly once per state video.
+  3. Direct function calls, no subprocess fork per request.
+  4. Configurable out_height (720 default for vertical 9:16 presentation).
+
+Expected latency (10s audio, 720p source, RTX 5090):
+  - Cold first run: 40-60s (model load + face detect)
+  - Warm + uncached source: 8-15s
+  - Warm + cached source: 3-6s  <-- this is what we want at demo time
+
+Endpoints:
+  GET  /health            -> status + gpu + warmup
+  POST /lipsync           -> form-data video+audio, returns mp4
+  POST /prewarm           -> {source_path_on_pod} -> pre-detects face + caches
+
+The state videos can be uploaded once to the pod, then prewarmed at startup
+so the very first real render hits the fast path.
+"""
+from __future__ import annotations
+import os, sys, time, uuid, tempfile, shutil, pathlib, hashlib, pickle, threading, logging, io, contextlib, subprocess
+
+# wav2lip import prep — must be before FastAPI app so module loads cleanly
+WAV2LIP_ROOT = pathlib.Path("/workspace/Wav2Lip")
+WORK_ROOT = pathlib.Path("/workspace/work")
+CACHE_ROOT = pathlib.Path("/workspace/facecache")
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+os.chdir(WAV2LIP_ROOT)
+sys.path.insert(0, str(WAV2LIP_ROOT))
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+import httpx
+import torch
+import numpy as np
+import cv2
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("w2l-v2")
+
+# ─── Import & warm up Wav2Lip ────────────────────────────────────────────────
+import audio as w2l_audio
+from models import Wav2Lip
+from batch_face import RetinaFace
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MEL_STEP = 16
+IMG_SIZE = 96
+FACE_BATCH = 512
+WAV2LIP_BATCH = 128
+
+
+def _load_ckpt(path: str):
+    ck = torch.load(path, map_location=DEVICE, weights_only=False)
+    return ck["state_dict"] if "state_dict" in ck else ck
+
+
+def _load_wav2lip(path: str):
+    model = Wav2Lip()
+    sd = _load_ckpt(path)
+    # strip 'module.' prefix if present
+    sd = {k.replace("module.", ""): v for k, v in sd.items()}
+    model.load_state_dict(sd)
+    return model.to(DEVICE).eval()
+
+
+log.info("loading wav2lip weights...")
+t0 = time.perf_counter()
+MODEL = _load_wav2lip(str(WAV2LIP_ROOT / "checkpoints" / "wav2lip_gan.pth"))
+log.info("  wav2lip loaded in %.2fs", time.perf_counter() - t0)
+
+log.info("loading retinaface...")
+t0 = time.perf_counter()
+DETECTOR = RetinaFace(gpu_id=0, model_path=str(WAV2LIP_ROOT / "checkpoints" / "mobilenet.pth"), network="mobilenet")
+log.info("  retinaface loaded in %.2fs", time.perf_counter() - t0)
+
+RENDER_LOCK = threading.Lock()   # single-GPU, serialize
+CACHE_LOCK = threading.Lock()
+FACE_CACHE: dict[str, tuple] = {}   # {sha256: (boxes, smoothed_boxes, fps, frames_count)}
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _sha256(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _get_smoothed(boxes, T=5):
+    boxes = np.array(boxes)
+    for i in range(len(boxes)):
+        if i + T > len(boxes):
+            window = boxes[len(boxes) - T:]
+        else:
+            window = boxes[i: i + T]
+        boxes[i] = np.mean(window, axis=0)
+    return boxes
+
+
+def _face_detect_cached(source_path: pathlib.Path, out_height: int):
+    """Return (frames_rgb_full, smoothed_boxes, fps). Caches bbox on disk by source sha256."""
+    key = f"{_sha256(source_path)}_h{out_height}"
+    cache_file = CACHE_ROOT / f"{key}.pkl"
+
+    vs = cv2.VideoCapture(str(source_path))
+    fps = vs.get(cv2.CAP_PROP_FPS) or 24.0
+
+    frames = []
+    while True:
+        ok, frame = vs.read()
+        if not ok:
+            break
+        aspect = frame.shape[1] / frame.shape[0]
+        frame = cv2.resize(frame, (int(out_height * aspect), out_height))
+        frames.append(frame)
+    vs.release()
+
+    with CACHE_LOCK:
+        if cache_file.exists():
+            t0 = time.perf_counter()
+            with cache_file.open("rb") as f:
+                smoothed = pickle.load(f)
+            log.info("face cache HIT  (key=%s)  load=%.3fs  frames=%d", key[:12], time.perf_counter()-t0, len(frames))
+            return frames, smoothed, fps
+
+    # cache miss: detect
+    t0 = time.perf_counter()
+    boxes = []
+    pad_top, pad_bottom, pad_left, pad_right = 0, 20, 0, 0
+
+    nb = (len(frames) + FACE_BATCH - 1) // FACE_BATCH
+    for b in range(nb):
+        batch = frames[b * FACE_BATCH:(b + 1) * FACE_BATCH]
+        faces = DETECTOR(batch)
+        for i, face_list in enumerate(faces):
+            if not face_list:
+                raise RuntimeError(f"no face detected on frame {b*FACE_BATCH+i}")
+            bbox = face_list[0][0]
+            y1, y2, x1, x2 = max(0, int(bbox[1]) - pad_top), int(bbox[3]) + pad_bottom, max(0, int(bbox[0]) - pad_left), int(bbox[2]) + pad_right
+            boxes.append([y1, y2, x1, x2])
+
+    smoothed = _get_smoothed(boxes, T=5)
+    with CACHE_LOCK:
+        with cache_file.open("wb") as f:
+            pickle.dump(smoothed, f)
+    log.info("face cache MISS (key=%s)  detect=%.2fs  frames=%d", key[:12], time.perf_counter()-t0, len(frames))
+    return frames, smoothed, fps
+
+
+def _run_lipsync(source_path: pathlib.Path, audio_path: pathlib.Path, out_path: pathlib.Path, out_height: int = 720) -> dict:
+    """In-process Wav2Lip render. Returns {total_sec, detect_sec, predict_sec, mux_sec}."""
+    t_all = time.perf_counter()
+    timings = {}
+
+    # 1) faces (cached per source)
+    t0 = time.perf_counter()
+    frames, smoothed_boxes, fps = _face_detect_cached(source_path, out_height)
+    timings["detect_sec"] = round(time.perf_counter() - t0, 3)
+
+    # 2) audio → mel
+    t0 = time.perf_counter()
+    # ensure wav
+    wav_path = audio_path
+    if audio_path.suffix.lower() != ".wav":
+        wav_tmp = out_path.with_suffix(".wav")
+        subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-ar", "16000", "-ac", "1", str(wav_tmp),
+                        "-loglevel", "error"], check=True)
+        wav_path = wav_tmp
+    wav = w2l_audio.load_wav(str(wav_path), 16000)
+    mel = w2l_audio.melspectrogram(wav)
+    if np.isnan(mel.reshape(-1)).sum() > 0:
+        raise RuntimeError("mel contains NaN")
+    mel_idx_mult = 80.0 / fps
+    mel_chunks = []
+    i = 0
+    while True:
+        s = int(i * mel_idx_mult)
+        if s + MEL_STEP > mel.shape[1]:
+            mel_chunks.append(mel[:, mel.shape[1] - MEL_STEP:])
+            break
+        mel_chunks.append(mel[:, s:s + MEL_STEP])
+        i += 1
+
+    # clip frames to mel length (if audio shorter than video, cut; if longer, loop)
+    n_mels = len(mel_chunks)
+    if n_mels <= len(frames):
+        frames = frames[:n_mels]
+    else:
+        # loop frames to match audio length
+        reps = (n_mels + len(frames) - 1) // len(frames)
+        frames = (frames * reps)[:n_mels]
+        # extend smoothed boxes too
+        sb = list(smoothed_boxes)
+        smoothed_boxes = np.array((sb * reps)[:n_mels])
+    timings["audio_sec"] = round(time.perf_counter() - t0, 3)
+
+    # 3) wav2lip predict
+    t0 = time.perf_counter()
+    temp_avi = out_path.with_suffix(".avi")
+    fw, fh = frames[0].shape[1], frames[0].shape[0]
+    writer = cv2.VideoWriter(str(temp_avi), cv2.VideoWriter_fourcc(*"DIVX"), fps, (fw, fh))
+
+    def datagen():
+        img_batch, mel_batch, frm_batch, coord_batch = [], [], [], []
+        for idx, m in enumerate(mel_chunks):
+            f = frames[idx].copy()
+            y1, y2, x1, x2 = smoothed_boxes[idx].astype(int)
+            face = f[y1:y2, x1:x2]
+            face = cv2.resize(face, (IMG_SIZE, IMG_SIZE))
+            img_batch.append(face)
+            mel_batch.append(m)
+            frm_batch.append(f)
+            coord_batch.append((y1, y2, x1, x2))
+            if len(img_batch) == WAV2LIP_BATCH:
+                yield _prep(img_batch, mel_batch), frm_batch, coord_batch
+                img_batch, mel_batch, frm_batch, coord_batch = [], [], [], []
+        if img_batch:
+            yield _prep(img_batch, mel_batch), frm_batch, coord_batch
+
+    def _prep(imgs, mels):
+        imgs = np.asarray(imgs)
+        mels = np.asarray(mels)
+        img_masked = imgs.copy()
+        img_masked[:, IMG_SIZE // 2:] = 0
+        img_concat = np.concatenate((img_masked, imgs), axis=3) / 255.0
+        mels = np.reshape(mels, [len(mels), mels.shape[1], mels.shape[2], 1])
+        img_t = torch.FloatTensor(np.transpose(img_concat, (0, 3, 1, 2))).to(DEVICE)
+        mel_t = torch.FloatTensor(np.transpose(mels, (0, 3, 1, 2))).to(DEVICE)
+        return img_t, mel_t
+
+    with torch.no_grad():
+        for (img_t, mel_t), frm_batch, coord_batch in datagen():
+            pred = MODEL(mel_t, img_t).cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+            for p, f, (y1, y2, x1, x2) in zip(pred, frm_batch, coord_batch):
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                f[y1:y2, x1:x2] = p
+                writer.write(f)
+    writer.release()
+    timings["predict_sec"] = round(time.perf_counter() - t0, 3)
+
+    # 4) mux with original audio
+    t0 = time.perf_counter()
+    subprocess.run([
+        "ffmpeg", "-y", "-i", str(temp_avi), "-i", str(audio_path),
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+        "-c:a", "aac", "-shortest", "-loglevel", "error", str(out_path),
+    ], check=True)
+    temp_avi.unlink(missing_ok=True)
+    timings["mux_sec"] = round(time.perf_counter() - t0, 3)
+
+    timings["total_sec"] = round(time.perf_counter() - t_all, 3)
+    log.info("render timings: %s", timings)
+    return timings
+
+
+# ─── FastAPI ─────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="EMPIRE Wav2Lip v2")
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "cuda": torch.cuda.is_available(),
+        "torch": torch.__version__,
+        "models_loaded": True,
+        "face_cache_size": len(list(CACHE_ROOT.glob("*.pkl"))),
+    }
+
+
+@app.post("/lipsync")
+async def lipsync(video: UploadFile = File(...), audio: UploadFile = File(...), out_height: int = Form(720)):
+    req_id = uuid.uuid4().hex[:8]
+    work = WORK_ROOT / req_id
+    work.mkdir(parents=True, exist_ok=True)
+
+    video_path = work / f"src{pathlib.Path(video.filename or 'x.mp4').suffix or '.mp4'}"
+    audio_path = work / f"audio{pathlib.Path(audio.filename or 'a.mp3').suffix or '.mp3'}"
+    out_path = work / "out.mp4"
+
+    try:
+        with video_path.open("wb") as f:
+            shutil.copyfileobj(video.file, f)
+        with audio_path.open("wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        with RENDER_LOCK:
+            timings = _run_lipsync(video_path, audio_path, out_path, out_height=out_height)
+
+        return FileResponse(
+            path=out_path,
+            media_type="video/mp4",
+            headers={
+                "X-Request-Id": req_id,
+                "X-Total-Sec": str(timings["total_sec"]),
+                "X-Detect-Sec": str(timings["detect_sec"]),
+                "X-Predict-Sec": str(timings["predict_sec"]),
+                "X-Mux-Sec": str(timings["mux_sec"]),
+            },
+        )
+    except Exception as e:
+        log.exception("render failed")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/prewarm")
+async def prewarm(body: dict):
+    """Precompute face cache for a source video on the pod."""
+    path = pathlib.Path(body["path"])
+    out_height = int(body.get("out_height", 720))
+    if not path.exists():
+        raise HTTPException(404, f"not on pod: {path}")
+    with RENDER_LOCK:
+        frames, boxes, fps = _face_detect_cached(path, out_height)
+    return {"frames": len(frames), "fps": fps, "box_count": len(boxes), "path": str(path), "out_height": out_height}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8010, log_level="info")

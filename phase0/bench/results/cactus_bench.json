@@ -1,0 +1,41 @@
+{
+  "results": [
+    {
+      "comment": "how much does this cost?",
+      "expected": "question",
+      "got": "question",
+      "rt_ms": 3770.8,
+      "source": "cactus_on_device"
+    },
+    {
+      "comment": "omg i love it!!!",
+      "expected": "compliment",
+      "got": "question",
+      "rt_ms": 4477.9,
+      "source": "cactus_on_device"
+    },
+    {
+      "comment": "looks kinda cheap tho",
+      "expected": "objection",
+      "got": "objection",
+      "rt_ms": 2252.9,
+      "source": "cactus_on_device"
+    },
+    {
+      "comment": "WHERE DO I BUY",
+      "expected": "call_to_action",
+      "got": "question",
+      "rt_ms": 919.6,
+      "source": "cactus_on_device"
+    },
+    {
+      "comment": "yooo this is fire",
+      "expected": "hype",
+      "got": "compliment",
+      "rt_ms": 1967.1,
+      "source": "cactus_on_device"
+    }
+  ],
+  "p50_ms": 2252.9,
+  "p90_ms": 4477.9
+}

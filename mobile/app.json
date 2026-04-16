@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "EMPIRE",
+    "slug": "empire-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "EMPIRE needs camera to see products",
+        "NSMicrophoneUsageDescription": "EMPIRE needs mic for voice commands"
+      }
+    },
+    "android": {
+      "permissions": ["CAMERA", "RECORD_AUDIO"]
+    },
+    "plugins": [
+      ["expo-camera", { "cameraPermission": "EMPIRE needs camera to see products" }],
+      ["expo-av", { "microphonePermission": "EMPIRE needs mic for voice commands" }]
+    ]
+  }
+}

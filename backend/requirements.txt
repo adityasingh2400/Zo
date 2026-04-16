@@ -1,0 +1,11 @@
+fastapi[standard]
+uvicorn[standard]
+websockets
+boto3
+elevenlabs
+rembg
+onnxruntime
+pillow
+httpx
+python-dotenv
+python-multipart

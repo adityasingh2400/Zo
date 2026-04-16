@@ -1,0 +1,50 @@
+[
+  {
+    "label": "silent",
+    "run": 0,
+    "wall_sec": 49.9,
+    "render_sec": 0.0,
+    "size_kb": 2503,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_silent_run0.mp4"
+  },
+  {
+    "label": "silent",
+    "run": 1,
+    "wall_sec": 9.65,
+    "render_sec": 0.0,
+    "size_kb": 2503,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_silent_run1.mp4"
+  },
+  {
+    "label": "silent",
+    "run": 2,
+    "wall_sec": 11.76,
+    "render_sec": 0.0,
+    "size_kb": 2503,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_silent_run2.mp4"
+  },
+  {
+    "label": "speaking",
+    "run": 0,
+    "wall_sec": 78.13,
+    "render_sec": 0.0,
+    "size_kb": 2679,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_speaking_run0.mp4"
+  },
+  {
+    "label": "speaking",
+    "run": 1,
+    "wall_sec": 6.15,
+    "render_sec": 0.0,
+    "size_kb": 2679,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_speaking_run1.mp4"
+  },
+  {
+    "label": "speaking",
+    "run": 2,
+    "wall_sec": 11.38,
+    "render_sec": 0.0,
+    "size_kb": 2679,
+    "path": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/wav2lip_speaking_run2.mp4"
+  }
+]

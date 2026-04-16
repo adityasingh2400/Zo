@@ -8,13 +8,42 @@ import { ChatPanel } from './components/ChatPanel';
 export default function App() {
   const {
     connected, status, productData, productPhoto, salesScript,
-    agentLog, latestAudio, commentResponse, sendComment, sendSell,
+    agentLog, latestAudio, commentResponse, transcript, sendComment, sendSell,
   } = useEmpireSocket();
 
   const [sellInput, setSellInput] = useState('sell this for $49');
+  const [dragging, setDragging] = useState(false);
+
+  async function uploadFile(file) {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('voice_text', sellInput);
+    const endpoint = file.type.startsWith('video/')
+      ? `http://${window.location.hostname}:8000/api/sell-video`
+      : `http://${window.location.hostname}:8000/api/sell`;
+    await fetch(endpoint, { method: 'POST', body: formData });
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) uploadFile(file);
+  }
 
   return (
-    <div style={styles.app}>
+    <div
+      style={{ ...styles.app, ...(dragging ? styles.appDragging : {}) }}
+      onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={handleDrop}
+    >
+      {dragging && (
+        <div style={styles.dropOverlay}>
+          <span style={{ fontSize: 64 }}>🎬</span>
+          <p style={{ fontSize: 24, fontWeight: 700 }}>Drop video or photo here</p>
+        </div>
+      )}
       {/* Header */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
@@ -41,11 +70,27 @@ export default function App() {
           style={styles.sellInput}
           placeholder='e.g. "sell this for $49 targeting young professionals"'
         />
-        <button onClick={() => sendSell(sellInput)} style={styles.sellBtn}>
-          🚀 SELL THIS
-        </button>
         <label style={styles.uploadLabel}>
-          📷 Upload Photo
+          🎬 Upload Video
+          <input
+            type="file"
+            accept="video/*"
+            style={{ display: 'none' }}
+            onChange={async (e) => {
+              const file = e.target.files[0];
+              if (!file) return;
+              const formData = new FormData();
+              formData.append('file', file);
+              formData.append('voice_text', sellInput);
+              await fetch(`http://${window.location.hostname}:8000/api/sell-video`, {
+                method: 'POST',
+                body: formData,
+              });
+            }}
+          />
+        </label>
+        <label style={styles.uploadLabel}>
+          📷 Photo
           <input
             type="file"
             accept="image/*"
@@ -71,7 +116,7 @@ export default function App() {
           <AvatarPanel status={status} latestAudio={latestAudio} salesScript={salesScript} />
         </div>
         <div style={styles.gridRight}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} />
+          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} />
         </div>
         <div style={styles.gridBottomLeft}>
           <AgentLog log={agentLog} />
@@ -135,5 +180,14 @@ const styles = {
   gridBottomRight: { minHeight: 250 },
   footer: {
     textAlign: 'center', padding: '12px 0', color: '#3f3f46', fontSize: 12,
+  },
+  appDragging: {
+    outline: '3px dashed #7c3aed',
+    outlineOffset: -3,
+  },
+  dropOverlay: {
+    position: 'fixed', inset: 0, background: 'rgba(124,58,237,0.15)',
+    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    zIndex: 999, color: '#fff', gap: 12, backdropFilter: 'blur(4px)',
   },
 };

@@ -2,24 +2,39 @@ import asyncio
 import json
 import time
 import base64
+import logging
+import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("empire")
 
 from config import BACKEND_HOST, BACKEND_PORT
-from agents.eyes import analyze_with_claude, analyze_with_gemma, classify_comment_gemma, parse_voice_intent_gemma
+from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma
 from agents.creator import remove_background, generate_3d_model
 from agents.seller import (
-    generate_sales_script,
     generate_comment_response,
+    make_avatar_speak,
     text_to_speech,
-    send_audio_to_livetalking,
+    set_livetalking_session,
+    render_comment_response_wav2lip,
+    render_pitch_latentsync,
 )
+from agents.intake import process_video
 
 # ── State ──────────────────────────────────────────────
+
+RENDER_DIR = Path(__file__).resolve().parent / "renders"
+RENDER_DIR.mkdir(exist_ok=True)
 
 pipeline_state: dict[str, Any] = {
     "status": "idle",
@@ -28,6 +43,8 @@ pipeline_state: dict[str, Any] = {
     "product_clean_b64": None,
     "model_3d": None,
     "sales_script": None,
+    "pitch_video_url": None,
+    "last_response_video_url": None,
     "agent_log": [],
 }
 
@@ -65,6 +82,13 @@ async def broadcast_to_dashboards(msg: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"EMPIRE backend running on {BACKEND_HOST}:{BACKEND_PORT}")
+    # Pre-load Cactus model in background thread so first request isn't slow
+    from agents.eyes import _get_cactus_model, CACTUS_AVAILABLE
+    if CACTUS_AVAILABLE:
+        logger.info("Pre-loading Cactus/Gemma 4 model (background thread)...")
+        import asyncio
+        await asyncio.to_thread(_get_cactus_model)
+        logger.info("Cactus/Gemma 4 model ready.")
     yield
 
 app = FastAPI(title="EMPIRE", lifespan=lifespan)
@@ -144,6 +168,11 @@ async def dashboard_ws(ws: WebSocket):
                     frame_b64=frame,
                     voice_text=msg.get("voice_text", "sell this"),
                 ))
+
+            elif msg.get("type") == "livetalking_session":
+                set_livetalking_session(msg.get("session_id", ""))
+                log_event("SYSTEM", f"LiveTalking WebRTC session: {msg.get('session_id', '')[:20]}...")
+
     except WebSocketDisconnect:
         dashboard_clients.remove(ws)
 
@@ -153,100 +182,88 @@ async def dashboard_ws(ws: WebSocket):
 async def run_sell_pipeline(frame_b64: str, voice_text: str):
     pipeline_state["status"] = "analyzing"
     pipeline_state["agent_log"] = []
+    logger.info("=" * 60)
+    logger.info("SELL PIPELINE START")
+    logger.info("  frame_b64 length: %d chars", len(frame_b64))
+    logger.info("  voice_text: %s", voice_text[:100])
+    logger.info("=" * 60)
+    pipeline_start = time.time()
 
-    # Step 0: Parse voice intent (Gemma 4, on-device)
-    log_event("EYES", "Parsing voice command (Gemma 4, on-device)...")
+    # PHASE 1: Single Claude call (vision + script) + background removal in parallel
+    log_event("EYES", "Analyzing product + writing script (single Claude call + bg removal)...")
     t0 = time.time()
-    intent = await parse_voice_intent_gemma(voice_text)
-    intent_ms = int((time.time() - t0) * 1000)
-    log_event("EYES", f"Intent parsed ({intent_ms}ms, FREE)", intent)
-    await broadcast_to_dashboards({"type": "voice_intent", "data": intent})
 
-    # Step 1: EYES (Gemma 4 fast analysis)
-    log_event("EYES", "Analyzing product on-device (Gemma 4)...")
-    t0 = time.time()
-    gemma_result = await analyze_with_gemma(frame_b64, voice_text)
-    gemma_ms = int((time.time() - t0) * 1000)
-    log_event("EYES", f"On-device analysis complete ({gemma_ms}ms, FREE)", gemma_result)
-    await broadcast_to_dashboards({"type": "gemma_analysis", "data": gemma_result})
+    async def _claude_combined():
+        try:
+            return await analyze_and_script_claude(frame_b64, voice_text)
+        except Exception as e:
+            logger.error("Claude combined error: %s", e)
+            return {"error": str(e), "source": "claude_error"}
 
-    # Step 2: EYES (Claude rich analysis)
-    log_event("EYES", "Deep analysis via Claude Vision (cloud)...")
-    t0 = time.time()
-    try:
-        claude_result = await analyze_with_claude(frame_b64, voice_text)
-    except Exception as e:
-        claude_result = {"error": str(e)}
-        log_event("EYES", f"Claude Vision error: {e}")
-    claude_ms = int((time.time() - t0) * 1000)
-    log_event("EYES", f"Deep analysis complete ({claude_ms}ms)", claude_result)
+    async def _bg_removal():
+        try:
+            return await remove_background(frame_b64)
+        except Exception as e:
+            logger.error("Background removal error: %s", e)
+            return None
 
-    product_data = claude_result if "error" not in claude_result else gemma_result
+    claude_result, clean_b64 = await asyncio.gather(
+        _claude_combined(), _bg_removal()
+    )
+    phase1_ms = int((time.time() - t0) * 1000)
+
+    # Extract product data and script from combined result
+    product_data = claude_result.get("product", claude_result)
+    product_data["source"] = "claude_cloud"
+    script = claude_result.get("script", "")
+    if not script:
+        script = f"Check out this amazing {product_data.get('name', 'product')}!"
+
+    log_event("EYES", f"Claude: {product_data.get('name', 'done')} ({phase1_ms}ms)")
     pipeline_state["product_data"] = product_data
     await broadcast_to_dashboards({"type": "product_data", "data": product_data})
 
-    # Step 3: CREATOR (background removal)
-    pipeline_state["status"] = "creating"
-    log_event("CREATOR", "Removing background...")
-    t0 = time.time()
-    try:
-        clean_b64 = await remove_background(frame_b64)
-        pipeline_state["product_clean_b64"] = clean_b64
-        creator_ms = int((time.time() - t0) * 1000)
-        log_event("CREATOR", f"Clean product photo ready ({creator_ms}ms)")
-        await broadcast_to_dashboards({"type": "product_photo", "photo": clean_b64})
-    except Exception as e:
-        log_event("CREATOR", f"Background removal failed: {e}")
-
-    # Step 3b: CREATOR (3D model, non-blocking)
-    asyncio.ensure_future(run_3d_generation(frame_b64))
-
-    # Step 4: SELLER (generate script)
-    pipeline_state["status"] = "selling"
-    log_event("SELLER", "Writing sales pitch...")
-    t0 = time.time()
-    try:
-        script = await generate_sales_script(product_data, voice_text)
-    except Exception as e:
-        script = f"Check out this amazing product! {product_data.get('name', 'item')}."
-        log_event("SELLER", f"Script generation error, using fallback: {e}")
-    script_ms = int((time.time() - t0) * 1000)
     pipeline_state["sales_script"] = script
-    log_event("SELLER", f"Sales pitch ready ({script_ms}ms)", {"script": script})
+    log_event("SELLER", f"Sales pitch ready ({phase1_ms}ms)", {"script": script})
     await broadcast_to_dashboards({"type": "sales_script", "script": script})
 
-    # Step 5: SELLER (TTS)
-    log_event("SELLER", "Generating voice...")
+    if clean_b64:
+        pipeline_state["product_clean_b64"] = clean_b64
+        log_event("CREATOR", f"Clean product photo ready ({phase1_ms}ms)")
+        await broadcast_to_dashboards({"type": "product_photo", "photo": clean_b64})
+    else:
+        log_event("CREATOR", "Background removal failed")
+
+    asyncio.ensure_future(run_3d_generation(frame_b64))
+
+    # PHASE 2: Avatar speak / TTS
+    pipeline_state["status"] = "selling"
+    log_event("SELLER", "Avatar going live...")
     t0 = time.time()
-    try:
-        audio_bytes = await text_to_speech(script)
-    except Exception as e:
-        audio_bytes = b""
-        log_event("SELLER", f"TTS error: {e}")
-    tts_ms = int((time.time() - t0) * 1000)
-    log_event("SELLER", f"Voice generated ({tts_ms}ms, {len(audio_bytes)} bytes)")
-
-    if audio_bytes:
-        audio_b64 = base64.b64encode(audio_bytes).decode()
-        await broadcast_to_dashboards({
-            "type": "tts_audio",
-            "audio": audio_b64,
-            "format": "mp3",
-        })
-
-    # Step 6: SELLER (send to LiveTalking for lip sync)
-    if audio_bytes:
-        log_event("SELLER", "Sending to avatar for lip sync...")
-        t0 = time.time()
-        lt_result = await send_audio_to_livetalking(audio_bytes)
-        lt_ms = int((time.time() - t0) * 1000)
-        if "error" in lt_result:
-            log_event("SELLER", f"LiveTalking: {lt_result['error']} ({lt_ms}ms)")
-        else:
-            log_event("SELLER", f"Avatar lip-syncing! ({lt_ms}ms)")
+    lt_result = await make_avatar_speak(script)
+    lt_ms = int((time.time() - t0) * 1000)
+    if "error" in lt_result:
+        log_event("SELLER", f"LiveTalking: {lt_result['error']} ({lt_ms}ms)")
+        log_event("SELLER", "Falling back to TTS audio only...")
+        try:
+            audio_bytes = await text_to_speech(script)
+            if audio_bytes:
+                await broadcast_to_dashboards({
+                    "type": "tts_audio",
+                    "audio": base64.b64encode(audio_bytes).decode(),
+                    "format": "mp3",
+                })
+        except Exception as e:
+            log_event("SELLER", f"TTS fallback failed: {e}")
+    else:
+        log_event("SELLER", f"Avatar speaking! ({lt_ms}ms, lip-synced via WebRTC)")
 
     pipeline_state["status"] = "live"
-    log_event("SYSTEM", "EMPIRE is LIVE. Avatar selling your product.")
+    total_ms = int((time.time() - pipeline_start) * 1000)
+    log_event("SYSTEM", f"EMPIRE is LIVE. Total pipeline: {total_ms}ms")
+    logger.info("=" * 60)
+    logger.info("SELL PIPELINE COMPLETE — %dms total", total_ms)
+    logger.info("=" * 60)
     await broadcast_to_dashboards({"type": "status", "status": "live"})
 
 
@@ -274,45 +291,45 @@ async def run_comment_pipeline(comment: str):
     classification = await classify_comment_gemma(comment)
     class_ms = int((time.time() - t0) * 1000)
     comment_type = classification.get("type", "question")
-    gemma_draft = classification.get("draft_response", "")
     log_event("EYES", f"Classified as {comment_type} ({class_ms}ms, FREE)", classification)
 
     # Step 2: Claude refines the response with full product context
     log_event("SELLER", "Refining response with product context (Claude)...")
     t0 = time.time()
     try:
-        response_text = await generate_comment_response(comment, product_data)
+        response_text = await generate_comment_response(comment, product_data, comment_type)
     except Exception as e:
         response_text = "Thanks for the question! Let me look into that."
         log_event("SELLER", f"Response gen error: {e}")
     resp_ms = int((time.time() - t0) * 1000)
     log_event("SELLER", f"Response generated ({resp_ms}ms)", {"response": response_text})
 
-    # TTS
+    await broadcast_to_dashboards({
+        "type": "comment_response",
+        "comment": comment,
+        "response": response_text,
+    })
+
+    # Step 3: Avatar speaks (text → LiveTalking handles TTS + lip sync)
+    log_event("SELLER", "Avatar responding...")
     t0 = time.time()
-    try:
-        audio_bytes = await text_to_speech(response_text)
-    except Exception as e:
-        audio_bytes = b""
-        log_event("SELLER", f"TTS error: {e}")
-    tts_ms = int((time.time() - t0) * 1000)
-    log_event("SELLER", f"Voice ready ({tts_ms}ms)")
-
-    if audio_bytes:
-        audio_b64 = base64.b64encode(audio_bytes).decode()
-        await broadcast_to_dashboards({
-            "type": "comment_response",
-            "comment": comment,
-            "response": response_text,
-            "audio": audio_b64,
-            "format": "mp3",
-        })
-
-        lt_result = await send_audio_to_livetalking(audio_bytes)
-        if "error" not in lt_result:
-            log_event("SELLER", "Avatar responding with lip sync!")
-        else:
-            log_event("SELLER", f"LiveTalking: {lt_result.get('error')}")
+    lt_result = await make_avatar_speak(response_text)
+    lt_ms = int((time.time() - t0) * 1000)
+    if "error" in lt_result:
+        log_event("SELLER", f"LiveTalking: {lt_result['error']} ({lt_ms}ms)")
+        # Fallback: TTS audio only
+        try:
+            audio_bytes = await text_to_speech(response_text)
+            if audio_bytes:
+                await broadcast_to_dashboards({
+                    "type": "tts_audio",
+                    "audio": base64.b64encode(audio_bytes).decode(),
+                    "format": "mp3",
+                })
+        except Exception:
+            pass
+    else:
+        log_event("SELLER", f"Avatar responding with lip sync! ({lt_ms}ms)")
 
 
 # ── REST endpoints (for testing without WebSocket) ─────
@@ -333,6 +350,78 @@ async def api_sell(file: UploadFile = File(...), voice_text: str = Form("sell th
     return {"status": "pipeline_started"}
 
 
+@app.post("/api/sell-video")
+async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("sell this")):
+    """Upload a product video. Extracts frames + transcript, runs full pipeline."""
+    import tempfile
+    logger.info("[API] /api/sell-video called — file: %s, size: uploading, voice: %s",
+                file.filename, voice_text[:50])
+    contents = await file.read()
+    logger.info("[API] Video received: %d bytes (%s)", len(contents), file.filename)
+    suffix = Path(file.filename).suffix if file.filename else ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(contents)
+        video_path = f.name
+    logger.info("[API] Saved to temp: %s", video_path)
+
+    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text))
+    return {"status": "video_pipeline_started", "bytes": len(contents)}
+
+
+async def run_video_sell_pipeline(video_path: str, voice_text: str):
+    """Full pipeline from video: intake → analyze → sell."""
+    pipeline_state["status"] = "ingesting"
+    pipeline_state["agent_log"] = []
+    logger.info("=" * 60)
+    logger.info("VIDEO PIPELINE START")
+    logger.info("  video_path: %s", video_path)
+    logger.info("  voice_text: %s", voice_text[:100])
+    logger.info("=" * 60)
+
+    log_event("SYSTEM", "Video received. Starting intake pipeline...")
+
+    # Step 1: Video intake (parallel audio + frame extraction)
+    t0 = time.time()
+    try:
+        logger.info("[INTAKE] Starting video processing...")
+        intake_result = await process_video(video_path)
+    except Exception as e:
+        logger.error("[INTAKE] FAILED: %s", e)
+        logger.error(traceback.format_exc())
+        log_event("SYSTEM", f"Video intake failed: {e}")
+        return
+    finally:
+        Path(video_path).unlink(missing_ok=True)
+
+    intake_ms = int((time.time() - t0) * 1000)
+    transcript = intake_result["transcript"]
+    best_frames_b64 = intake_result["best_frames_b64"]
+    timings = intake_result["timings"]
+
+    log_event("SYSTEM", f"Intake complete ({intake_ms}ms)", {
+        "frames_extracted": timings["frame_count"],
+        "frames_kept": timings["filtered_frame_count"],
+        "transcript_length": len(transcript),
+    })
+    logger.info("[INTAKE] Complete in %dms", intake_ms)
+    logger.info("[INTAKE]   frames: %d raw → %d best", timings["frame_count"], timings["filtered_frame_count"])
+    logger.info("[INTAKE]   transcript: %d chars", len(transcript))
+    logger.info("[INTAKE]   timings: %s", json.dumps(timings))
+
+    if transcript:
+        log_event("EYES", f'Seller said: "{transcript[:200]}..."')
+        await broadcast_to_dashboards({"type": "transcript", "text": transcript})
+
+    # Use best frame for the main pipeline, pass transcript as voice_text
+    if best_frames_b64:
+        combined_voice = f"{voice_text}. Seller's narration: {transcript}" if transcript else voice_text
+        pipeline_state["product_photo_b64"] = best_frames_b64[0]
+        await broadcast_to_dashboards({"type": "phone_frame", "frame": best_frames_b64[0][:100] + "..."})
+        await run_sell_pipeline(best_frames_b64[0], combined_voice)
+    else:
+        log_event("SYSTEM", "No usable frames extracted from video")
+
+
 @app.post("/api/comment")
 async def api_comment(text: str = Form(...)):
     asyncio.ensure_future(run_comment_pipeline(text))
@@ -347,6 +436,140 @@ async def api_state():
         "has_photo": pipeline_state["product_clean_b64"] is not None,
         "has_3d": pipeline_state["model_3d"] is not None,
         "log_count": len(pipeline_state["agent_log"]),
+    }
+
+
+# ── Lip-sync endpoints (Phase 1 pipeline) ──────────────
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
+
+
+def _save_render(label: str, data: bytes) -> str:
+    fname = f"{label}_{int(time.time())}.mp4"
+    path = RENDER_DIR / fname
+    path.write_bytes(data)
+    return f"/renders/{fname}"
+
+
+@app.post("/api/generate_pitch")
+async def api_generate_pitch(
+    text: str = Form(...),
+    inference_steps: int = Form(10),
+    out_height: int = Form(1080),
+):
+    """Render a high-quality pitch video via LatentSync (slow, one-time per pitch)."""
+    log_event("SELLER", f"generate_pitch: TTS + LatentSync render ({len(text)} chars)")
+    t0 = time.time()
+    audio_bytes = await text_to_speech(text)
+    tts_ms = int((time.time() - t0) * 1000)
+    log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
+
+    t0 = time.time()
+    video_bytes, headers = await render_pitch_latentsync(
+        audio_bytes, inference_steps=inference_steps, out_height=out_height
+    )
+    render_ms = int((time.time() - t0) * 1000)
+    url = _save_render("pitch", video_bytes)
+    pipeline_state["pitch_video_url"] = url
+    log_event("SELLER", f"LatentSync pitch rendered ({render_ms}ms)", {"url": url})
+
+    await broadcast_to_dashboards({
+        "type": "pitch_video",
+        "url": url,
+        "render_ms": render_ms,
+        "tts_ms": tts_ms,
+        "backend": "latentsync",
+    })
+    return {
+        "url": url,
+        "render_ms": render_ms,
+        "tts_ms": tts_ms,
+        "pipeline_seconds": headers.get("x-pipeline-seconds"),
+    }
+
+
+@app.post("/api/respond_to_comment")
+async def api_respond_to_comment(
+    comment: str = Form(...),
+    out_height: int = Form(720),
+):
+    """LIVE comment response: Gemma classify → Claude refine → TTS → Wav2Lip.
+    Target: sub-8s end-to-end (warm pod, warm face cache)."""
+    product_data = pipeline_state.get("product_data") or {}
+    total_t0 = time.time()
+
+    # Fire classify + LLM in parallel. Classify is for telemetry/badging only;
+    # LLM response uses default "question" type to avoid blocking on Gemma (7-15s).
+    class_t0 = time.time()
+    classify_task = asyncio.create_task(classify_comment_gemma(comment))
+
+    t0 = time.time()
+    try:
+        response_text = await generate_comment_response(comment, product_data, "question")
+    except Exception:
+        response_text = "Great question — let me get back to you on that."
+    resp_ms = int((time.time() - t0) * 1000)
+    log_event("SELLER", f"response drafted ({resp_ms}ms)", {"response": response_text})
+
+    # Kick off TTS immediately; classify keeps running for badging
+    t0 = time.time()
+    audio_bytes = await text_to_speech(response_text)
+    tts_ms = int((time.time() - t0) * 1000)
+
+    # Collect classify result if it finished (non-blocking-ish)
+    comment_type = "question"
+    class_ms = int((time.time() - class_t0) * 1000)
+    if classify_task.done():
+        try:
+            comment_type = (classify_task.result() or {}).get("type", "question")
+        except Exception:
+            pass
+    else:
+        # Don't wait — cancel if it's still running to free the CPU for lipsync
+        classify_task.cancel()
+    log_event("EYES", f'Comment "{comment[:40]}" → {comment_type} ({class_ms}ms)')
+
+    t0 = time.time()
+    video_bytes, headers = await render_comment_response_wav2lip(audio_bytes, out_height=out_height)
+    lipsync_ms = int((time.time() - t0) * 1000)
+
+    url = _save_render("resp", video_bytes)
+    pipeline_state["last_response_video_url"] = url
+    total_ms = int((time.time() - total_t0) * 1000)
+
+    log_event("SELLER", f"comment response ready in {total_ms}ms", {
+        "url": url, "classify_ms": class_ms, "llm_ms": resp_ms,
+        "tts_ms": tts_ms, "lipsync_ms": lipsync_ms,
+    })
+
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "total_ms": total_ms,
+        "class_ms": class_ms,
+        "llm_ms": resp_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+    })
+    return {
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "total_ms": total_ms,
+        "breakdown": {
+            "classify_ms": class_ms,
+            "llm_ms": resp_ms,
+            "tts_ms": tts_ms,
+            "lipsync_ms": lipsync_ms,
+        },
+        "wav2lip": {
+            "total_sec": headers.get("x-total-sec"),
+            "detect_sec": headers.get("x-detect-sec"),
+            "predict_sec": headers.get("x-predict-sec"),
+        },
     }
 
 

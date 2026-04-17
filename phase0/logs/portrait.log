@@ -1,0 +1,8 @@
+Nano Banana (gemini-2.5-flash-image) -> portrait
+Output dir: /Users/aditya/Desktop/ychackathon/phase0/assets/portraits
+Response in 9.7s
+  saved: /Users/aditya/Desktop/ychackathon/phase0/assets/portraits/portrait_1776360009_0.png  (1400653 bytes)
+
+Canonical: /Users/aditya/Desktop/ychackathon/phase0/assets/portraits/portrait.png -> portrait_1776360009_0.png
+[B_alt] 6.9s  -> portrait_B_alt_1776360056.png
+[A_closed] 7.3s  -> portrait_A_closed_1776360056.png

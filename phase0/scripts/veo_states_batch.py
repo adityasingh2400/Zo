@@ -23,7 +23,8 @@ from dotenv import dotenv_values
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 env = dotenv_values(ROOT.parent / ".env")
 for k, v in env.items():
-    os.environ[k] = v
+    if v is not None:
+        os.environ.setdefault(k, v)
 
 from google import genai
 from google.genai import types

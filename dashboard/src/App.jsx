@@ -8,9 +8,11 @@ import { ChatPanel } from './components/ChatPanel';
 
 export default function App() {
   const {
-    connected, status, productData, productPhoto, salesScript,
+    connected, status, productData, productPhoto,
     agentLog, transcript, sendComment,
-    pitchVideoUrl, responseVideo, liveStage, pendingComments,
+    pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
+    view3d, transcriptExtract,
+    wsRef,
   } = useEmpireSocket();
 
   const [sellInput, setSellInput] = useState('sell this for $49');
@@ -101,13 +103,14 @@ export default function App() {
             responseVideo={responseVideo}
             pendingComments={pendingComments}
             liveStage={liveStage}
+            wsRef={wsRef}
           />
           <div style={styles.stageBelow}>
             <AgentLog log={agentLog} />
           </div>
         </div>
         <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} />
+          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} />
           <ChatPanel
             onSendComment={sendComment}
             commentResponse={responseVideo}

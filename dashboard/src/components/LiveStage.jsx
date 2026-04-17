@@ -146,6 +146,10 @@ const styles = {
   },
   video: {
     width: '100%', height: '100%', objectFit: 'contain', background: '#000',
+    // Crisp downscale on Retina displays; the rendered MP4 is already 1080p so
+    // any browser-side resampling should preserve detail rather than blur it.
+    imageRendering: 'auto',
+    WebkitTransform: 'translateZ(0)',
   },
   placeholder: {
     textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center',

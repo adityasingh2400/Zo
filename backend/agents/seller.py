@@ -155,12 +155,16 @@ async def _post_lipsync(
 async def render_comment_response_wav2lip(
     audio_bytes: bytes,
     source_path_on_pod: str = POD_SPEAKING_1080P,
-    out_height: int = 1080,
+    out_height: int = 1920,
 ) -> tuple[bytes, dict]:
     """FAST path: Wav2Lip on the pod. Target p50 warm ~6-10s for a ~5s response.
     Used for LIVE comment responses where sub-8s matters.
-    Output is rendered at native 1080p so the dashboard's cinema stage stays crisp;
-    the face-detect cache is keyed on out_height so the warm path is unchanged.
+    Output is rendered at the source video's native 1920px height (1080x1920 9:16)
+    so it visually matches the Tier 0 idle clips on the dashboard cinema stage.
+    Earlier we shipped at out_height=1080, which downscaled the 1920-tall source
+    to 606x1080; that read as a noticeable resolution drop when the response
+    crossfaded in over the native idle layer. Native height fixes that.
+    Face-detect cache is keyed on out_height so the warm path is unchanged.
     Returns (mp4_bytes, timing_headers)."""
     logger.info("[LIPSYNC] Wav2Lip /lipsync_fast — audio=%dB source=%s", len(audio_bytes), source_path_on_pod)
     t0 = time.perf_counter()

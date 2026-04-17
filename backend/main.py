@@ -186,7 +186,7 @@ async def dashboard_ws(ws: WebSocket):
                 comment_text = msg.get("text", "")
                 async def _run():
                     try:
-                        await api_respond_to_comment(comment=comment_text, out_height=1080)
+                        await api_respond_to_comment(comment=comment_text, out_height=1920)
                     except Exception as e:
                         log_event("SELLER", f"comment pipeline error: {e}")
                 asyncio.create_task(_run())
@@ -638,7 +638,7 @@ async def api_bridges():
 @app.post("/api/respond_to_comment")
 async def api_respond_to_comment(
     comment: str = Form(...),
-    out_height: int = Form(1080),
+    out_height: int = Form(1920),
 ):
     """LIVE comment response with seamless avatar choreography.
 
@@ -699,9 +699,20 @@ async def api_respond_to_comment(
         except Exception:
             logger.exception("[director] play_bridge failed (non-fatal)")
 
-    # 5) Wav2Lip render
+    # 5) Wav2Lip render — use the substrate of whichever Tier 0 idle is
+    #    currently visible so the response inherits the same body language.
+    #    Eliminates the "different person leaning forward" jump-cut when
+    #    Tier 1 fades in over the calm idle layer.
+    substrate = director.current_substrate_pod_path() if director else None
     t0 = time.time()
-    video_bytes, headers = await render_comment_response_wav2lip(audio_bytes, out_height=out_height)
+    if substrate:
+        video_bytes, headers = await render_comment_response_wav2lip(
+            audio_bytes, source_path_on_pod=substrate, out_height=out_height,
+        )
+    else:
+        video_bytes, headers = await render_comment_response_wav2lip(
+            audio_bytes, out_height=out_height,
+        )
     lipsync_ms = int((time.time() - t0) * 1000)
 
     url = _save_render("resp", video_bytes)

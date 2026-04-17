@@ -1,0 +1,14 @@
+Health: {'status': 'ok', 'gpu': 'NVIDIA GeForce RTX 5090', 'cuda': True, 'torch': '2.10.0+cu128', 'models_loaded': True, 'face_cache_size': 0}
+
+[silent run0] wall=49.90s  render= 0.00s  size=2503KB  -> wav2lip_silent_run0.mp4
+[silent run1] wall= 9.65s  render= 0.00s  size=2503KB  -> wav2lip_silent_run1.mp4
+[silent run2] wall=11.76s  render= 0.00s  size=2503KB  -> wav2lip_silent_run2.mp4
+[speaking run0] wall=78.13s  render= 0.00s  size=2679KB  -> wav2lip_speaking_run0.mp4
+[speaking run1] wall= 6.15s  render= 0.00s  size=2679KB  -> wav2lip_speaking_run1.mp4
+[speaking run2] wall=11.38s  render= 0.00s  size=2679KB  -> wav2lip_speaking_run2.mp4
+
+================ SUMMARY ================
+  silent      cold=0.00s  warm_p50=0.00s  all=[0.0, 0.0, 0.0]
+  speaking    cold=0.00s  warm_p50=0.00s  all=[0.0, 0.0, 0.0]
+
+Report: /Users/aditya/Desktop/ychackathon/phase0/bench/results/wav2lip_bench.json

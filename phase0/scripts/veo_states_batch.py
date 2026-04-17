@@ -100,7 +100,6 @@ def gen_one(label: str, spec: dict) -> dict:
             aspect_ratio="9:16",
             duration_seconds=8,
             resolution="1080p",
-            person_generation="allow_adult",
         ),
     )
     print(f"[{full_label}] submitted ({time.perf_counter()-t0:.1f}s)")

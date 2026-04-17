@@ -31,31 +31,56 @@ TIER1_CROSSFADE_MS_DEFAULT = 350
 TIER0_CROSSFADE_MS_DEFAULT = 600
 TIER1_FADEOUT_MS_DEFAULT = 500
 READING_CHAT_HOLD_MS = 800   # how long the attentive idle plays before bridge replaces it
-IDLE_ROTATE_MIN_MS = 12_000
-IDLE_ROTATE_MAX_MS = 30_000
+IDLE_ROTATE_MIN_MS = 8_000   # tighter cadence so demo viewer sees variety quickly
+IDLE_ROTATE_MAX_MS = 18_000
 
-# Tier 0 candidates and weights. Order is best-effort; missing assets are
-# auto-skipped so the rotation degrades gracefully if Veo hasn't shipped a
-# clip yet.
-TIER0_LIBRARY: list[tuple[str, str, float]] = [
-    # (intent, url, weight)
-    ("idle_calm",          "/clips/idle/idle_calm.mp4",          0.70),
-    ("idle_attentive",     "/clips/idle/idle_attentive.mp4",     0.10),
-    ("idle_thinking",      "/clips/idle/idle_thinking.mp4",      0.05),
-    ("misc_glance_aside",  "/clips/idle/misc_glance_aside.mp4",  0.05),
-    ("misc_hair_touch",    "/clips/idle/misc_hair_touch.mp4",    0.04),
-    ("misc_sip_drink",     "/clips/idle/misc_sip_drink.mp4",     0.04),
-    ("misc_walk_off_return","/clips/idle/misc_walk_off_return.mp4",0.02),
+# Tier 0 = looping idle clips. Each one is symmetric (boomerangable) and
+# meant to play indefinitely under the reactive layer. Director rotates
+# between them every 12-30s.
+#
+# Asymmetric clips like sip_drink and walk_off_return CANNOT loop without
+# looking unnatural (reversed sip = vomit, reversed walk = moonwalk), so
+# they live in TIER1_INTERJECTIONS instead and play as one-shot crossfades
+# with the looping idle still painting underneath.
+# (intent, dashboard URL, weight, pod path for Wav2Lip substrate)
+# The pod_path is the file the Wav2Lip server reads when this idle is the
+# currently-active Tier 0; matching the response substrate to the playing
+# idle keeps body language continuous through the crossfade.
+TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
+    ("idle_calm",          "/states/idle/idle_calm.mp4",         0.70, "/workspace/idle/idle_calm.mp4"),
+    ("idle_attentive",     "/states/idle/idle_attentive.mp4",    0.15, "/workspace/idle/idle_attentive.mp4"),
+    ("idle_thinking",      "/states/idle/idle_thinking.mp4",     0.05, "/workspace/idle/idle_thinking.mp4"),
+    ("misc_glance_aside",  "/states/idle/misc_glance_aside.mp4", 0.05, "/workspace/idle/misc_glance_aside.mp4"),
+    ("misc_hair_touch",    "/states/idle/misc_hair_touch.mp4",   0.05, "/workspace/idle/misc_hair_touch.mp4"),
 ]
 
-# When Veo M2 hasn't shipped yet, fall back to the existing 8s state video.
-# This keeps M1 demoable on day one.
+# Tier 1 one-shot interjections. Director picks one occasionally and plays
+# it as a crossfaded one-shot over the always-on Tier 0 idle. They start
+# and end close to the anchor pose so the crossfade hides any mismatch.
+TIER1_INTERJECTIONS: list[tuple[str, str, float, str]] = [
+    ("misc_sip_drink",      "/states/idle/misc_sip_drink.mp4",      0.6, ""),
+    ("misc_walk_off_return","/states/idle/misc_walk_off_return.mp4",0.4, ""),
+]
+
+# Probability per idle-rotation tick that we play a Tier 1 interjection
+# instead of swapping the Tier 0 clip. At 8-18s rotation cadence with p=0.35,
+# expect one sip / walk-off roughly every 30-50s — frequent enough to feel
+# alive on stage without becoming twitchy.
+INTERJECTION_PROBABILITY = 0.35
+
+# When Veo idle library hasn't shipped yet, fall back to the existing 8s
+# silent state video so the dashboard never starts blank.
 TIER0_FALLBACK_URL = "/states/state_idle_pose_silent_1080p.mp4"
-READING_CHAT_FALLBACK_URL = TIER0_FALLBACK_URL  # swap to /clips/idle/idle_attentive.mp4 once Veo lands
+READING_CHAT_FALLBACK_URL = "/states/idle/idle_attentive.mp4"
 
 
 class Director:
     """One-per-process avatar choreographer."""
+
+    # Default Wav2Lip substrate (matches POD_SPEAKING_1080P in config). Used
+    # if no Tier 0 idle is currently active (early startup) — but in practice
+    # the idle rotation kicks immediately so this is rarely hit.
+    DEFAULT_SUBSTRATE_POD_PATH = "/workspace/state_pitching_pose_speaking_1080p.mp4"
 
     def __init__(self, broadcast: Callable[[dict], Awaitable[None]]):
         self._broadcast = broadcast
@@ -63,6 +88,14 @@ class Director:
         self._idle_task: asyncio.Task | None = None
         self._last_intent: dict[str, str] = {}     # layer -> intent (for state_sync replay)
         self._last_url: dict[str, str] = {}        # layer -> url (for state_sync replay)
+        # Pod-side path of the substrate that matches whatever Tier 0 is
+        # currently painting. Wav2Lip pulls this so the response inherits
+        # the body language of the visible idle clip.
+        self._current_substrate_pod_path: str = self.DEFAULT_SUBSTRATE_POD_PATH
+
+    def current_substrate_pod_path(self) -> str:
+        """The Wav2Lip server-side path that matches the visible Tier 0 clip."""
+        return self._current_substrate_pod_path
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
     def mark_ready(self) -> None:
@@ -194,11 +227,13 @@ class Director:
             self._idle_task.cancel()
 
     async def _idle_loop(self) -> None:
-        # Send the calm baseline immediately so Tier 0 never starts blank.
+        # Seed the substrate tracker before the first emit so any comment that
+        # races in at boot uses the right pod-side substrate.
+        self._current_substrate_pod_path = TIER0_LIBRARY[0][3]
         await self.emit(
             "tier0",
-            "idle_calm",
-            TIER0_FALLBACK_URL,  # will pick from library once those exist
+            TIER0_LIBRARY[0][0],
+            TIER0_LIBRARY[0][1],
             loop=True,
             mode="crossfade",
             emitted_by="idle_init",
@@ -207,10 +242,31 @@ class Director:
             wait_ms = random.uniform(IDLE_ROTATE_MIN_MS, IDLE_ROTATE_MAX_MS)
             await asyncio.sleep(wait_ms / 1000)
             try:
-                pick = self._weighted_pick()
+                # Tier 1 interjections (sip, walk-off) don't change the
+                # underlying Tier 0 substrate; the Director keeps the active
+                # idle pose paired with the next response.
+                if random.random() < INTERJECTION_PROBABILITY and TIER1_INTERJECTIONS:
+                    pick = self._weighted_pick(TIER1_INTERJECTIONS)
+                    if pick:
+                        intent, url, _w, _pod = pick
+                        await self.emit(
+                            "tier1",
+                            intent,
+                            url,
+                            loop=False,
+                            mode="crossfade",
+                            emitted_by="idle_interjection",
+                        )
+                        continue
+
+                # Rotate the looping idle on Tier 0 + remember its pod-side
+                # substrate so the next Wav2Lip render uses the matching pose.
+                pick = self._weighted_pick(TIER0_LIBRARY)
                 if pick is None:
                     continue
-                intent, url, _w = pick
+                intent, url, _w, pod_path = pick
+                if pod_path:
+                    self._current_substrate_pod_path = pod_path
                 await self.emit(
                     "tier0",
                     intent,
@@ -224,11 +280,10 @@ class Director:
             except Exception:
                 logger.exception("[director] idle rotation tick failed")
 
-    def _weighted_pick(self) -> tuple[str, str, float] | None:
-        candidates = TIER0_LIBRARY
+    def _weighted_pick(self, candidates):
         if not candidates:
             return None
-        total = sum(w for _, _, w in candidates)
+        total = sum(c[2] for c in candidates)
         r = random.uniform(0, total)
         acc = 0.0
         for c in candidates:

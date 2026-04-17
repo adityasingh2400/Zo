@@ -26,65 +26,60 @@ export function LiveStage({
   liveStage,
   wsRef,
 }) {
-  const tier0Ref = useRef(null);
+  // Tier 0 = ping-pong of two looping idle videos with opacity crossfade,
+  // matching the Tier 1 design. Eliminates the visible flash that used to
+  // happen when a single <video> swapped src between rotating idle clips.
+  const tier0ARef = useRef(null);
+  const tier0BRef = useRef(null);
   const tier1ARef = useRef(null);
   const tier1BRef = useRef(null);
 
-  // Which Tier 1 element is currently visible (true = A, false = B). The other
-  // one is hidden, ready to receive the next clip.
+  // Which element of each tier is currently visible (true = A, false = B).
+  const [tier0ActiveIsA, setTier0ActiveIsA] = useState(true);
+  const [tier0Opacity, setTier0Opacity] = useState(1);   // tier0 starts visible
   const [tier1ActiveIsA, setTier1ActiveIsA] = useState(true);
-  // Visibility of the active Tier 1 element (0..1). Tier 0 sits underneath
-  // and is always painting, so visibility 0 means "show idle".
   const [tier1Opacity, setTier1Opacity] = useState(0);
   const [overlayVisible, setOverlayVisible] = useState(false);
 
   const stream = useAvatarStream({ wsRef });
 
   // ── Tier 0 driver ────────────────────────────────────────────────────────
-  // Drives the always-on idle layer. Loop, muted, crossfade-in on src change.
+  // Always-on idle layer. Two stacked elements ping-pong with a 600ms opacity
+  // crossfade so swapping idle clips never shows a visible flash.
   const lastTier0Url = useRef(null);
   useEffect(() => {
-    const v = tier0Ref.current;
-    if (!v) return;
+    const url = stream.tier0?.url
+      || `/states/state_idle_pose_silent_1080p.mp4`;
+    if (url === lastTier0Url.current) return;
 
-    const url = stream.tier0?.url;
-    if (!url) {
-      // No instruction from Director yet — make sure something is playing
-      // so we never see a black stage. Falls back to the static state video.
-      const fallback = `${API_BASE}/states/state_idle_pose_silent_1080p.mp4`;
-      if (v.src !== fallback) {
-        v.src = fallback;
-        v.muted = true;
-        v.loop = true;
-        v.play().catch(() => {});
-      }
-      return;
-    }
+    const incomingEl = tier0ActiveIsA ? tier0BRef.current : tier0ARef.current;
+    const outgoingEl = tier0ActiveIsA ? tier0ARef.current : tier0BRef.current;
+    if (!incomingEl) return;
 
-    // Director told us to play this Tier 0 clip; if it changed, swap src.
-    // (Tier 0 single-element swap; the seamless crossfade between *two* Tier 0
-    // elements is M3 polish — for M1 we just swap source which has a tiny
-    // flash but is hidden by Tier 1 most of the time.)
-    if (url !== lastTier0Url.current) {
-      v.src = `${API_BASE}${url}`;
-      v.muted = true;
-      v.loop = stream.tier0.loop ?? true;
-      v.play().then(() => stream.sendStageReady()).catch(() => {});
-      lastTier0Url.current = url;
-    }
-  }, [stream.tier0?.url, stream.tier0?.loop]);
+    incomingEl.src = `${API_BASE}${url}`;
+    incomingEl.muted = true;
+    incomingEl.loop = stream.tier0?.loop ?? true;
+    incomingEl.volume = 0;
 
-  // Send stage_ready once Tier 0 actually starts painting frames, so the
-  // Director knows it's safe to send Tier 1 events.
-  useEffect(() => {
-    const v = tier0Ref.current;
-    if (!v) return;
-    const onPlaying = () => stream.sendStageReady();
-    v.addEventListener('playing', onPlaying);
-    return () => v.removeEventListener('playing', onPlaying);
-    // stream.sendStageReady is stable enough; we want this once per mount.
+    const fadeMs = stream.tier0?.fadeMs ?? 600;
+    const onCanPlay = () => {
+      incomingEl.removeEventListener('canplay', onCanPlay);
+      incomingEl.play().then(() => {
+        // Promote incoming to active, fade it in, fade outgoing out.
+        setTier0ActiveIsA(prev => !prev);
+        setTier0Opacity(1);
+        stream.sendStageReady();
+        // Pause the outgoing element after the fade so we don't keep two
+        // 1080p decoders running.
+        setTimeout(() => {
+          try { outgoingEl?.pause(); } catch {}
+        }, fadeMs + 50);
+      }).catch(() => {});
+    };
+    incomingEl.addEventListener('canplay', onCanPlay, { once: true });
+    lastTier0Url.current = url;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [stream.tier0?.url, stream.tier0?.loop]);
 
   // ── Tier 1 driver ────────────────────────────────────────────────────────
   // On every new tier1 instruction, load it into the inactive element, wait
@@ -202,15 +197,35 @@ export function LiveStage({
   return (
     <div style={styles.container}>
       <div style={styles.stage}>
-        {/* Tier 0: always-on idle layer */}
+        {/* Tier 0A: always-on idle layer (ping-pong A) */}
         <video
-          ref={tier0Ref}
+          ref={tier0ARef}
           playsInline
           autoPlay
           loop
           muted
           controls={false}
-          style={{ ...styles.video, ...styles.tier0 }}
+          style={{
+            ...styles.video,
+            ...styles.tier0,
+            opacity: tier0ActiveIsA ? tier0Opacity : 0,
+            transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
+          }}
+        />
+
+        {/* Tier 0B: always-on idle layer (ping-pong B) */}
+        <video
+          ref={tier0BRef}
+          playsInline
+          loop
+          muted
+          controls={false}
+          style={{
+            ...styles.video,
+            ...styles.tier0,
+            opacity: !tier0ActiveIsA ? tier0Opacity : 0,
+            transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
+          }}
         />
 
         {/* Tier 1A */}

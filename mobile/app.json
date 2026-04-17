@@ -16,11 +16,25 @@
       }
     },
     "android": {
-      "permissions": ["CAMERA", "RECORD_AUDIO"]
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
     },
     "plugins": [
-      ["expo-camera", { "cameraPermission": "EMPIRE needs camera to see products" }],
-      ["expo-av", { "microphonePermission": "EMPIRE needs mic for voice commands" }]
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "EMPIRE needs camera to see products"
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "EMPIRE needs mic for voice commands"
+        }
+      ],
+      "expo-asset"
     ]
   }
 }

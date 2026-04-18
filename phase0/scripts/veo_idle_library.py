@@ -159,6 +159,91 @@ PERFORMANCES: dict[str, str] = {
         "holding a small wrapped item, settles back to the anchor pose by "
         "second eight."
     ),
+
+    # ── Speaking variants (Wav2Lip substrates) ──────────────────────────
+    # These mirror the body language of the corresponding idle clips but
+    # with the mouth ACTIVELY MOVING in natural conversational speech. They
+    # are NOT loop-friendly and NOT for direct playback — they exist solely
+    # as substrates for Wav2Lip. The face crop has rich open-mouth motion
+    # so the GAN has high-detail material to predict on; the body matches
+    # the visible Tier 0 idle so the response crossfade looks continuous.
+    #
+    # No "loop constraint" clause needed (these are one-shot substrates).
+    # No "first frame == last frame" needed.
+    # Hands stay at their idle position so the body silhouette doesn't
+    # change between idle layer and response layer.
+
+    "idle_calm_speaking": (
+        "Same calm framing as idle_calm: she sits/stands centered, looking "
+        "softly at the camera, hands at her sides or out of frame, gentle "
+        "Duchenne smile. THE ONLY DIFFERENCE FROM IDLE: her mouth is now "
+        "ACTIVELY MOVING in natural, continuous conversational speech — "
+        "lips opening and closing, jaw articulating, tongue visible "
+        "occasionally, normal phoneme shapes (rounded for 'oo', wide for "
+        "'ee', open for 'ah'). Imagine she is calmly answering a viewer's "
+        "question. Speech motion is natural and continuous from second "
+        "zero through second eight — no long mouth-closed pauses. Eyes "
+        "make warm intermittent contact with camera, occasional natural "
+        "blinks. Body is otherwise still: head doesn't tilt, shoulders "
+        "don't drift, hands don't gesture. The mouth is the only thing "
+        "moving expressively. (No spoken audio is needed — the lip motion "
+        "will be re-synced to a different audio track. The MORE varied "
+        "and natural the mouth shapes, the better.)"
+    ),
+
+    "idle_reading_comments_speaking": (
+        "Same body framing as idle_reading_comments: she has leaned forward "
+        "about 12-15cm toward an off-screen device below the camera. Her "
+        "eyes are pointed DOWN AND TO HER LOWER-RIGHT (viewer's lower-"
+        "left), NEVER at the camera, throughout the entire clip. NO eye "
+        "contact with the lens. Hands are out of frame.\n\n"
+        "DIFFERENCE FROM IDLE: her mouth is now ACTIVELY MOVING as if "
+        "reading the comments aloud or thinking aloud — natural "
+        "conversational speech motion. Lips opening and closing, jaw "
+        "articulating, varied phoneme shapes throughout the eight "
+        "seconds. Continuous motion, no long mouth-closed pauses. The "
+        "lean is held perfectly still (body locked, head locked) — only "
+        "the mouth moves expressively, plus one natural slow blink near "
+        "second four (still no eye contact during the blink). NO text "
+        "overlay, no UI, no objects in frame. Background unchanged."
+    ),
+
+    "idle_thinking_speaking": (
+        "Same body framing as idle_thinking: head tilted gently 8 degrees "
+        "to her right, one hand resting at her chin, brow slightly "
+        "lowered in concentration, faint dimpled smirk. THE DIFFERENCE: "
+        "her mouth is now ACTIVELY MOVING in natural conversational "
+        "speech, as if she's thinking out loud. Continuous lip and jaw "
+        "motion, varied phoneme shapes, occasional tongue visibility. "
+        "Eyes are mostly looking up-left in thought but make occasional "
+        "soft contact with camera. The hand stays at the chin throughout, "
+        "the head tilt holds, body otherwise still. Only the mouth "
+        "moves expressively."
+    ),
+
+    "misc_glance_aside_speaking": (
+        "Same body framing as misc_glance_aside but the glance is held "
+        "longer: she has turned her gaze slightly off-camera to her left "
+        "with a soft outer-brow raise (acknowledging an off-frame "
+        "viewer), and is talking to that off-screen direction. Her mouth "
+        "is ACTIVELY MOVING in natural conversational speech for the "
+        "full eight seconds — continuous lip and jaw motion. Body "
+        "otherwise still: shoulders square to camera, hands out of "
+        "frame, head facing forward but eyes drifted left. Only the "
+        "mouth and a natural blink or two move expressively."
+    ),
+
+    "misc_hair_touch_speaking": (
+        "Same body framing as misc_hair_touch: she has just tucked a "
+        "strand of hair behind her right ear and her right hand is "
+        "settling back to her side, soft warm smile, looking at camera. "
+        "THE DIFFERENCE: her mouth is now ACTIVELY MOVING in natural "
+        "conversational speech for the full eight seconds — continuous "
+        "lip and jaw motion, varied phoneme shapes. Eyes hold warm "
+        "contact with the lens (or break briefly for a soft blink). "
+        "Body otherwise still: hands settled, head steady. Only the "
+        "mouth moves expressively."
+    ),
 }
 
 

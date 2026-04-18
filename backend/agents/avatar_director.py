@@ -47,11 +47,11 @@ IDLE_ROTATE_MAX_MS = 18_000
 # currently-active Tier 0; matching the response substrate to the playing
 # idle keeps body language continuous through the crossfade.
 TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
-    ("idle_calm",          "/states/idle/idle_calm.mp4",         0.70, "/workspace/idle/idle_calm.mp4"),
-    ("idle_attentive",     "/states/idle/idle_attentive.mp4",    0.15, "/workspace/idle/idle_attentive.mp4"),
-    ("idle_thinking",      "/states/idle/idle_thinking.mp4",     0.05, "/workspace/idle/idle_thinking.mp4"),
-    ("misc_glance_aside",  "/states/idle/misc_glance_aside.mp4", 0.05, "/workspace/idle/misc_glance_aside.mp4"),
-    ("misc_hair_touch",    "/states/idle/misc_hair_touch.mp4",   0.05, "/workspace/idle/misc_hair_touch.mp4"),
+    ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle/idle_calm.mp4"),
+    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle/idle_reading_comments.mp4"),
+    ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle/idle_thinking.mp4"),
+    ("misc_glance_aside",    "/states/idle/misc_glance_aside.mp4",    0.05, "/workspace/idle/misc_glance_aside.mp4"),
+    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.05, "/workspace/idle/misc_hair_touch.mp4"),
 ]
 
 # Tier 1 one-shot interjections. Director picks one occasionally and plays
@@ -71,7 +71,7 @@ INTERJECTION_PROBABILITY = 0.35
 # When Veo idle library hasn't shipped yet, fall back to the existing 8s
 # silent state video so the dashboard never starts blank.
 TIER0_FALLBACK_URL = "/states/state_idle_pose_silent_1080p.mp4"
-READING_CHAT_FALLBACK_URL = "/states/idle/idle_attentive.mp4"
+READING_CHAT_FALLBACK_URL = "/states/idle/idle_reading_comments.mp4"
 
 
 class Director:

@@ -15,3 +15,6 @@ backend/renders/
 
 # Phase 0 local logs
 phase0/logs/
+
+# Local dev fixtures (large demo videos)
+backend/test_fixtures/

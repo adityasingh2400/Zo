@@ -150,6 +150,9 @@ async def dashboard_ws(ws: WebSocket):
         "state": {
             "status": pipeline_state["status"],
             "product_data": pipeline_state["product_data"],
+            "sales_script": pipeline_state.get("sales_script"),
+            "pitch_video_url": pipeline_state.get("pitch_video_url"),
+            "last_response_video_url": pipeline_state.get("last_response_video_url"),
             "agent_log": pipeline_state["agent_log"][-50:],
         },
     })
@@ -160,7 +163,15 @@ async def dashboard_ws(ws: WebSocket):
             msg = json.loads(raw)
 
             if msg.get("type") == "simulate_comment":
-                asyncio.ensure_future(run_comment_pipeline(msg.get("text", "")))
+                # Use the fast Wav2Lip path (sub-8s) instead of the legacy LiveTalking path.
+                # The endpoint also broadcasts `comment_response_video` to dashboards.
+                comment_text = msg.get("text", "")
+                async def _run():
+                    try:
+                        await api_respond_to_comment(comment=comment_text, out_height=720)
+                    except Exception as e:
+                        log_event("SELLER", f"comment pipeline error: {e}")
+                asyncio.ensure_future(_run())
 
             elif msg.get("type") == "simulate_sell":
                 frame = pipeline_state.get("product_photo_b64", "")
@@ -486,6 +497,40 @@ async def api_generate_pitch(
         "render_ms": render_ms,
         "tts_ms": tts_ms,
         "pipeline_seconds": headers.get("x-pipeline-seconds"),
+    }
+
+
+# Maps Gemma comment-type labels → pre-rendered LatentSync clip filenames.
+# Filled in by P1.3 (12-18 generic clips). Until then, falls back to live wav2lip.
+CLIP_LIBRARY: dict[str, list[str]] = {
+    "question":   [],   # ["bridge_let_me_check.mp4", "bridge_great_question.mp4"]
+    "compliment": [],   # ["bridge_thanks.mp4", "bridge_glad.mp4"]
+    "objection":  [],   # ["bridge_understand.mp4"]
+    "spam":       [],
+}
+
+
+@app.post("/api/classify_comment")
+async def api_classify_comment(comment: str = Form(...)):
+    """Lightweight P1.5: classify a comment via on-device Gemma; if a generic
+    pre-rendered clip exists for that label, return its URL so the client can
+    play it instantly while the full Wav2Lip render proceeds in parallel."""
+    t0 = time.time()
+    try:
+        result = await classify_comment_gemma(comment)
+    except Exception as e:
+        result = {"type": "question", "source": "fallback", "error": str(e)}
+    label = (result.get("type") or "question").lower()
+    elapsed_ms = int((time.time() - t0) * 1000)
+    clips = CLIP_LIBRARY.get(label, [])
+    bridge_url = f"/clips/{clips[0]}" if clips else None
+    return {
+        "comment": comment,
+        "label": label,
+        "classify_ms": elapsed_ms,
+        "source": result.get("source"),
+        "bridge_clip_url": bridge_url,
+        "draft_response": result.get("draft_response"),
     }
 
 

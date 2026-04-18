@@ -151,11 +151,12 @@ def gen_one(label: str) -> dict:
             model="veo-3.1-generate-preview",
             prompt=prompt,
             image=types.Image(image_bytes=image_bytes, mime_type="image/png"),
+            # NOTE: person_generation is auto-managed when conditioning on an
+            # image. Setting it explicitly returns 400 ("not supported").
             config=types.GenerateVideosConfig(
                 aspect_ratio="9:16",
                 duration_seconds=8,
                 resolution="1080p",
-                person_generation="allow_adult",
             ),
         )
     except Exception as e:

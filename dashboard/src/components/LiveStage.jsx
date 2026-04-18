@@ -26,6 +26,11 @@ export function LiveStage({
   liveStage,
   wsRef,
 }) {
+  // Voice/routing state listened off the shared WS directly so LiveStage stays
+  // self-contained — no prop changes needed in App.jsx (which Cody is also
+  // editing to add VoiceMic). When Cody's server starts broadcasting these
+  // events, the pills + badge come alive automatically.
+  const { voiceState, routingDecision } = useVoiceStage({ wsRef });
   // Tier 0 = ping-pong of two looping idle videos with opacity crossfade,
   // matching the Tier 1 design. Eliminates the visible flash that used to
   // happen when a single <video> swapped src between rotating idle clips.
@@ -262,6 +267,19 @@ export function LiveStage({
           </div>
         )}
 
+        {/* Voice-flow state — drives the audience's mental model of where we are
+            in the request. Cody's VoiceMic + router will broadcast the events
+            that flip voiceState; this component just renders. */}
+        {voiceState && voiceState !== 'idle' && (
+          <VoiceStatePill state={voiceState} />
+        )}
+
+        {/* Routing decision badge — pops on every comment routed locally vs cloud.
+            Auto-fades after 3.2s so the stage stays clean. */}
+        {routingDecision && (
+          <RoutingBadge decision={routingDecision} />
+        )}
+
         {/* Pending comment chip */}
         {oldestPending && !overlayVisible && (
           <PendingChip text={oldestPending.text} startedAt={oldestPending.t0} />
@@ -306,6 +324,59 @@ export function LiveStage({
   );
 }
 
+// ── useVoiceStage — listen for Cody's voice + router events ──────────────────
+// Pure observer of the shared WS. No prop drilling, no double subscription
+// (we attach via addEventListener so we don't clobber the existing handler).
+//
+// State machine:
+//   voice_transcript   → 'thinking'   (transcript landed, router about to fire)
+//   routing_decision   → 'responding' (tool picked, render kicking off)
+//   comment_response_video → null     (response is on stage, hand off to LIVE)
+//
+// Safety auto-clear after 12s so a dropped follow-up never sticks the pill.
+function useVoiceStage({ wsRef }) {
+  const [voiceState, setVoiceState] = useState(null);
+  const [routingDecision, setRoutingDecision] = useState(null);
+  const clearTimerRef = useRef(null);
+
+  useEffect(() => {
+    const ws = wsRef?.current;
+    if (!ws) return;
+    function setStateSafe(s) {
+      setVoiceState(s);
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+      if (s) clearTimerRef.current = setTimeout(() => setVoiceState(null), 12_000);
+    }
+    function onMessage(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      switch (msg.type) {
+        case 'voice_state':
+          // Director-driven explicit state. Wins over inferred state.
+          setStateSafe(msg.state || null);
+          break;
+        case 'voice_transcript':
+          setStateSafe('thinking');
+          break;
+        case 'routing_decision':
+          setRoutingDecision(msg);
+          setStateSafe('responding');
+          break;
+        case 'comment_response_video':
+          setStateSafe(null);
+          break;
+      }
+    }
+    ws.addEventListener('message', onMessage);
+    return () => {
+      ws.removeEventListener('message', onMessage);
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+    };
+  }, [wsRef]);
+
+  return { voiceState, routingDecision };
+}
+
 function PendingChip({ text, startedAt }) {
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
@@ -315,10 +386,101 @@ function PendingChip({ text, startedAt }) {
   return (
     <div style={styles.pendingChip}>
       <span style={styles.pendingDot} />
-      <span style={{ fontSize: 12, color: '#fde68a' }}>
+      <span style={{ fontSize: 14, color: '#fde68a', fontWeight: 600 }}>
         Reading "{text.slice(0, 40)}{text.length > 40 ? '…' : ''}"
       </span>
       <span style={styles.pendingTimer}>{elapsed.toFixed(1)}s</span>
+    </div>
+  );
+}
+
+// ── Voice flow state pill ────────────────────────────────────────────────────
+// Lives at the top-center of the stage when the voice path is mid-flight.
+// Each state has its own color + message so the audience knows exactly
+// where we are in the pipeline. 10ft readable.
+const VOICE_STATES = {
+  transcribing: {
+    label: 'TRANSCRIBING',
+    sub: 'Cactus + Gemma 4 · on-device',
+    color: '#22d3ee',
+    bg: 'rgba(8, 51, 68, 0.92)',
+    border: '#0e7490',
+  },
+  thinking: {
+    label: 'ROUTING',
+    sub: 'FunctionGemma · picking tool',
+    color: '#a855f7',
+    bg: 'rgba(45, 16, 78, 0.92)',
+    border: '#7c3aed',
+  },
+  responding: {
+    label: 'RESPONDING',
+    sub: 'Wav2Lip + GFPGAN · render',
+    color: '#22c55e',
+    bg: 'rgba(6, 51, 32, 0.92)',
+    border: '#16a34a',
+  },
+};
+
+function VoiceStatePill({ state }) {
+  const cfg = VOICE_STATES[state] || VOICE_STATES.transcribing;
+  return (
+    <div
+      style={{
+        ...styles.voicePill,
+        background: cfg.bg,
+        borderColor: cfg.border,
+        color: cfg.color,
+      }}
+    >
+      <span style={{ ...styles.voicePillDot, background: cfg.color }} />
+      <div style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.1 }}>
+        <span style={styles.voicePillLabel}>{cfg.label}</span>
+        <span style={styles.voicePillSub}>{cfg.sub}</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Routing decision badge ───────────────────────────────────────────────────
+// Shows up briefly each time the FunctionGemma router fires a tool. Local
+// routes are framed as savings, cloud routes as deliberate escalation.
+function RoutingBadge({ decision }) {
+  const [visible, setVisible] = useState(true);
+  useEffect(() => {
+    setVisible(true);
+    const id = setTimeout(() => setVisible(false), 3200);
+    return () => clearTimeout(id);
+  }, [decision]);
+  if (!visible) return null;
+
+  const local = !!decision.was_local;
+  const tone = local
+    ? { color: '#4ade80', bg: 'rgba(6, 51, 32, 0.92)', border: '#16a34a', label: 'LOCAL' }
+    : { color: '#fbbf24', bg: 'rgba(60, 38, 4, 0.92)', border: '#d97706', label: 'CLOUD' };
+  const toolLabel = String(decision.tool || 'unknown').replace(/_/g, ' ');
+  const ms = Number.isFinite(decision.ms) ? `${decision.ms}ms` : null;
+  const saved = Number.isFinite(decision.cost_saved_usd) && decision.cost_saved_usd > 0
+    ? `· saved $${decision.cost_saved_usd.toFixed(4)}`
+    : null;
+
+  return (
+    <div
+      style={{
+        ...styles.routingBadge,
+        background: tone.bg,
+        borderColor: tone.border,
+        color: tone.color,
+      }}
+    >
+      <span style={{ ...styles.routingBadgeTag, background: tone.color, color: '#0a0a0a' }}>
+        {tone.label}
+      </span>
+      <span style={styles.routingBadgeBody}>
+        <strong>{toolLabel}</strong>
+        {ms && <span style={styles.routingBadgeMeta}> · {ms}</span>}
+        {saved && <span style={styles.routingBadgeMeta}>{` ${saved}`}</span>}
+      </span>
     </div>
   );
 }
@@ -349,25 +511,72 @@ const styles = {
   livePill: {
     position: 'absolute', top: 14, left: 14, zIndex: 5,
     background: 'rgba(239,68,68,0.95)', color: '#fff',
-    padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 800, letterSpacing: 1,
-    display: 'flex', alignItems: 'center', gap: 6,
+    padding: '6px 14px', borderRadius: 8, fontSize: 13, fontWeight: 900, letterSpacing: 1.5,
+    display: 'flex', alignItems: 'center', gap: 8,
+    boxShadow: '0 2px 12px rgba(239,68,68,0.4)',
   },
   liveDot: {
-    width: 7, height: 7, borderRadius: 4, background: '#fff',
+    width: 9, height: 9, borderRadius: 5, background: '#fff',
     animation: 'pulse 1.4s ease-in-out infinite',
   },
   pendingChip: {
     position: 'absolute', top: 14, right: 14, zIndex: 5,
-    background: 'rgba(120,53,15,0.92)', border: '1px solid #f59e0b',
-    padding: '6px 10px', borderRadius: 999,
-    display: 'flex', alignItems: 'center', gap: 8, maxWidth: '60%',
+    background: 'rgba(120,53,15,0.94)', border: '1px solid #f59e0b',
+    padding: '8px 14px', borderRadius: 999,
+    display: 'flex', alignItems: 'center', gap: 10, maxWidth: '60%',
     backdropFilter: 'blur(6px)',
+    boxShadow: '0 2px 12px rgba(245,158,11,0.25)',
   },
   pendingDot: {
-    width: 8, height: 8, borderRadius: 4, background: '#f59e0b',
+    width: 10, height: 10, borderRadius: 5, background: '#f59e0b',
     animation: 'pulse 1s ease-in-out infinite',
   },
-  pendingTimer: { fontSize: 11, color: '#fcd34d', fontVariantNumeric: 'tabular-nums', fontWeight: 700 },
+  pendingTimer: { fontSize: 13, color: '#fcd34d', fontVariantNumeric: 'tabular-nums', fontWeight: 800 },
+  voicePill: {
+    position: 'absolute', top: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 6,
+    border: '1px solid', borderRadius: 12,
+    padding: '8px 14px',
+    display: 'flex', alignItems: 'center', gap: 10,
+    backdropFilter: 'blur(8px)',
+    boxShadow: '0 4px 16px rgba(0,0,0,0.35)',
+    animation: 'voicePillIn 220ms cubic-bezier(0.4, 0.0, 0.2, 1)',
+  },
+  voicePillDot: {
+    width: 10, height: 10, borderRadius: 5,
+    animation: 'pulse 0.9s ease-in-out infinite',
+    boxShadow: '0 0 12px currentColor',
+  },
+  voicePillLabel: {
+    fontSize: 13, fontWeight: 900, letterSpacing: 1.6,
+  },
+  voicePillSub: {
+    fontSize: 10, fontWeight: 600, letterSpacing: 0.6, opacity: 0.85,
+    fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+  },
+  routingBadge: {
+    position: 'absolute', bottom: 18, left: '50%', transform: 'translateX(-50%)', zIndex: 6,
+    border: '1px solid', borderRadius: 999,
+    padding: '6px 6px 6px 6px',
+    display: 'flex', alignItems: 'center', gap: 10,
+    backdropFilter: 'blur(8px)',
+    boxShadow: '0 4px 16px rgba(0,0,0,0.45)',
+    animation: 'routingBadgeIn 280ms cubic-bezier(0.4, 0.0, 0.2, 1)',
+    maxWidth: '70%',
+  },
+  routingBadgeTag: {
+    fontSize: 10, fontWeight: 900, letterSpacing: 1.4,
+    padding: '3px 8px', borderRadius: 999,
+  },
+  routingBadgeBody: {
+    fontSize: 13, fontWeight: 700, paddingRight: 12,
+    textTransform: 'uppercase', letterSpacing: 0.5,
+  },
+  routingBadgeMeta: {
+    opacity: 0.8, fontWeight: 500,
+    fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+    textTransform: 'none',
+    fontSize: 12,
+  },
   commentOverlay: {
     position: 'absolute', left: 0, right: 0, bottom: 0, zIndex: 5,
     padding: 16,
@@ -384,14 +593,16 @@ const styles = {
     fontSize: 24, width: 36, height: 36, borderRadius: 18,
     background: '#27272a', display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
-  commentUser: { color: '#a1a1aa', fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1 },
-  commentText: { color: '#fafafa', fontSize: 14, fontWeight: 500 },
+  commentUser: { color: '#a1a1aa', fontSize: 12, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1 },
+  commentText: { color: '#fafafa', fontSize: 16, fontWeight: 500 },
   latencyBadge: {
-    background: '#16a34a', color: '#fff', padding: '4px 10px', borderRadius: 999,
-    fontSize: 11, fontWeight: 800, letterSpacing: 0.5,
+    background: '#16a34a', color: '#fff', padding: '6px 12px', borderRadius: 999,
+    fontSize: 13, fontWeight: 900, letterSpacing: 0.5,
+    fontVariantNumeric: 'tabular-nums',
+    boxShadow: '0 2px 8px rgba(34,197,94,0.35)',
   },
   responseLine: {
-    color: '#22c55e', fontSize: 12, fontStyle: 'italic', marginTop: 6, paddingLeft: 46,
+    color: '#22c55e', fontSize: 14, fontStyle: 'italic', marginTop: 8, paddingLeft: 46,
   },
 };
 
@@ -401,6 +612,14 @@ if (typeof document !== 'undefined' && !document.getElementById('livestage-keyfr
   s.innerHTML = `
     @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.45 } }
     @keyframes slideUp { from { transform: translateY(100%); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+    @keyframes voicePillIn {
+      from { transform: translate(-50%, -8px); opacity: 0 }
+      to   { transform: translate(-50%,  0);   opacity: 1 }
+    }
+    @keyframes routingBadgeIn {
+      from { transform: translate(-50%, 8px); opacity: 0 }
+      to   { transform: translate(-50%, 0);   opacity: 1 }
+    }
   `;
   document.head.appendChild(s);
 }

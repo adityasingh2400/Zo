@@ -110,7 +110,7 @@ export default function App() {
           </div>
         </div>
         <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} />
+          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
           <ChatPanel
             onSendComment={sendComment}
             commentResponse={responseVideo}

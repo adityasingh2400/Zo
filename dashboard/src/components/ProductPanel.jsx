@@ -1,7 +1,51 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Spin3D } from './Spin3D';
 
-export function ProductPanel({ productData, productPhoto, transcript, view3d, transcriptExtract }) {
+// Subscribe to voice_state events directly so the Spin3D rim light + speed
+// react in lockstep with the voice pipeline, without prop-drilling through App.
+function useSpin3DVoiceState({ wsRef }) {
+  const [state, setState] = useState('idle');
+  const clearTimerRef = useRef(null);
+  useEffect(() => {
+    const ws = wsRef?.current;
+    if (!ws) return;
+    function setStateSafe(s) {
+      setState(s || 'idle');
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+      if (s && s !== 'idle') {
+        clearTimerRef.current = setTimeout(() => setState('idle'), 12_000);
+      }
+    }
+    function onMessage(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      switch (msg.type) {
+        case 'voice_state':
+          // Director-driven, authoritative.
+          setStateSafe(msg.state || 'idle');
+          break;
+        case 'voice_transcript':
+          setStateSafe('thinking');
+          break;
+        case 'routing_decision':
+          setStateSafe('responding');
+          break;
+        case 'comment_response_video':
+          setStateSafe('idle');
+          break;
+      }
+    }
+    ws.addEventListener('message', onMessage);
+    return () => {
+      ws.removeEventListener('message', onMessage);
+      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
+    };
+  }, [wsRef]);
+  return state;
+}
+
+export function ProductPanel({ productData, productPhoto, transcript, view3d, transcriptExtract, wsRef }) {
+  const spinState = useSpin3DVoiceState({ wsRef });
   if (!productData && !productPhoto && !view3d && !transcriptExtract) {
     return (
       <div style={styles.container}>
@@ -19,7 +63,13 @@ export function ProductPanel({ productData, productPhoto, transcript, view3d, tr
       <h3 style={styles.title}>Product Intelligence</h3>
       <div style={styles.content}>
         {view3d ? (
-          <Spin3D view={view3d} height={220} />
+          <Spin3D
+            view={view3d}
+            height={220}
+            label={productData?.name || undefined}
+            state={spinState}
+            accent="#7c3aed"
+          />
         ) : productPhoto && (
           <img
             src={`data:image/png;base64,${productPhoto}`}

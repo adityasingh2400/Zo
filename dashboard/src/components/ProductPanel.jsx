@@ -1,6 +1,6 @@
 import React from 'react';
 
-export function ProductPanel({ productData, productPhoto }) {
+export function ProductPanel({ productData, productPhoto, transcript }) {
   if (!productData && !productPhoto) {
     return (
       <div style={styles.container}>
@@ -34,6 +34,12 @@ export function ProductPanel({ productData, productPhoto }) {
             {productData.selling_points?.map((pt, i) => (
               <DataRow key={i} label={`Point ${i + 1}`} value={pt} />
             ))}
+          </div>
+        )}
+        {transcript && (
+          <div style={{ marginTop: 12, padding: '10px 12px', background: '#27272a', borderRadius: 8 }}>
+            <span style={{ color: '#a855f7', fontSize: 12, fontWeight: 700 }}>SELLER NARRATION</span>
+            <p style={{ color: '#d4d4d8', fontSize: 13, marginTop: 4, fontStyle: 'italic' }}>"{transcript}"</p>
           </div>
         )}
       </div>

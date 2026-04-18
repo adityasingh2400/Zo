@@ -11,6 +11,7 @@ export function useEmpireSocket() {
   const [agentLog, setAgentLog] = useState([]);
   const [latestAudio, setLatestAudio] = useState(null);
   const [commentResponse, setCommentResponse] = useState(null);
+  const [transcript, setTranscript] = useState(null);
   const wsRef = useRef(null);
 
   const connect = useCallback(() => {
@@ -53,6 +54,9 @@ export function useEmpireSocket() {
           setCommentResponse(msg);
           setLatestAudio({ audio: msg.audio, format: msg.format });
           break;
+        case 'transcript':
+          setTranscript(msg.text);
+          break;
       }
     };
 
@@ -74,6 +78,6 @@ export function useEmpireSocket() {
 
   return {
     connected, status, productData, productPhoto, salesScript,
-    agentLog, latestAudio, commentResponse, sendComment, sendSell,
+    agentLog, latestAudio, commentResponse, transcript, sendComment, sendSell,
   };
 }

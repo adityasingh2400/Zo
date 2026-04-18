@@ -168,7 +168,7 @@ async def dashboard_ws(ws: WebSocket):
                 comment_text = msg.get("text", "")
                 async def _run():
                     try:
-                        await api_respond_to_comment(comment=comment_text, out_height=720)
+                        await api_respond_to_comment(comment=comment_text, out_height=1080)
                     except Exception as e:
                         log_event("SELLER", f"comment pipeline error: {e}")
                 asyncio.ensure_future(_run())
@@ -537,7 +537,7 @@ async def api_classify_comment(comment: str = Form(...)):
 @app.post("/api/respond_to_comment")
 async def api_respond_to_comment(
     comment: str = Form(...),
-    out_height: int = Form(720),
+    out_height: int = Form(1080),
 ):
     """LIVE comment response: Gemma classify → Claude refine → TTS → Wav2Lip.
     Target: sub-8s end-to-end (warm pod, warm face cache)."""

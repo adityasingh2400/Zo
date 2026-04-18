@@ -286,15 +286,101 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     asyncio.ensure_future(run_3d_generation(frame_b64))
 
-    # PHASE 2: Avatar speak / TTS
+    # PHASE 2: TTS + Wav2Lip render — real video lipsync via the same fast
+    # path the comment responses use. The legacy LiveTalking WebRTC path was
+    # removed because it required a session handshake that the dashboard no
+    # longer initiates, and its audio-only fallback played MP3 over a silent
+    # idle face — read as "gibberish in a random language" because the mouth
+    # never moved.
+    #
+    # New flow:
+    #   1. Voice pill → RESPONDING so the audience knows we're rendering.
+    #   2. ElevenLabs TTS the Claude-generated script (English-locked).
+    #   3. Wav2Lip render against whichever speaking-substrate the Director
+    #      thinks matches the visible Tier 0 idle (calm by default).
+    #   4. Director crossfades the rendered mp4 onto Tier 1 → settles back
+    #      to the silent idle layer when the video duration elapses.
     pipeline_state["status"] = "selling"
     log_event("SELLER", "Avatar going live...")
-    t0 = time.time()
-    lt_result = await make_avatar_speak(script)
-    lt_ms = int((time.time() - t0) * 1000)
-    if "error" in lt_result:
-        log_event("SELLER", f"LiveTalking: {lt_result['error']} ({lt_ms}ms)")
-        log_event("SELLER", "Falling back to TTS audio only...")
+    if director:
+        await director.set_voice_state("responding")
+
+    pitch_t0 = time.time()
+    try:
+        # 2a. TTS
+        t0 = time.time()
+        audio_bytes = await text_to_speech(script)
+        tts_ms = int((time.time() - t0) * 1000)
+        if not audio_bytes:
+            raise RuntimeError("TTS returned empty audio")
+        log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
+
+        # 2b. Wav2Lip render against the substrate the Director picked for
+        #     whatever Tier 0 is visible. Falls back to default substrate if
+        #     the configured one isn't on the pod (the Director caches a
+        #     "missing" mark so we don't repeatedly retry the bad path).
+        substrate = director.current_substrate_pod_path() if director else None
+        t0 = time.time()
+        try:
+            if substrate:
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, source_path_on_pod=substrate, out_height=1080,
+                )
+            else:
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=1080,
+                )
+        except Exception as e:
+            err_str = str(e).lower()
+            if substrate and director and ("404" in err_str or "400" in err_str or "not found" in err_str):
+                logger.warning("[pitch] substrate %s unavailable, falling back: %s", substrate, e)
+                director.mark_substrate_status(substrate, False)
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=1080,
+                )
+            else:
+                raise
+        lipsync_ms = int((time.time() - t0) * 1000)
+        log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
+
+        # 2c. Save + broadcast through Director so the carousel crossfade
+        #     machinery and idle-release timing work the same way as comment
+        #     responses (single source of truth for stage state).
+        url = _save_render("pitch", video_bytes)
+        pipeline_state["pitch_video_url"] = url
+
+        if director:
+            await director.play_response(url)
+            # Probe rendered duration so the idle release fires precisely as
+            # she finishes the pitch. Falls back to a word-count estimate.
+            rendered_path = RENDER_DIR / Path(url).name
+            play_ms = _probe_video_duration_ms(rendered_path)
+            if play_ms is None:
+                word_count = len(script.split())
+                play_ms = int(max(2500, word_count * 350))
+            play_ms_with_tail = play_ms + 400
+
+            async def _release_pitch_to_idle(delay_ms: int):
+                await asyncio.sleep(delay_ms / 1000)
+                if director:
+                    await director.fade_to_idle()
+                    await director.set_voice_state(None)
+            asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
+
+        await broadcast_to_dashboards({
+            "type": "pitch_video",
+            "url": url,
+            "render_ms": lipsync_ms,
+            "tts_ms": tts_ms,
+            "backend": "wav2lip",
+        })
+        pitch_total_ms = int((time.time() - pitch_t0) * 1000)
+        log_event("SELLER", f"Avatar speaking! ({pitch_total_ms}ms total, lipsynced via Wav2Lip)")
+    except Exception as e:
+        logger.exception("[pitch] render failed")
+        log_event("SELLER", f"Pitch render failed: {e}")
+        # Last-ditch: TTS-only fallback so at least audio plays. This is the
+        # legacy "no video" path, kept only for catastrophic Wav2Lip failures.
         try:
             audio_bytes = await text_to_speech(script)
             if audio_bytes:
@@ -303,10 +389,11 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
                     "audio": base64.b64encode(audio_bytes).decode(),
                     "format": "mp3",
                 })
-        except Exception as e:
-            log_event("SELLER", f"TTS fallback failed: {e}")
-    else:
-        log_event("SELLER", f"Avatar speaking! ({lt_ms}ms, lip-synced via WebRTC)")
+                log_event("SELLER", "Fell back to TTS-only audio (no lipsync video)")
+        except Exception as e2:
+            log_event("SELLER", f"TTS fallback also failed: {e2}")
+        if director:
+            await director.set_voice_state(None)
 
     pipeline_state["status"] = "live"
     total_ms = int((time.time() - pipeline_start) * 1000)
@@ -556,7 +643,11 @@ async def _finish_transcript_extract(task: asyncio.Task) -> None:
 
 @app.post("/api/comment")
 async def api_comment(text: str = Form(...)):
-    asyncio.ensure_future(run_comment_pipeline(text))
+    """Public REST entry-point for a viewer comment. Routes through the
+    production response pipeline (reading_chat → bridge → Wav2Lip → Director
+    crossfade → fade-to-idle) — same path the dashboard's chat panel uses
+    via the WS simulate_comment message."""
+    asyncio.ensure_future(api_respond_to_comment(comment=text, out_height=1920))
     return {"status": "processing"}
 
 

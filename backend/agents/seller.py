@@ -252,12 +252,21 @@ class _BytesCtx:
 def _eleven_tts_sync(text: str) -> bytes:
     """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
     event loop isn't blocked while audio bytes are being generated +
-    streamed; the WS broadcast for play_clip events can interleave."""
+    streamed; the WS broadcast for play_clip events can interleave.
+
+    language_code='en' is locked because eleven_flash_v2_5 is multilingual
+    and will auto-detect from the input text. Edge cases (mostly-numeric
+    scripts, brand names, ASCII art in product descriptions) can flip the
+    detection to a different language and produce phonetically-warped
+    output that reads as gibberish to English listeners. Locking en is
+    the safe default; we only revisit this when we add multi-language
+    sellers."""
     audio_gen = eleven.text_to_speech.convert(
         text=text,
         voice_id=ELEVENLABS_VOICE_ID,
         model_id="eleven_flash_v2_5",
         output_format="mp3_44100_128",
+        language_code="en",
     )
     return b"".join(audio_gen)
 

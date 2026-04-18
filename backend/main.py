@@ -557,6 +557,26 @@ def _save_render(label: str, data: bytes) -> str:
     return f"/renders/{fname}"
 
 
+def _probe_video_duration_ms(path: Path) -> int | None:
+    """ffprobe a local mp4 for its video stream duration in ms.
+    Returns None if probe fails; caller should fall back to an estimate."""
+    import subprocess
+    if not path.exists():
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=duration", "-of",
+             "default=nokey=1:noprint_wrappers=1", str(path)],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0:
+            return None
+        return int(float(r.stdout.strip()) * 1000)
+    except Exception:
+        return None
+
+
 @app.post("/api/generate_pitch")
 async def api_generate_pitch(
     text: str = Form(...),
@@ -754,16 +774,21 @@ async def api_respond_to_comment(
     # 6) Crossfade in the live response, then release back to idle when done.
     if director:
         await director.play_response(url)
-        # Schedule the idle release after the response has had time to play.
-        # Wav2Lip output duration ≈ TTS audio duration ≈ ~3-5s for short replies.
-        # Estimate 1s per 3 words and add a safety buffer.
-        word_count = len(response_text.split())
-        estimated_play_ms = int(max(2500, word_count * 350) + 600)
+        # Probe the actual rendered video duration so the idle release fires
+        # precisely as the avatar finishes speaking. Falls back to a word-count
+        # estimate if ffprobe fails. Adds a small tail (400ms) so the response
+        # gets a beat of post-speech facial relaxation before crossfade.
+        rendered_path = RENDER_DIR / Path(url).name
+        play_ms = _probe_video_duration_ms(rendered_path)
+        if play_ms is None:
+            word_count = len(response_text.split())
+            play_ms = int(max(2500, word_count * 350))
+        play_ms_with_tail = play_ms + 400
 
         async def _release_after(delay_ms: int):
             await asyncio.sleep(delay_ms / 1000)
             await director.fade_to_idle()
-        asyncio.create_task(_release_after(estimated_play_ms))
+        asyncio.create_task(_release_after(play_ms_with_tail))
 
     await broadcast_to_dashboards({
         "type": "comment_response_video",

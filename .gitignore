@@ -9,12 +9,3 @@ build/
 *.egg-info/
 .expo/
 .agents/
-
-# Generated at runtime (lip-sync outputs served from /renders)
-backend/renders/
-
-# Phase 0 local logs
-phase0/logs/
-
-# Local dev fixtures (large demo videos)
-backend/test_fixtures/

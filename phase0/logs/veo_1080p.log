@@ -1,0 +1,34 @@
+[pitching_pose_speaking_1080p] submitting Veo 3.1 (1080p, 9:16, 8s)
+[pitching_pose_speaking_1080p] submitted (1.3s), op=models/veo-3.1-generate-preview/operations/7vlb43kofip3
+[pitching_pose_speaking_1080p] poll 1 elapsed=9s done=None
+[pitching_pose_speaking_1080p] poll 2 elapsed=18s done=None
+[pitching_pose_speaking_1080p] poll 3 elapsed=26s done=None
+[pitching_pose_speaking_1080p] poll 4 elapsed=34s done=None
+[pitching_pose_speaking_1080p] poll 5 elapsed=42s done=None
+[pitching_pose_speaking_1080p] poll 6 elapsed=51s done=None
+[pitching_pose_speaking_1080p] poll 7 elapsed=59s done=None
+[pitching_pose_speaking_1080p] poll 8 elapsed=67s done=None
+[pitching_pose_speaking_1080p] poll 9 elapsed=75s done=None
+[pitching_pose_speaking_1080p] poll 10 elapsed=83s done=None
+[pitching_pose_speaking_1080p] poll 11 elapsed=92s done=None
+[pitching_pose_speaking_1080p] poll 12 elapsed=100s done=None
+[pitching_pose_speaking_1080p] poll 13 elapsed=108s done=True
+[pitching_pose_speaking_1080p] DONE 109.5s -> /Users/aditya/Desktop/ychackathon/phase0/assets/states/state_pitching_pose_speaking_1080p_1776369342.mp4 (6015 KB)
+  symlink: state_pitching_pose_speaking_1080p.mp4 -> state_pitching_pose_speaking_1080p_1776369342.mp4
+  probe: {
+    "programs": [
+
+    ],
+    "stream_groups": [
+
+    ],
+    "streams": [
+        {
+            "width": 1080,
+            "height": 1920,
+            "r_frame_rate": "24/1",
+            "duration": "8.000000"
+        }
+    ]
+}
+Report: /Users/aditya/Desktop/ychackathon/phase0/bench/results/veo_1080p.json

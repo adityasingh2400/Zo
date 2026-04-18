@@ -1,0 +1,84 @@
+{
+  "intro": [
+    {
+      "text": "Hey everyone, welcome to the stream!",
+      "file": "intro_hey_everyone_welcome_to_the_stream.mp4"
+    },
+    {
+      "text": "Hi there, so glad you're here today!",
+      "file": "intro_hi_there_so_glad_you_re_here_today.mp4"
+    },
+    {
+      "text": "Welcome in, let's check out something special.",
+      "file": "intro_welcome_in_let_s_check_out_something_spe.mp4"
+    }
+  ],
+  "bridge": [
+    {
+      "text": "Let me grab that for you real quick.",
+      "file": "bridge_let_me_grab_that_for_you_real_quick.mp4"
+    },
+    {
+      "text": "Great question, hold on one second.",
+      "file": "bridge_great_question_hold_on_one_second.mp4"
+    },
+    {
+      "text": "One moment, looking that up now.",
+      "file": "bridge_one_moment_looking_that_up_now.mp4"
+    },
+    {
+      "text": "Yeah totally, give me a sec.",
+      "file": "bridge_yeah_totally_give_me_a_sec.mp4"
+    },
+    {
+      "text": "Awesome, let me pull that up.",
+      "file": "bridge_awesome_let_me_pull_that_up.mp4"
+    },
+    {
+      "text": "Good catch, hang tight.",
+      "file": "bridge_good_catch_hang_tight.mp4"
+    }
+  ],
+  "question": [
+    {
+      "text": "Yes, that's a great question and the answer is yes!",
+      "file": "question_yes_that_s_a_great_question_and_the_answ.mp4"
+    },
+    {
+      "text": "Absolutely, it can definitely do that.",
+      "file": "question_absolutely_it_can_definitely_do_that.mp4"
+    },
+    {
+      "text": "Yep, that's actually one of my favorite features.",
+      "file": "question_yep_that_s_actually_one_of_my_favorite_f.mp4"
+    }
+  ],
+  "compliment": [
+    {
+      "text": "Thank you so much, that means a lot!",
+      "file": "compliment_thank_you_so_much_that_means_a_lot.mp4"
+    },
+    {
+      "text": "Aw, thanks for saying that!",
+      "file": "compliment_aw_thanks_for_saying_that.mp4"
+    },
+    {
+      "text": "Appreciate the love in the chat!",
+      "file": "compliment_appreciate_the_love_in_the_chat.mp4"
+    }
+  ],
+  "objection": [
+    {
+      "text": "I hear you, let me explain what makes it different.",
+      "file": "objection_i_hear_you_let_me_explain_what_makes_it_.mp4"
+    },
+    {
+      "text": "Totally fair, here's the thing though.",
+      "file": "objection_totally_fair_here_s_the_thing_though.mp4"
+    },
+    {
+      "text": "I get that concern, here's why it still works.",
+      "file": "objection_i_get_that_concern_here_s_why_it_still_w.mp4"
+    }
+  ]
+}

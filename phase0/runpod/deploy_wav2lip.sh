@@ -50,23 +50,31 @@ pip install -q numpy==1.26.4 opencv-python-headless librosa numba tqdm scipy
 pip install -q face_alignment==1.3.5 basicsr || true  # basicsr may fail, acceptable
 pip install -q fastapi uvicorn[standard] python-multipart httpx
 
+# RetinaFace via batch-face (used by wav2lip_server_v2.py for fast face detection).
+pip install -q batch-face
+
 echo "=== Downloading Wav2Lip weights ==="
 mkdir -p checkpoints
-if [ ! -f "checkpoints/wav2lip_gan.pth" ]; then
-  # Mirror from the original HuggingFace model distribution
-  wget -q -O checkpoints/wav2lip_gan.pth "https://huggingface.co/camenduru/Wav2Lip/resolve/main/wav2lip_gan.pth" || {
-    echo "HF mirror failed, trying alternate..."
-    wget -q -O checkpoints/wav2lip_gan.pth "https://iiitaphyd-my.sharepoint.com/personal/radrabha_m_research_iiit_ac_in/_layouts/15/download.aspx?share=EdjI7bZlgApMqsVoEUUXpLsBxqXbn5z8VTmoxp55YNDcIA"
-  }
+if [ ! -s "checkpoints/wav2lip_gan.pth" ]; then
+  # Working mirror (Sharepoint and the original camenduru drop both 404 in 2026).
+  wget -q --show-progress --timeout=60 -O checkpoints/wav2lip_gan.pth \
+    "https://huggingface.co/Nekochu/Wav2Lip/resolve/main/wav2lip_gan.pth?download=true"
 fi
-ls -la checkpoints/
 
 echo "=== Downloading face detection weights ==="
-if [ ! -f "face_detection/detection/sfd/s3fd.pth" ]; then
-  mkdir -p face_detection/detection/sfd
-  wget -q -O face_detection/detection/sfd/s3fd.pth "https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth" || \
-  wget -q -O face_detection/detection/sfd/s3fd.pth "https://github.com/1adrianb/face-alignment/releases/download/v1.0.1/s3fd-619a316812.pth"
+mkdir -p face_detection/detection/sfd
+if [ ! -s "face_detection/detection/sfd/s3fd.pth" ]; then
+  # adrianbulat.com is unreliable; HF camenduru mirror is fast.
+  wget -q --timeout=60 -O face_detection/detection/sfd/s3fd.pth \
+    "https://huggingface.co/camenduru/facexlib/resolve/main/s3fd-619a316812.pth?download=true"
+fi
+if [ ! -s "checkpoints/mobilenet.pth" ]; then
+  # batch-face's RetinaFace network=mobilenet expects this file.
+  wget -q --timeout=60 -O checkpoints/mobilenet.pth \
+    "https://huggingface.co/py-feat/retinaface/resolve/main/mobilenet0.25_Final.pth?download=true"
 fi
 
-echo "=== All deps installed. Next: copy server.py and start it. ==="
-echo "To start:  cd /workspace/Wav2Lip && source venv/bin/activate && python /workspace/wav2lip_server.py"
+ls -la checkpoints/ face_detection/detection/sfd/
+
+echo "=== All deps installed. ==="
+echo "To start:  cd /workspace/Wav2Lip && source venv/bin/activate && python /workspace/wav2lip_server_v2.py"

@@ -20,6 +20,8 @@ export function useEmpireSocket() {
   const [responseVideo, setResponseVideo] = useState(null); // {url, comment, response, total_ms, ...}
   const [liveStage, setLiveStage] = useState('INTRO');
   const [pendingComments, setPendingComments] = useState([]); // [{id, text, t0}]
+  const [view3d, setView3d] = useState(null); // {kind, frames|url, ms, source}
+  const [transcriptExtract, setTranscriptExtract] = useState(null); // on-device structured pitch hints
   const wsRef = useRef(null);
 
   const connect = useCallback(() => {
@@ -40,7 +42,18 @@ export function useEmpireSocket() {
           setProductData(msg.state.product_data);
           setSalesScript(msg.state.sales_script || null);
           setPitchVideoUrl(msg.state.pitch_video_url || null);
+          if (msg.state.last_response_video_url) {
+            setResponseVideo(prev => prev || { url: msg.state.last_response_video_url });
+          }
           setAgentLog(msg.state.agent_log || []);
+          if (msg.state.view_3d) setView3d(msg.state.view_3d);
+          if (msg.state.transcript_extract) setTranscriptExtract(msg.state.transcript_extract);
+          break;
+        case 'view_3d':
+          setView3d(msg.data);
+          break;
+        case 'transcript_extract':
+          setTranscriptExtract(msg.data);
           break;
         case 'agent_log':
           setAgentLog(prev => [...prev.slice(-49), msg.entry]);
@@ -113,7 +126,9 @@ export function useEmpireSocket() {
   return {
     connected, status, productData, productPhoto, salesScript,
     agentLog, latestAudio, commentResponse, transcript,
-    pitchVideoUrl, responseVideo, liveStage, pendingComments,
+    pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
+    view3d, transcriptExtract,
     sendComment, sendSell,
+    wsRef, // exposed so useAvatarStream can attach an extra message listener
   };
 }

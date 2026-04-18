@@ -1,0 +1,149 @@
+[
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/idle_attentive_1776456402.mp4",
+    "ok": true,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.9408,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 281.91,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 142.5,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/idle_calm_1776456395.mp4",
+    "ok": false,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.5709,
+        "min": 0.85,
+        "ok": false
+      },
+      "mse_first_last": {
+        "value": 2149.14,
+        "max": 600.0,
+        "ok": false
+      },
+      "laplacian_mid": {
+        "value": 126.7,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/idle_thinking_1776456386.mp4",
+    "ok": true,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.9518,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 227.02,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 109.3,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/misc_glance_aside_1776456395.mp4",
+    "ok": true,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.9633,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 174.61,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 81.5,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/misc_hair_touch_1776456488.mp4",
+    "ok": true,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.9271,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 343.46,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 99.5,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/misc_sip_drink_1776456505.mp4",
+    "ok": true,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.8882,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 527.4,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 177.5,
+        "min": 80.0,
+        "ok": true
+      }
+    }
+  },
+  {
+    "video": "/Users/aditya/Desktop/ychackathon/phase0/assets/states/idle/misc_walk_off_return_1776456513.mp4",
+    "ok": false,
+    "checks": {
+      "ssim_first_last": {
+        "value": 0.9036,
+        "min": 0.85,
+        "ok": true
+      },
+      "mse_first_last": {
+        "value": 465.07,
+        "max": 600.0,
+        "ok": true
+      },
+      "laplacian_mid": {
+        "value": 49.8,
+        "min": 80.0,
+        "ok": false
+      }
+    }
+  }
+]

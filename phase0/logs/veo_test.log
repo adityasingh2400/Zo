@@ -1,0 +1,41 @@
+[pitching_pose_speaking] submitting Veo 3.1 image-to-video  (8s, 9:16)
+[pitching_pose_silent] submitting Veo 3.1 image-to-video  (8s, 9:16)
+[pitching_pose_speaking] submitted in 1.25s, operation name: models/veo-3.1-generate-preview/operations/f0s50f0uogdf
+[pitching_pose_silent] submitted in 1.44s, operation name: models/veo-3.1-generate-preview/operations/ecyx8czpm0s3
+[pitching_pose_speaking] poll 1  elapsed=8.2s  done=None
+[pitching_pose_silent] poll 1  elapsed=8.3s  done=None
+[pitching_pose_speaking] poll 2  elapsed=16.4s  done=None
+[pitching_pose_silent] poll 2  elapsed=16.5s  done=None
+[pitching_pose_speaking] poll 3  elapsed=24.7s  done=None
+[pitching_pose_silent] poll 3  elapsed=24.7s  done=None
+[pitching_pose_speaking] poll 4  elapsed=32.9s  done=None
+[pitching_pose_silent] poll 4  elapsed=32.9s  done=None
+[pitching_pose_speaking] poll 5  elapsed=41.1s  done=None
+[pitching_pose_silent] poll 5  elapsed=41.1s  done=None
+[pitching_pose_speaking] poll 6  elapsed=49.3s  done=None
+[pitching_pose_silent] poll 6  elapsed=49.4s  done=None
+[pitching_pose_speaking] poll 7  elapsed=57.5s  done=True
+[pitching_pose_speaking] operation done — response keys:
+[pitching_pose_silent] poll 7  elapsed=57.7s  done=True
+[pitching_pose_silent] operation done — response keys:
+   raw response keys: ['generated_videos', 'rai_media_filtered_count', 'rai_media_filtered_reasons']
+   raw dict: generated_videos=None rai_media_filtered_count=1 rai_media_filtered_reasons=['We encountered an issue with the audio for your prompt, which means we could not create your video. This can sometimes happen due to our safety filters or other processing issues. Please modify your request and try again. You have not been charged for this attempt.']
+task failed: No video in response (see logs)
+[pitching_pose_speaking] DONE in 58.8s  -> /Users/aditya/Desktop/ychackathon/phase0/assets/states/state_pitching_pose_speaking_1776360369.mp4  (2046 KB)
+
+Report: /Users/aditya/Desktop/ychackathon/phase0/bench/results/veo_test.json
+  symlink: state_pitching_pose_speaking.mp4 -> state_pitching_pose_speaking_1776360369.mp4
+[pitching_pose_silent] submitting Veo 3.1 image-to-video  (8s, 9:16)
+[pitching_pose_silent] submitted in 0.97s, operation name: models/veo-3.1-generate-preview/operations/1etnud9vule7
+[pitching_pose_silent] poll 1  elapsed=8.2s  done=None
+[pitching_pose_silent] poll 2  elapsed=16.4s  done=None
+[pitching_pose_silent] poll 3  elapsed=24.6s  done=None
+[pitching_pose_silent] poll 4  elapsed=32.8s  done=None
+[pitching_pose_silent] poll 5  elapsed=41.0s  done=None
+[pitching_pose_silent] poll 6  elapsed=49.2s  done=None
+[pitching_pose_silent] poll 7  elapsed=57.5s  done=True
+[pitching_pose_silent] operation done — response keys:
+[pitching_pose_silent] DONE in 58.5s  -> /Users/aditya/Desktop/ychackathon/phase0/assets/states/state_pitching_pose_silent_1776360467.mp4  (1472 KB)
+
+Report: /Users/aditya/Desktop/ychackathon/phase0/bench/results/veo_test.json
+  symlink: state_pitching_pose_silent.mp4 -> state_pitching_pose_silent_1776360467.mp4

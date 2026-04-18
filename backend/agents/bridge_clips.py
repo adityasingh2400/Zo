@@ -1,0 +1,230 @@
+"""Pre-rendered bridge clips for instant comment responses.
+
+Why: when a viewer comment lands, the LLM + TTS + LatentSync pipeline takes
+~8-15s. To kill the dead air, we play a generic acknowledgement clip
+("great question, let me check") for the first 2-3s while the real response
+renders in the background.
+
+Architecture:
+  • Scripts live in BRIDGE_SCRIPTS — short utterances, label-tagged.
+  • Pre-renders live in backend/renders/bridges/<label>/<slug>.mp4
+  • A manifest.json keeps the (label, script, file, ms) mapping.
+  • At runtime, pick_bridge_clip(label) returns a URL ready to play.
+  • If no clips available for a label, falls back to "neutral" pool.
+  • If THAT pool is empty, returns None and caller skips the bridge.
+
+To populate:
+  python -m agents.bridge_clips render --avatar wav2lip256_avatar1
+  (requires LatentSync /api/latentsync available on RUNPOD_POD_IP)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import logging
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("empire.bridge")
+
+RENDER_DIR = Path(__file__).resolve().parent.parent / "renders"
+BRIDGE_DIR = RENDER_DIR / "bridges"
+MANIFEST_PATH = BRIDGE_DIR / "manifest.json"
+BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Scripts ──────────────────────────────────────────────────────────────────
+# Each entry: (label, text). Labels match the Gemma classifier output:
+# "question" | "compliment" | "objection" | "neutral".
+# Keep utterances 1.5-3s long — they buy us time, not full responses.
+BRIDGE_SCRIPTS: list[tuple[str, str]] = [
+    # questions
+    ("question", "Great question — let me think about that."),
+    ("question", "Ooh, good one. Hold on a sec."),
+    ("question", "Yeah, totally fair to ask."),
+    ("question", "I love that you asked that."),
+    # compliments
+    ("compliment", "Aww thank you so much!"),
+    ("compliment", "I appreciate that, seriously."),
+    ("compliment", "You're so sweet, thank you."),
+    # objections
+    ("objection", "Totally hear you on that."),
+    ("objection", "I get it, let me address that."),
+    ("objection", "That's fair, here's the deal."),
+    # neutral acks (used as fallback for any label)
+    ("neutral", "Okay, hang on one second."),
+    ("neutral", "Yeah, let me show you."),
+    ("neutral", "Mhm, mhm."),
+    ("neutral", "Right, so..."),
+]
+
+
+def _slug(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:10]
+
+
+def load_manifest() -> dict[str, list[dict[str, Any]]]:
+    """Returns {label: [{script, file, url, ms}, ...]}."""
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        return json.loads(MANIFEST_PATH.read_text())
+    except Exception as e:
+        logger.warning("manifest read failed: %s", e)
+        return {}
+
+
+def save_manifest(manifest: dict[str, list[dict[str, Any]]]):
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
+
+
+# ── Runtime selection ────────────────────────────────────────────────────────
+
+
+def pick_bridge_clip(label: str) -> dict[str, Any] | None:
+    """Return a random pre-rendered bridge for `label`, falling back to
+    "neutral" if no clips for that label exist. Returns None if neither
+    pool is populated."""
+    manifest = load_manifest()
+    pool = manifest.get(label) or []
+    if not pool:
+        pool = manifest.get("neutral") or []
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+def all_bridges() -> dict[str, list[dict[str, Any]]]:
+    return load_manifest()
+
+
+# ── Pre-render workflow ──────────────────────────────────────────────────────
+
+
+async def render_all(
+    *,
+    elevenlabs_voice: str = "Rachel",
+    avatar_video: str = "/workspace/state_pitching_pose_speaking_1080p.mp4",
+    overwrite: bool = False,
+):
+    """Generate TTS for each script, send through LatentSync, save to disk,
+    write/update manifest. Idempotent — skips already-rendered clips by
+    matching the (script, sha256) slug."""
+    from agents.seller import text_to_speech, render_pitch_latentsync
+
+    manifest = load_manifest()
+    rendered = 0
+    skipped = 0
+    failed = 0
+
+    for label, text in BRIDGE_SCRIPTS:
+        slug = _slug(text)
+        out_dir = BRIDGE_DIR / label
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{slug}.mp4"
+
+        # Skip if already rendered + in manifest
+        existing = next(
+            (c for c in manifest.get(label, []) if c.get("script") == text and Path(c.get("file", "")).exists()),
+            None,
+        )
+        if existing and not overwrite:
+            skipped += 1
+            logger.info("[skip] %s/%s already rendered", label, slug)
+            continue
+
+        t0 = time.time()
+        try:
+            logger.info("[tts ] %s/%s — %s", label, slug, text)
+            audio_b64 = await text_to_speech(text, voice=elevenlabs_voice)
+            if not audio_b64:
+                logger.warning("[fail] no audio for %s", text)
+                failed += 1
+                continue
+
+            logger.info("[ls  ] %s/%s sending to LatentSync...", label, slug)
+            video_url = await render_pitch_latentsync(audio_b64, source_video_path=avatar_video)
+            if not video_url:
+                logger.warning("[fail] no video for %s", text)
+                failed += 1
+                continue
+
+            # render_pitch_latentsync returns a /renders/... URL pointing at a saved file.
+            # Move/copy into our bridges dir for organisation.
+            src_path = RENDER_DIR / Path(video_url).name
+            if src_path.exists():
+                src_path.rename(out_path)
+            else:
+                logger.warning("[fail] render file missing: %s", src_path)
+                failed += 1
+                continue
+
+            ms = int((time.time() - t0) * 1000)
+            entry = {
+                "script": text,
+                "file": str(out_path.relative_to(RENDER_DIR.parent)),
+                "url": f"/renders/bridges/{label}/{out_path.name}",
+                "ms": ms,
+            }
+            manifest.setdefault(label, []).append(entry)
+            save_manifest(manifest)
+            rendered += 1
+            logger.info("[ok  ] %s/%s in %dms", label, slug, ms)
+        except Exception as e:
+            logger.exception("[err ] %s/%s: %s", label, slug, e)
+            failed += 1
+
+    logger.info("=" * 60)
+    logger.info("bridge render done: rendered=%d skipped=%d failed=%d", rendered, skipped, failed)
+    logger.info("manifest at %s", MANIFEST_PATH)
+    logger.info("=" * 60)
+    return {"rendered": rendered, "skipped": skipped, "failed": failed, "total": len(BRIDGE_SCRIPTS)}
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="show registered bridge scripts")
+
+    r = sub.add_parser("render", help="render all bridge clips via TTS + LatentSync")
+    r.add_argument("--voice", default="Rachel")
+    r.add_argument("--avatar", default="/workspace/state_pitching_pose_speaking_1080p.mp4",
+                   help="path to avatar source video on the RunPod")
+    r.add_argument("--overwrite", action="store_true")
+
+    sub.add_parser("manifest", help="print current manifest")
+
+    args = parser.parse_args()
+
+    if args.cmd == "list":
+        for label, text in BRIDGE_SCRIPTS:
+            print(f"  [{label:11}] {text}")
+        return
+
+    if args.cmd == "manifest":
+        m = load_manifest()
+        for label, items in m.items():
+            print(f"== {label} ({len(items)} clips)")
+            for c in items:
+                print(f"   - {c['url']:60} ({c.get('ms', '?')}ms) — {c['script']}")
+        return
+
+    if args.cmd == "render":
+        # Add backend dir to path so `agents.seller` resolves.
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        result = asyncio.run(render_all(
+            elevenlabs_voice=args.voice,
+            avatar_video=args.avatar,
+            overwrite=args.overwrite,
+        ))
+        sys.exit(0 if result["failed"] == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

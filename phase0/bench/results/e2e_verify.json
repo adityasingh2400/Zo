@@ -1,0 +1,421 @@
+{
+  "n": 10,
+  "n_ok": 10,
+  "pass_rate": 1.0,
+  "p50_ms": 5625,
+  "p95_ms": 6005,
+  "budget_ms": 12000,
+  "out_height": 1080,
+  "items": [
+    {
+      "i": 1,
+      "comment": "What size will fit a small wrist?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5845,
+      "total_ms": 5797,
+      "breakdown": {
+        "classify_ms": 1636,
+        "llm_ms": 1116,
+        "tts_ms": 520,
+        "lipsync_ms": 4159
+      },
+      "wav2lip": {
+        "total_sec": "2.633",
+        "detect_sec": "0.513",
+        "predict_sec": "0.743"
+      },
+      "response": "Our small size fits wrists under seven inches comfortably!",
+      "word_count": 9,
+      "url": "/renders/resp_1776401878.mp4",
+      "size_kb": 979,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2752252,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 2.833333
+      }
+    },
+    {
+      "i": 2,
+      "comment": "Is this real leather or faux?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5129,
+      "total_ms": 5119,
+      "breakdown": {
+        "classify_ms": 1287,
+        "llm_ms": 853,
+        "tts_ms": 433,
+        "lipsync_ms": 3831
+      },
+      "wav2lip": {
+        "total_sec": "2.304",
+        "detect_sec": "0.63",
+        "predict_sec": "0.603"
+      },
+      "response": "It's genuine full-grain leather, built to last you years!",
+      "word_count": 9,
+      "url": "/renders/resp_1776401884.mp4",
+      "size_kb": 1021,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2749467,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 2.958333
+      }
+    },
+    {
+      "i": 3,
+      "comment": "Does it ship internationally?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 4987,
+      "total_ms": 4979,
+      "breakdown": {
+        "classify_ms": 1294,
+        "llm_ms": 979,
+        "tts_ms": 314,
+        "lipsync_ms": 3684
+      },
+      "wav2lip": {
+        "total_sec": "2.151",
+        "detect_sec": "0.542",
+        "predict_sec": "0.575"
+      },
+      "response": "We ship to most countries, but let me check your specific location!",
+      "word_count": 12,
+      "url": "/renders/resp_1776401889.mp4",
+      "size_kb": 1065,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2751305,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 3.083333
+      }
+    },
+    {
+      "i": 4,
+      "comment": "How long does the battery last?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5134,
+      "total_ms": 5122,
+      "breakdown": {
+        "classify_ms": 1495,
+        "llm_ms": 1189,
+        "tts_ms": 305,
+        "lipsync_ms": 3626
+      },
+      "wav2lip": {
+        "total_sec": "2.325",
+        "detect_sec": "0.565",
+        "predict_sec": "0.556"
+      },
+      "response": "Battery lasts up to ten hours on a single charge!",
+      "word_count": 10,
+      "url": "/renders/resp_1776401894.mp4",
+      "size_kb": 816,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2686596,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 2.416667
+      }
+    },
+    {
+      "i": 5,
+      "comment": "Returns policy?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5633,
+      "total_ms": 5625,
+      "breakdown": {
+        "classify_ms": 1786,
+        "llm_ms": 1407,
+        "tts_ms": 378,
+        "lipsync_ms": 3838
+      },
+      "wav2lip": {
+        "total_sec": "2.12",
+        "detect_sec": "0.529",
+        "predict_sec": "0.536"
+      },
+      "response": "We offer thirty days for returns, full refund guaranteed!",
+      "word_count": 9,
+      "url": "/renders/resp_1776401900.mp4",
+      "size_kb": 1058,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2772024,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 3.041667
+      }
+    },
+    {
+      "i": 6,
+      "comment": "Looks gorgeous on you!",
+      "expected": "compliment",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5887,
+      "total_ms": 5879,
+      "breakdown": {
+        "classify_ms": 1510,
+        "llm_ms": 1098,
+        "tts_ms": 412,
+        "lipsync_ms": 4368
+      },
+      "wav2lip": {
+        "total_sec": "2.763",
+        "detect_sec": "0.488",
+        "predict_sec": "0.775"
+      },
+      "response": "Thank you so much, you have amazing taste\u2014want to grab one for yourself?",
+      "word_count": 13,
+      "url": "/renders/resp_1776401906.mp4",
+      "size_kb": 1262,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2772212,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 3.625
+      }
+    },
+    {
+      "i": 7,
+      "comment": "This is way too expensive for what it is.",
+      "expected": "objection",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 6012,
+      "total_ms": 6005,
+      "breakdown": {
+        "classify_ms": 1890,
+        "llm_ms": 1460,
+        "tts_ms": 430,
+        "lipsync_ms": 4113
+      },
+      "wav2lip": {
+        "total_sec": "2.534",
+        "detect_sec": "0.539",
+        "predict_sec": "0.845"
+      },
+      "response": "I get that\u2014but you're paying for quality that lasts years, not months.",
+      "word_count": 12,
+      "url": "/renders/resp_1776401912.mp4",
+      "size_kb": 1564,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2822851,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 4.416667
+      }
+    },
+    {
+      "i": 8,
+      "comment": "Cheaper on Amazon, why buy here?",
+      "expected": "objection",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5597,
+      "total_ms": 5587,
+      "breakdown": {
+        "classify_ms": 1520,
+        "llm_ms": 993,
+        "tts_ms": 526,
+        "lipsync_ms": 4067
+      },
+      "wav2lip": {
+        "total_sec": "2.376",
+        "detect_sec": "0.501",
+        "predict_sec": "0.714"
+      },
+      "response": "I'd need to know which product you're looking at to give you the real comparison!",
+      "word_count": 15,
+      "url": "/renders/resp_1776401918.mp4",
+      "size_kb": 1268,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2755601,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 3.666667
+      }
+    },
+    {
+      "i": 9,
+      "comment": "first lol",
+      "expected": "spam",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 6349,
+      "total_ms": 6341,
+      "breakdown": {
+        "classify_ms": 2385,
+        "llm_ms": 1960,
+        "tts_ms": 425,
+        "lipsync_ms": 3956
+      },
+      "wav2lip": {
+        "total_sec": "2.165",
+        "detect_sec": "0.477",
+        "predict_sec": "0.569"
+      },
+      "response": "Welcome to the stream, thanks for hanging with us!",
+      "word_count": 9,
+      "url": "/renders/resp_1776401924.mp4",
+      "size_kb": 898,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2723900,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 2.625
+      }
+    },
+    {
+      "i": 10,
+      "comment": "Can it sync with my Garmin app?",
+      "expected": "question",
+      "ok": true,
+      "checks": {
+        "has_url": true,
+        "has_response": true,
+        "response_short": true,
+        "video_tall_enough": true,
+        "video_h264": true,
+        "video_has_audio": true,
+        "within_budget": true
+      },
+      "elapsed_ms": 5351,
+      "total_ms": 5330,
+      "breakdown": {
+        "classify_ms": 1442,
+        "llm_ms": 1040,
+        "tts_ms": 402,
+        "lipsync_ms": 3885
+      },
+      "wav2lip": {
+        "total_sec": "2.37",
+        "detect_sec": "0.458",
+        "predict_sec": "0.717"
+      },
+      "response": "That's a feature we're exploring, but it doesn't currently sync with Garmin.",
+      "word_count": 12,
+      "url": "/renders/resp_1776401930.mp4",
+      "size_kb": 1217,
+      "probe": {
+        "width": 606,
+        "height": 1080,
+        "video_codec": "h264",
+        "video_bitrate": 2770996,
+        "audio_codec": "aac",
+        "audio_channels": 1,
+        "duration_sec": 3.5
+      }
+    }
+  ]
+}

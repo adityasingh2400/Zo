@@ -37,7 +37,8 @@ IDLE_DIR = ROOT / "assets" / "states" / "idle"
 # being played in reverse.
 LOOPABLE = [
     "idle_calm",
-    "idle_attentive",
+    "idle_reading_comments",
+    "idle_attentive",   # legacy alias
     "idle_thinking",
     "misc_glance_aside",
     "misc_hair_touch",

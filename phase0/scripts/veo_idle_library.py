@@ -27,7 +27,13 @@ for k, v in env.items():
 from google import genai
 from google.genai import types
 
-API_KEY = os.environ["GEMINI_API_KEY"]
+# Vertex AI (production model `veo-3.1-generate-001`, 50 RPM, no daily preview cap)
+# is preferred. Falls back to Gemini API preview model if Vertex env not set.
+USE_VERTEX = bool(os.environ.get("GCP_PROJECT_ID"))
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
+VEO_MODEL = "veo-3.1-generate-001" if USE_VERTEX else "veo-3.1-generate-preview"
 PORTRAIT = ROOT / "assets" / "portraits" / "portrait.png"
 OUT_DIR = ROOT / "assets" / "states" / "idle"  # rendered into states/idle so they ship next to the speaking-pose source
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,31 +83,50 @@ PERFORMANCES: dict[str, str] = {
         "still photograph that happens to include two blinks. The end frame "
         "must match the start frame so the clip can repeat invisibly."
     ),
-    "idle_attentive": (
-        "She is reacting to a viewer's chat message: a clear, definite "
-        "lean toward the camera between second zero and second two — her "
-        "head and shoulders move forward by about 12-15cm so the lean is "
-        "obviously visible (not subtle). At the same time her eyes shift "
-        "down and to HER lower-RIGHT (the viewer's lower-LEFT) and "
-        "settle there. She HOLDS this leaned-in, looking-down-right pose "
-        "perfectly still from second two through second six — body locked, "
-        "head locked, only the eyes very slightly track within the lower-"
-        "right region. A clear interested squint (visible lid-tighten, "
-        "narrowing of both eyes), a small inner-brow furrow, and a "
-        "knowing dimpled half-smile at one corner of the mouth. Her "
-        "mouth stays closed — no speech, no jaw motion, no parted lips. "
-        "Her hands NEVER appear in frame and never move. NO text, no "
-        "chat panel, no UI overlay, no paper, no object, no graphics — "
-        "the background stays the same cozy bedroom set with fairy-light "
-        "bokeh, completely unchanged. The lean and squint should be "
-        "clearly distinguishable from a still portrait — a casual viewer "
-        "must instantly read this as 'she just leaned in to read "
-        "something.' Camera stays rigidly locked off — the lean is from "
-        "the subject moving toward the lens, not the lens moving toward "
-        "her. (The clip will be played forward then in reverse to create "
-        "a seamless loop, so it does not need to return to the anchor "
-        "pose at second eight; just hold the lean cleanly through the end.)"
+    "idle_reading_comments": (
+        "She is reading text on a phone or tablet that is sitting on a "
+        "desk BELOW THE CAMERA, just out of frame. The camera is NOT "
+        "what she is looking at. Treat the camera as if it does not "
+        "exist — she is not aware of it, not addressing it, not "
+        "performing for it. Her attention is entirely on the off-screen "
+        "device below the lens.\n\n"
+        "Beats:\n"
+        "Seconds 0-2: she leans forward about 12-15cm toward the desk "
+        "to read more easily. Her eyes drop down to the device the "
+        "moment she starts leaning. There is no moment of eye contact "
+        "with the camera — by frame 24 her gaze is already off-screen "
+        "downward.\n"
+        "Seconds 2-6: COMPLETELY FROZEN HOLD. She is a still photograph "
+        "for these four seconds. Her head does not tilt, rotate, or "
+        "nod. Her shoulders do not drift. Her hands do not appear or "
+        "twitch. Her mouth stays closed. Her gaze remains fixed on the "
+        "off-screen device — eyes pointed down and slightly to HER "
+        "lower-right (viewer's lower-left). The only motion permitted "
+        "in this entire window is one slow blink near second four. "
+        "Otherwise: statue-still.\n"
+        "Seconds 6-8: she relaxes back toward the anchor pose, gaze "
+        "lifts.\n\n"
+        "EYE CONTACT RULE: from second 1 onward through second 7 she "
+        "MUST NOT look at the camera. Not for a single frame. Not even "
+        "briefly. Even during her blink. Her eyes are pointed at the "
+        "off-screen device, which is below the lens and slightly to "
+        "her right. If you find yourself rendering eye contact, that "
+        "is wrong — render her looking down-right instead.\n\n"
+        "Her face shows quiet concentration: a subtle visible lid-"
+        "tighten (interested squint), a small inner-brow furrow, a "
+        "tiny dimpled half-smile at one mouth corner. Mouth closed "
+        "throughout, no speech, no jaw motion. Hands NEVER appear. NO "
+        "text overlay, no chat UI, no graphics, no paper, no object — "
+        "the bedroom set with fairy-light bokeh stays unchanged. "
+        "Camera is locked off on a tripod — the lean is the subject "
+        "moving toward the desk, not the lens moving toward her. "
+        "(The clip will be boomeranged forward+reverse so frame 192 "
+        "matches frame 0 automatically; you do not need to return to "
+        "the anchor pose at second eight.)"
     ),
+    # Backward-compat alias — points at the same prompt under the old name.
+    # Keep until the Director's TIER0_LIBRARY is renamed to match.
+    "idle_attentive": "__alias__:idle_reading_comments",
     "idle_thinking": (
         "A quiet thinking beat: head tilts gently 8 degrees to her right by "
         "second two, brow lowers slightly (concentration), one hand drifts up "
@@ -140,15 +165,22 @@ PERFORMANCES: dict[str, str] = {
 def gen_one(label: str) -> dict:
     if label not in PERFORMANCES:
         return {"label": label, "error": f"unknown performance label"}
-    client = genai.Client(api_key=API_KEY)
+    # Alias resolution — let an old label point at a new prompt without
+    # duplicating the text. e.g. idle_attentive -> idle_reading_comments.
+    perf = PERFORMANCES[label]
+    if isinstance(perf, str) and perf.startswith("__alias__:"):
+        target = perf.split(":", 1)[1]
+        perf = PERFORMANCES[target]
+    client = (genai.Client(vertexai=True, project=GCP_PROJECT_ID, location=GCP_LOCATION)
+              if USE_VERTEX else genai.Client(api_key=API_KEY))
     image_bytes = PORTRAIT.read_bytes()
-    prompt = SCAFFOLD.format(PERFORMANCE=PERFORMANCES[label])
+    prompt = SCAFFOLD.format(PERFORMANCE=perf)
     print(f"[{label}] submitting Veo 3.1 (1080p, 9:16, 8s)")
     t0 = time.perf_counter()
 
     try:
         op = client.models.generate_videos(
-            model="veo-3.1-generate-preview",
+            model=VEO_MODEL,
             prompt=prompt,
             image=types.Image(image_bytes=image_bytes, mime_type="image/png"),
             # NOTE: person_generation is auto-managed when conditioning on an

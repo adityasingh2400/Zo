@@ -673,12 +673,8 @@ async def api_respond_to_comment(
     resp_ms = int((time.time() - t0) * 1000)
     log_event("SELLER", f"response drafted ({resp_ms}ms)", {"response": response_text})
 
-    # 3) Kick off TTS immediately
-    t0 = time.time()
-    audio_bytes = await text_to_speech(response_text)
-    tts_ms = int((time.time() - t0) * 1000)
-
-    # Collect classify result if it finished — used for both badging AND bridge pick
+    # 3) Collect classify result NOW — needed to pick the right bridge label.
+    #    Don't wait if it hasn't finished; fall back to "neutral" pool.
     comment_type = "question"
     class_ms = int((time.time() - class_t0) * 1000)
     if classify_task.done():
@@ -690,12 +686,24 @@ async def api_respond_to_comment(
         classify_task.cancel()
     log_event("EYES", f'Comment "{comment[:40]}" → {comment_type} ({class_ms}ms)')
 
-    # 4) Bridge clip — crossfades over reading_chat. Best-effort; if no clip
-    #    in the manifest for this label, dashboard just keeps reading_chat
-    #    until the response lands.
+    # 4) Fire TTS and bridge in parallel. Bridge plays an audible
+    #    acknowledgment over the reading_chat pose while TTS + Wav2Lip cook.
+    #    Without parallelism the bridge would only get the Wav2Lip render
+    #    window (~3.5s) to play; with parallelism it gets the full TTS +
+    #    Wav2Lip window (~4s) so it doesn't end before the response arrives.
+    bridge_task = None
     if director:
+        bridge_task = asyncio.create_task(director.play_bridge(comment_type))
+
+    t0 = time.time()
+    audio_bytes = await text_to_speech(response_text)
+    tts_ms = int((time.time() - t0) * 1000)
+
+    # Best-effort: collect bridge result without blocking. If the manifest
+    # is empty / the call errored we just keep reading_chat showing.
+    if bridge_task and bridge_task.done():
         try:
-            await director.play_bridge(comment_type)
+            bridge_task.result()
         except Exception:
             logger.exception("[director] play_bridge failed (non-fatal)")
 
@@ -705,14 +713,33 @@ async def api_respond_to_comment(
     #    Tier 1 fades in over the calm idle layer.
     substrate = director.current_substrate_pod_path() if director else None
     t0 = time.time()
-    if substrate:
-        video_bytes, headers = await render_comment_response_wav2lip(
-            audio_bytes, source_path_on_pod=substrate, out_height=out_height,
-        )
-    else:
-        video_bytes, headers = await render_comment_response_wav2lip(
-            audio_bytes, out_height=out_height,
-        )
+    try:
+        if substrate:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=substrate, out_height=out_height,
+            )
+        else:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=out_height,
+            )
+    except Exception as e:
+        # If the configured substrate doesn't exist on the pod (400 / 404),
+        # mark it unavailable so future calls skip it, then retry with the
+        # default speaking-pose substrate. This keeps the live path alive
+        # when speaking variants haven't shipped yet.
+        if substrate and director:
+            err_str = str(e).lower()
+            if "404" in err_str or "400" in err_str or "not found" in err_str:
+                logger.warning("[lipsync] substrate %s unavailable, falling back: %s",
+                               substrate, e)
+                director.mark_substrate_status(substrate, False)
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=out_height,
+                )
+            else:
+                raise
+        else:
+            raise
     lipsync_ms = int((time.time() - t0) * 1000)
 
     url = _save_render("resp", video_bytes)

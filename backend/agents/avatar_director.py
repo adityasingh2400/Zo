@@ -42,16 +42,25 @@ IDLE_ROTATE_MAX_MS = 18_000
 # looking unnatural (reversed sip = vomit, reversed walk = moonwalk), so
 # they live in TIER1_INTERJECTIONS instead and play as one-shot crossfades
 # with the looping idle still painting underneath.
-# (intent, dashboard URL, weight, pod path for Wav2Lip substrate)
-# The pod_path is the file the Wav2Lip server reads when this idle is the
-# currently-active Tier 0; matching the response substrate to the playing
-# idle keeps body language continuous through the crossfade.
+# Each row: (intent, dashboard URL, rotation weight, Wav2Lip substrate pod path).
+#
+# The substrate is what Wav2Lip uses when a comment fires while this idle
+# is the visible Tier 0. We DO NOT use the idle clip itself as the substrate —
+# Wav2Lip needs an open, expressively-moving mouth to predict on. Instead
+# every idle has a paired "speaking variant" with the same body language /
+# framing but with active speech motion. The visual continuity comes from
+# matching body, the lip-sync quality comes from matching mouth motion.
+#
+# Speaking variants live in /workspace/idle_speaking/ on the pod (uploaded
+# by upload_speaking_variants.sh). If a variant doesn't exist yet we fall
+# back to the original speaking-pose substrate; the dashboard crossfade
+# hides the body mismatch on those clips until variants ship.
 TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
-    ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle/idle_calm.mp4"),
-    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle/idle_reading_comments.mp4"),
-    ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle/idle_thinking.mp4"),
-    ("misc_glance_aside",    "/states/idle/misc_glance_aside.mp4",    0.05, "/workspace/idle/misc_glance_aside.mp4"),
-    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.05, "/workspace/idle/misc_hair_touch.mp4"),
+    ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
+    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle_speaking/idle_reading_comments_speaking.mp4"),
+    ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
+    ("misc_glance_aside",    "/states/idle/misc_glance_aside.mp4",    0.05, "/workspace/idle_speaking/misc_glance_aside_speaking.mp4"),
+    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.05, "/workspace/idle_speaking/misc_hair_touch_speaking.mp4"),
 ]
 
 # Tier 1 one-shot interjections. Director picks one occasionally and plays
@@ -78,8 +87,8 @@ class Director:
     """One-per-process avatar choreographer."""
 
     # Default Wav2Lip substrate (matches POD_SPEAKING_1080P in config). Used
-    # if no Tier 0 idle is currently active (early startup) — but in practice
-    # the idle rotation kicks immediately so this is rarely hit.
+    # whenever the configured speaking variant for the active idle isn't
+    # available on the pod (e.g. variant not yet rendered/uploaded).
     DEFAULT_SUBSTRATE_POD_PATH = "/workspace/state_pitching_pose_speaking_1080p.mp4"
 
     def __init__(self, broadcast: Callable[[dict], Awaitable[None]]):
@@ -92,10 +101,29 @@ class Director:
         # currently painting. Wav2Lip pulls this so the response inherits
         # the body language of the visible idle clip.
         self._current_substrate_pod_path: str = self.DEFAULT_SUBSTRATE_POD_PATH
+        # Per-substrate availability cache. Populated lazily by probing
+        # the Wav2Lip server's /prewarm endpoint (which 400s if the pod
+        # path doesn't exist). Kept here so we don't hit the network on
+        # every comment.
+        self._substrate_available: dict[str, bool] = {
+            self.DEFAULT_SUBSTRATE_POD_PATH: True,
+        }
 
     def current_substrate_pod_path(self) -> str:
-        """The Wav2Lip server-side path that matches the visible Tier 0 clip."""
-        return self._current_substrate_pod_path
+        """The Wav2Lip server-side path that matches the visible Tier 0 clip,
+        falling back to the default speaking-pose substrate if the configured
+        speaking variant isn't on the pod yet."""
+        path = self._current_substrate_pod_path
+        if self._substrate_available.get(path) is False:
+            return self.DEFAULT_SUBSTRATE_POD_PATH
+        return path
+
+    def mark_substrate_status(self, pod_path: str, available: bool) -> None:
+        """Record whether a substrate is on the pod (lazy cache populated
+        by external probe code or by Wav2Lip 400 errors at render time)."""
+        self._substrate_available[pod_path] = available
+        if not available:
+            logger.warning("[director] substrate %s unavailable; will fall back to default", pod_path)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
     def mark_ready(self) -> None:

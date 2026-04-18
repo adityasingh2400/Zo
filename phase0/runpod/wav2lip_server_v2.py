@@ -134,7 +134,11 @@ def _face_detect_cached(source_path: pathlib.Path, out_height: int):
     # cache miss: detect
     t0 = time.perf_counter()
     boxes = []
-    pad_top, pad_bottom, pad_left, pad_right = 0, 20, 0, 0
+    # Larger pad gives the predicted mouth more vertical area to land on a
+    # closed-mouth substrate, fixing the "tiny pasted mouth" look on idle
+    # poses. pad_top adds forehead room (helps the face crop frame the chin
+    # better), pad_bottom adds chin room (where new mouth pixels actually go).
+    pad_top, pad_bottom, pad_left, pad_right = 10, 30, 5, 5
 
     nb = (len(frames) + FACE_BATCH - 1) // FACE_BATCH
     last_box = None
@@ -251,12 +255,40 @@ def _run_lipsync(source_path: pathlib.Path, audio_path: pathlib.Path, out_path: 
         mel_t = torch.FloatTensor(np.transpose(mels, (0, 3, 1, 2))).to(DEVICE)
         return img_t, mel_t
 
+    # Soft-edge mask for paste-back: feather the patch boundary so the seam
+    # between predicted mouth pixels and original face pixels is invisible.
+    # Built once per frame size since the box dims are stable across the take.
+    _mask_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    def _soft_mask(h: int, w: int) -> np.ndarray:
+        """3-channel float mask, 1.0 in the center, fading to 0 at edges."""
+        key = (h, w)
+        if key not in _mask_cache:
+            mask = np.ones((h, w), dtype=np.float32)
+            # Feather width: ~10% of the smaller dimension, capped at 24px
+            # so we don't over-blend on tight crops.
+            feather = max(4, min(24, int(min(h, w) * 0.10)))
+            for i in range(feather):
+                a = (i + 1) / (feather + 1)
+                mask[i, :] *= a
+                mask[h - 1 - i, :] *= a
+                mask[:, i] *= a
+                mask[:, w - 1 - i] *= a
+            _mask_cache[key] = np.dstack([mask, mask, mask])
+        return _mask_cache[key]
+
     with torch.no_grad():
         for (img_t, mel_t), frm_batch, coord_batch in datagen():
             pred = MODEL(mel_t, img_t).cpu().numpy().transpose(0, 2, 3, 1) * 255.0
             for p, f, (y1, y2, x1, x2) in zip(pred, frm_batch, coord_batch):
-                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1), interpolation=cv2.INTER_LANCZOS4)
-                f[y1:y2, x1:x2] = p
+                ph, pw = y2 - y1, x2 - x1
+                p = cv2.resize(p.astype(np.uint8), (pw, ph), interpolation=cv2.INTER_LANCZOS4)
+                # Alpha-blend the predicted patch over the original frame
+                # using the feathered mask. Hides the rectangular seam.
+                mask = _soft_mask(ph, pw)
+                original = f[y1:y2, x1:x2].astype(np.float32)
+                blended = original * (1.0 - mask) + p.astype(np.float32) * mask
+                f[y1:y2, x1:x2] = blended.astype(np.uint8)
                 writer.write(f)
     writer.release()
     timings["predict_sec"] = round(time.perf_counter() - t0, 3)

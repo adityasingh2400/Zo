@@ -22,6 +22,14 @@ export function useEmpireSocket() {
   const [pendingComments, setPendingComments] = useState([]); // [{id, text, t0}]
   const [view3d, setView3d] = useState(null); // {kind, frames|url, ms, source}
   const [transcriptExtract, setTranscriptExtract] = useState(null); // on-device structured pitch hints
+  const [voiceTranscript, setVoiceTranscript] = useState(null); // {text, source, ms} — latest mic-in transcript
+  // Router telemetry: last N decisions + rolled-up counters for RoutingPanel.
+  // local = any tool that avoids a cloud round-trip (respond_locally /
+  // play_canned_clip / block_comment). cloud = escalate_to_cloud.
+  const [routingDecisions, setRoutingDecisions] = useState([]); // newest-last
+  const [routingStats, setRoutingStats] = useState({
+    total: 0, local: 0, cloud: 0, cost_saved_usd: 0,
+  });
   const wsRef = useRef(null);
 
   const connect = useCallback(() => {
@@ -92,6 +100,76 @@ export function useEmpireSocket() {
         case 'transcript':
           setTranscript(msg.text);
           break;
+        case 'routing_decision':
+          // Keep a rolling window of the last 50 decisions + roll up counters.
+          // Panel reads both: counters for the big headline, list for the
+          // per-comment feed judges see from 10ft.
+          //
+          // Attach a stable sequence id so React keys don't shift when new
+          // decisions arrive — otherwise old rows remount and their pulse
+          // animation re-fires, which looks like every row is blinking.
+          setRoutingDecisions(prev => {
+            const nextSeq = (prev[prev.length - 1]?.seq ?? 0) + 1;
+            return [...prev.slice(-49), {
+              ...msg,
+              seq: nextSeq,
+              receivedAt: Date.now(),
+            }];
+          });
+          setRoutingStats(prev => {
+            // Reject non-finite cost_saved_usd (NaN / Infinity) — if a
+            // malformed broadcast ever poisons the accumulator, the panel
+            // would show "$NaN" for the rest of the session.
+            const saved = Number(msg.cost_saved_usd);
+            const delta = Number.isFinite(saved) && saved >= 0 ? saved : 0;
+            return {
+              total: prev.total + 1,
+              local: prev.local + (msg.tool !== 'escalate_to_cloud' ? 1 : 0),
+              cloud: prev.cloud + (msg.tool === 'escalate_to_cloud' ? 1 : 0),
+              cost_saved_usd: prev.cost_saved_usd + delta,
+            };
+          });
+          break;
+        case 'comment_blocked':
+          // Router decided the comment is spam. Drop its pending chip so
+          // LiveStage's "Reading..." overlay clears. No video, no bubble.
+          setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          break;
+        case 'comment_failed':
+          // Downstream render failed (Wav2Lip, TTS, Claude, etc.). Drop the
+          // matching pending chip so LiveStage's "Reading..." overlay clears.
+          setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          // If Claude drafted text before the downstream blew up, show it
+          // as a degraded reply — better than nothing while the pod is down.
+          if (msg.response) {
+            const degraded = {
+              type: 'comment_failed',
+              comment: msg.comment,
+              response: msg.response,
+              degraded: true,
+              total_ms: 0,
+            };
+            setCommentResponse(degraded);
+            setResponseVideo(prev => prev ?? degraded);
+          }
+          break;
+        case 'voice_transcript':
+          // Fires within ~200ms of push-to-talk release. Drop empty
+          // transcripts (no_speech / transcription_failed) — the endpoint
+          // has already short-circuited those; the dashboard shouldn't
+          // flash an empty bubble.
+          if (msg.text) {
+            setVoiceTranscript({ text: msg.text, source: msg.source, ms: msg.ms });
+            // Add as a pending comment so ChatPanel renders the
+            // "AI Seller (rendering...)" placeholder alongside the bubble,
+            // matching the typed-comment UX. Cleared by comment_response_video.
+            const id = `v_${Date.now()}`;
+            setPendingComments(prev => [...prev, {
+              id, text: msg.text, t0: Date.now(),
+              source: 'voice', voiceSource: msg.source, voiceMs: msg.ms,
+            }]);
+          }
+          break;
       }
     };
 
@@ -127,7 +205,8 @@ export function useEmpireSocket() {
     connected, status, productData, productPhoto, salesScript,
     agentLog, latestAudio, commentResponse, transcript,
     pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
-    view3d, transcriptExtract,
+    view3d, transcriptExtract, voiceTranscript,
+    routingDecisions, routingStats,
     sendComment, sendSell,
     wsRef, // exposed so useAvatarStream can attach an extra message listener
   };

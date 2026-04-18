@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import base64
 import logging
@@ -19,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger("empire")
 
 from config import BACKEND_HOST, BACKEND_PORT
-from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma
+from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
 from agents.creator import remove_background, generate_3d_model
 from agents.seller import (
     generate_comment_response,
@@ -33,6 +34,7 @@ from agents.intake import process_video
 from agents.threed import carousel_from_video, glb_from_image
 from agents.bridge_clips import pick_bridge_clip, all_bridges
 from agents.avatar_director import Director
+from agents import router as comment_router
 
 # ── State ──────────────────────────────────────────────
 
@@ -61,6 +63,52 @@ phone_clients: list[WebSocket] = []
 director: "Director | None" = None  # set in app startup, see below
 
 
+PRODUCTS_PATH = Path(__file__).resolve().parent / "data" / "products.json"
+
+
+def _load_active_product() -> None:
+    """Read backend/data/products.json and pick an active product. The active
+    product lives in pipeline_state["product_data"] so the router's
+    respond_locally path can match against its qa_index immediately —
+    no prior /api/sell upload required for the demo.
+
+    Selection order:
+      1. ACTIVE_PRODUCT_ID env var if set and present in the file
+      2. First key in the JSON (dicts preserve insertion order)
+    Missing file or unreadable JSON: log + skip (router falls back to cloud).
+    """
+    if not PRODUCTS_PATH.exists():
+        logger.info("No products.json at %s — skipping pre-load", PRODUCTS_PATH)
+        return
+    try:
+        with PRODUCTS_PATH.open() as f:
+            products = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to read products.json: %s", e)
+        return
+    if not products:
+        return
+    if not isinstance(products, dict):
+        logger.warning("products.json must be a JSON object keyed by product id "
+                       "(got %s) — skipping", type(products).__name__)
+        return
+
+    active_id = os.getenv("ACTIVE_PRODUCT_ID") or next(iter(products.keys()))
+    product = products.get(active_id)
+    if not isinstance(product, dict):
+        logger.warning("Product %r is not an object — skipping", active_id)
+        return
+    if not product:
+        logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json", active_id)
+        return
+
+    pipeline_state["product_data"] = product
+    pipeline_state["active_product_id"] = active_id
+    qa_count = len(product.get("qa_index") or {})
+    logger.info('[products] Loaded "%s" (id=%s) with %d Q/A entries',
+                product.get("name", "?"), active_id, qa_count)
+
+
 def log_event(agent: str, message: str, data: Any = None):
     entry = {
         "agent": agent,
@@ -82,8 +130,13 @@ async def broadcast_to_dashboards(msg: dict):
             await ws.send_json(msg)
         except Exception:
             dead.append(ws)
+    # A disconnecting client may already have been removed by its own
+    # /ws/dashboard handler's disconnect path; tolerate that race.
     for ws in dead:
-        dashboard_clients.remove(ws)
+        try:
+            dashboard_clients.remove(ws)
+        except ValueError:
+            pass
 
 
 # ── App ────────────────────────────────────────────────
@@ -97,13 +150,25 @@ async def lifespan(app: FastAPI):
     director = Director(broadcast_to_dashboards)
     director.start_idle_rotation()
     logger.info("Avatar Director instantiated; idle rotation running.")
-    # Pre-load Cactus model in background thread so first request isn't slow
-    from agents.eyes import _get_cactus_model, CACTUS_AVAILABLE
+    # Pre-load Cactus models in background threads so the first request isn't
+    # slow. Gemma 4 (vision + classify + script) and whisper-base (voice
+    # transcription) live on separate Cactus handles; we load them
+    # sequentially to avoid any re-entrant SDK init on startup.
+    from agents.eyes import _get_cactus_model, _get_cactus_whisper_model, CACTUS_AVAILABLE
     if CACTUS_AVAILABLE:
-        logger.info("Pre-loading Cactus/Gemma 4 model (background thread)...")
-        import asyncio
+        logger.info("Pre-loading Cactus Gemma 4 model (background thread)...")
         await asyncio.to_thread(_get_cactus_model)
         logger.info("Cactus/Gemma 4 model ready.")
+        logger.info("Pre-loading Cactus whisper-base model (background thread)...")
+        await asyncio.to_thread(_get_cactus_whisper_model)
+        logger.info("Cactus/whisper-base model ready.")
+
+    # Load demo products + pre-select an active one for respond_locally. The
+    # Hour 5-6 scope: the router can answer routine questions without any
+    # prior /api/sell call. ACTIVE_PRODUCT_ID env var overrides the first-
+    # key default if you want to swap between demo objects without editing
+    # code on stage.
+    _load_active_product()
     yield
 
 app = FastAPI(title="EMPIRE", lifespan=lifespan)
@@ -181,12 +246,14 @@ async def dashboard_ws(ws: WebSocket):
             msg = json.loads(raw)
 
             if msg.get("type") == "simulate_comment":
-                # Use the fast Wav2Lip path (sub-8s) instead of the legacy LiveTalking path.
-                # The endpoint also broadcasts `comment_response_video` to dashboards.
+                # Route the comment through the 4-tool dispatcher. Local
+                # tools (respond_locally / play_canned_clip / block_comment)
+                # resolve in <300ms; cloud tool forwards to the existing
+                # api_respond_to_comment Wav2Lip pipeline.
                 comment_text = msg.get("text", "")
                 async def _run():
                     try:
-                        await api_respond_to_comment(comment=comment_text, out_height=1920)
+                        await run_routed_comment(comment_text)
                     except Exception as e:
                         log_event("SELLER", f"comment pipeline error: {e}")
                 asyncio.create_task(_run())
@@ -546,7 +613,8 @@ async def _finish_transcript_extract(task: asyncio.Task) -> None:
 
 @app.post("/api/comment")
 async def api_comment(text: str = Form(...)):
-    asyncio.ensure_future(run_comment_pipeline(text))
+    # Route through the 4-tool dispatcher (same as voice + simulate_comment).
+    asyncio.ensure_future(run_routed_comment(text))
     return {"status": "processing"}
 
 
@@ -576,6 +644,13 @@ STATES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "sta
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 app.mount("/states", StaticFiles(directory=str(STATES_DIR)), name="states")
+
+# Pre-rendered local answers — the sub-300ms respond_locally path. Generated
+# offline by scripts/render_local_answers.py; missing files fall back to
+# escalate_to_cloud gracefully (see _run_respond_locally in this module).
+LOCAL_ANSWERS_DIR = Path(__file__).resolve().parent / "local_answers"
+LOCAL_ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/local_answers", StaticFiles(directory=str(LOCAL_ANSWERS_DIR)), name="local_answers")
 
 
 def _save_render(label: str, data: bytes) -> str:
@@ -720,6 +795,10 @@ async def api_respond_to_comment(
         response_text = "Great question — let me get back to you on that."
     resp_ms = int((time.time() - t0) * 1000)
     log_event("SELLER", f"response drafted ({resp_ms}ms)", {"response": response_text})
+    # Stash for degraded-path fallback: if TTS or Wav2Lip fails below, the
+    # wrapper in run_routed_comment reads this so we can still surface the
+    # text answer to the dashboard instead of showing nothing.
+    pipeline_state["last_response_text"] = {"comment": comment, "response": response_text}
 
     # 3) Collect classify result NOW — needed to pick the right bridge label.
     #    Don't wait if it hasn't finished; fall back to "neutral" pool.
@@ -846,6 +925,257 @@ async def api_respond_to_comment(
             "predict_sec": headers.get("x-predict-sec"),
         },
     }
+
+
+# ── Voice comment pipeline ─────────────────────────────────────────────────
+#
+# Hour 2-3 scaffolding: one new endpoint + a one-function stub router.
+#
+#   POST /api/voice_comment
+#     accepts an audio blob (webm/opus from the dashboard MediaRecorder,
+#     .wav from curl smoke tests), transcribes on-device via whisper-base on
+#     Cactus (fallback: Gemini 2.5 Flash), broadcasts voice_transcript to
+#     the dashboard, then hands the transcript to run_routed_comment().
+#
+#   run_routed_comment(comment)
+#     STUB. Forwards every comment to the existing /api/respond_to_comment
+#     cloud pipeline. Hour 4-5 replaces this with a FunctionGemma-driven
+#     dispatcher that picks among four tools (respond_locally,
+#     escalate_to_cloud, play_canned_clip, block_comment). Keeping the
+#     signature stable means /api/voice_comment never needs to change.
+
+
+async def run_routed_comment(comment: str) -> dict:
+    """Route an incoming comment through one of four tools.
+
+    Flow:
+      1. Gemma 4 classify on device (already lock-serialized).
+      2. router.decide → {tool, args, reason, ms, was_local, cost_saved_usd}.
+      3. Broadcast routing_decision WS event for the RoutingPanel.
+      4. Dispatch to the matching _run_* helper. On any downstream failure,
+         the helpers fade Tier 1 back to idle and broadcast comment_failed
+         with the best available fallback text (drafted by Claude before
+         the failure, when applicable) so the dashboard never sticks."""
+    product = pipeline_state.get("product_data")
+
+    # 1. Classify (on-device Gemma 4). Never raises — returns a dict with
+    #    at least {type, source} even on fallback. Safe to await here.
+    classify = await classify_comment_gemma(comment)
+
+    # 2. Decide.
+    decision = await comment_router.decide(comment, classify, product)
+
+    # 3. Broadcast so RoutingPanel (Hour 7) can tick counters.
+    await broadcast_to_dashboards({
+        "type": "routing_decision",
+        "comment": comment,
+        "tool": decision["tool"],
+        "reason": decision["reason"],
+        "ms": decision["ms"],
+        "was_local": decision["was_local"],
+        "cost_saved_usd": decision["cost_saved_usd"],
+    })
+    log_event("ROUTER", f'{decision["tool"]} — {decision["reason"]} ({decision["ms"]}ms)',
+              {"classify": classify.get("type"), "was_local": decision["was_local"]})
+
+    # 4. Dispatch.
+    tool = decision["tool"]
+    args = decision["args"]
+    if tool == "respond_locally":
+        return await _run_respond_locally(comment, args, decision)
+    if tool == "play_canned_clip":
+        return await _run_play_canned_clip(comment, args, decision)
+    if tool == "block_comment":
+        return await _run_block_comment(comment, args, decision)
+    # Default: escalate_to_cloud. Same pattern as the old stub — forward to
+    # the existing api_respond_to_comment, and on failure fade + broadcast
+    # comment_failed with any drafted text.
+    return await _run_escalate_to_cloud(comment, args, decision)
+
+
+async def _run_escalate_to_cloud(comment: str, args: dict, decision: dict) -> dict:
+    try:
+        result = await api_respond_to_comment(comment=comment, out_height=1920)
+        return {"dispatch": "escalate_to_cloud", "routing": decision, **result}
+    except Exception as e:
+        if director:
+            try:
+                await director.fade_to_idle()
+            except Exception:
+                logger.exception("fade_to_idle after failure also failed")
+        last = pipeline_state.get("last_response_text") or {}
+        fallback_text = last.get("response") if last.get("comment") == comment else None
+        await broadcast_to_dashboards({
+            "type": "comment_failed",
+            "comment": comment,
+            "response": fallback_text or "",
+            "reason": str(e)[:200],
+        })
+        raise
+
+
+async def _run_respond_locally(comment: str, args: dict, decision: dict) -> dict:
+    """Play a pre-rendered answer clip via the Director. If the answer file
+    isn't present on disk, fall back to escalate_to_cloud so the demo never
+    shows dead air."""
+    product = pipeline_state.get("product_data") or {}
+    qa = product.get("qa_index") or {}
+    entry = qa.get(args.get("answer_id", "")) or {}
+    url = entry.get("url")
+    text = entry.get("text") or ""
+
+    if not url:
+        logger.warning("[router] respond_locally with no URL (answer_id=%r) — escalating",
+                       args.get("answer_id"))
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    # Verify the file exists — pre-render script may not have shipped this
+    # answer yet. Static mount is /local_answers → backend/local_answers/<slug>.mp4.
+    if url.startswith("/local_answers/"):
+        file_path = Path(__file__).resolve().parent / "local_answers" / Path(url).name
+        if not file_path.exists():
+            logger.warning("[router] respond_locally file missing: %s — escalating", file_path)
+            return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    # Stage the response via the Director so Tier 0/Tier 1 layering stays
+    # intact. Fade to idle after the clip plays — we don't have ffprobe
+    # probing on pre-rendered clips, so use a word-count estimate with a
+    # small tail. Clips are short (1-2 sentences) so word count is fine.
+    if director:
+        await director.play_response(url)
+        words = max(4, len(text.split()))
+        play_ms = int(words * 350) + 400
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after(play_ms))
+
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": text,
+        "url": url,
+        "total_ms": decision["ms"],   # near-zero: no render, no TTS
+        "class_ms": 0,
+        "llm_ms": 0,
+        "tts_ms": 0,
+        "lipsync_ms": 0,
+        "local": True,
+    })
+    return {"dispatch": "respond_locally", "routing": decision,
+            "comment": comment, "response": text, "url": url,
+            "total_ms": decision["ms"]}
+
+
+async def _run_play_canned_clip(comment: str, args: dict, decision: dict) -> dict:
+    """Acknowledge with a pre-rendered bridge clip (compliment / objection /
+    neutral). Uses pick_bridge_clip which is manifest-driven and shared with
+    the escalate_to_cloud path's bridge."""
+    label = args.get("label", "neutral")
+    clip = pick_bridge_clip(label)
+    if not clip:
+        logger.warning("[router] no bridge for label=%s — escalating", label)
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    url = clip.get("url")
+    script = clip.get("script", "")
+    if director:
+        await director.play_response(url)
+        # Bridge clips are short (~2s). Fade after clip + tail.
+        play_ms = (clip.get("ms") or 2500) + 400
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after(play_ms))
+
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": script,
+        "url": url,
+        "total_ms": decision["ms"],
+        "class_ms": 0,
+        "llm_ms": 0,
+        "tts_ms": 0,
+        "lipsync_ms": 0,
+        "local": True,
+    })
+    return {"dispatch": "play_canned_clip", "routing": decision,
+            "comment": comment, "label": label, "url": url,
+            "response": script, "total_ms": decision["ms"]}
+
+
+async def _run_block_comment(comment: str, args: dict, decision: dict) -> dict:
+    """Spam/abuse — increment counter, broadcast for the panel, no visual."""
+    pipeline_state.setdefault("blocked_count", 0)
+    pipeline_state["blocked_count"] += 1
+    await broadcast_to_dashboards({
+        "type": "comment_blocked",
+        "comment": comment,
+        "reason": args.get("reason", "spam"),
+        "blocked_count": pipeline_state["blocked_count"],
+    })
+    return {"dispatch": "block_comment", "routing": decision,
+            "comment": comment, "reason": args.get("reason", "spam"),
+            "blocked_count": pipeline_state["blocked_count"],
+            "total_ms": decision["ms"]}
+
+
+@app.post("/api/voice_comment")
+async def api_voice_comment(audio: UploadFile = File(...)):
+    """Voice-driven comment. Transcribes on-device, broadcasts the transcript
+    immediately (so the dashboard can show what was heard with a latency
+    chip), then routes the comment through the standard pipeline.
+
+    Returns a single JSON with {transcript, dispatch, total_ms, ...response}.
+    The dashboard also receives two WS events along the way: voice_transcript
+    (after transcribe) and comment_response_video (after render)."""
+    t0 = time.time()
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        return {"error": "empty_audio", "total_ms": 0}
+
+    # (1) Transcribe — local whisper first, Gemini fallback. transcribe_voice
+    #     never raises; on total failure it returns source='transcription_failed'.
+    trans = await transcribe_voice(audio_bytes)
+    await broadcast_to_dashboards({
+        "type": "voice_transcript",
+        "text": trans.get("text", ""),
+        "source": trans.get("source", "unknown"),
+        "ms": trans.get("latency_ms", 0),
+    })
+    log_event("EYES", f'Voice: "{trans.get("text", "")}" '
+              f'via {trans.get("source", "?")} ({trans.get("latency_ms", 0)}ms)')
+    logger.info('[voice] "%s" via %s in %dms',
+                trans.get("text", ""), trans.get("source", "?"),
+                trans.get("latency_ms", 0))
+
+    # Bail if we got nothing intelligible — no point firing the cloud path.
+    text = (trans.get("text") or "").strip()
+    if not text:
+        return {
+            "transcript": trans,
+            "dispatch": "no_speech",
+            "total_ms": int((time.time() - t0) * 1000),
+        }
+
+    # (2) Route + render. Today = always escalate. Hour 4-5 adds real routing.
+    try:
+        routed = await run_routed_comment(text)
+    except Exception as e:
+        logger.exception("run_routed_comment failed")
+        return {
+            "transcript": trans,
+            "dispatch": "error",
+            "error": str(e),
+            "total_ms": int((time.time() - t0) * 1000),
+        }
+
+    routed["transcript"] = trans
+    routed["total_ms"] = int((time.time() - t0) * 1000)
+    return routed
 
 
 @app.post("/api/build_carousel")

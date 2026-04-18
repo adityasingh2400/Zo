@@ -48,27 +48,39 @@ IDLE_ROTATE_MAX_MS = 18_000
 # is the visible Tier 0. We DO NOT use the idle clip itself as the substrate —
 # Wav2Lip needs an open, expressively-moving mouth to predict on. Instead
 # every idle has a paired "speaking variant" with the same body language /
-# framing but with active speech motion. The visual continuity comes from
-# matching body, the lip-sync quality comes from matching mouth motion.
+# framing but with active speech motion that SETTLES to a closed-mouth
+# anchor pose in the final 2.5s, so the response crossfades back to silent
+# idle seamlessly. The visual continuity comes from matching body, the
+# lip-sync quality comes from matching mouth motion.
 #
-# Speaking variants live in /workspace/idle_speaking/ on the pod (uploaded
-# by upload_speaking_variants.sh). If a variant doesn't exist yet we fall
-# back to the original speaking-pose substrate; the dashboard crossfade
-# hides the body mismatch on those clips until variants ship.
+# Speaking variants live in /workspace/idle_speaking/ on the pod, uploaded
+# by phase0/scripts/upload_speaking_variants.sh. If a variant doesn't
+# exist yet we fall back to the default speaking-pose substrate.
+#
+# Consolidation: idle_reading_comments and misc_hair_touch both reuse the
+# idle_calm_speaking substrate. When a comment lands during reading_comments
+# (eyes-down) or hair_touch, the response renders with calm-speaking body
+# language — she "looks up to answer," which reads more natural than holding
+# the eyes-down or hand-on-hair pose mid-response. Fewer assets to render +
+# upload, identical product behaviour.
 TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
     ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
-    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle_speaking/idle_reading_comments_speaking.mp4"),
+    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
     ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
-    ("misc_glance_aside",    "/states/idle/misc_glance_aside.mp4",    0.05, "/workspace/idle_speaking/misc_glance_aside_speaking.mp4"),
-    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.05, "/workspace/idle_speaking/misc_hair_touch_speaking.mp4"),
+    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.10, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
 ]
 
 # Tier 1 one-shot interjections. Director picks one occasionally and plays
 # it as a crossfaded one-shot over the always-on Tier 0 idle. They start
 # and end close to the anchor pose so the crossfade hides any mismatch.
+#
+# misc_glance_aside lives here (not in TIER0_LIBRARY) because looping a
+# glance every 12s reads as "she keeps getting distracted by the same
+# thing." One-shot per rotation is the right cadence.
 TIER1_INTERJECTIONS: list[tuple[str, str, float, str]] = [
-    ("misc_sip_drink",      "/states/idle/misc_sip_drink.mp4",      0.6, ""),
-    ("misc_walk_off_return","/states/idle/misc_walk_off_return.mp4",0.4, ""),
+    ("misc_sip_drink",       "/states/idle/misc_sip_drink.mp4",            0.45, ""),
+    ("misc_walk_off_return", "/states/idle/misc_walk_off_return.mp4",      0.25, ""),
+    ("misc_glance_aside",    "/states/idle/misc_glance_aside_speaking.mp4",0.30, ""),
 ]
 
 # Probability per idle-rotation tick that we play a Tier 1 interjection
@@ -179,8 +191,8 @@ class Director:
     # ── Convenience ───────────────────────────────────────────────────────
     async def reading_chat(self) -> None:
         """Show the avatar reading the incoming comment. Held briefly before
-        the bridge crossfades over it. Falls back to the fallback URL
-        until the polished idle_attentive clip ships."""
+        the bridge crossfades over it. Uses the polished
+        idle_reading_comments clip as the visible reading-chat moment."""
         await self.emit(
             "tier1",
             "reading_chat",
@@ -243,6 +255,82 @@ class Director:
             fade_ms=TIER1_FADEOUT_MS_DEFAULT,
             emitted_by="fade_to_idle",
         )
+
+    # ── Voice flow integration ────────────────────────────────────────────
+    # The dashboard's <Spin3D> reacts to a `state` prop ('idle' | 'listening'
+    # | 'thinking' | 'responding') with rim-light gain, rotation speed, and
+    # accent flashes. The avatar's <LiveStage> shows a pill for the same
+    # state. Both are driven by `voice_state` events broadcast here so the
+    # whole stage moves in lockstep with the voice pipeline.
+    #
+    # Cody's POST /api/voice_comment can call these at the right moments:
+    #   set_voice_state("transcribing")   when audio upload begins
+    #   set_voice_state("thinking")       when transcript lands, router about to fire
+    #   set_voice_state("responding")     when render kicks off
+    #   set_voice_state(None)             when response_video is on stage (LIVE pill takes over)
+    #
+    # Calling these is OPTIONAL — the dashboard already infers the state
+    # from voice_transcript / routing_decision / comment_response_video
+    # events. These exist for tighter UI sync when the backend wants to
+    # step ahead of the next pipeline stage.
+    async def set_voice_state(self, state: str | None) -> None:
+        """Broadcast a voice_state event. `state` is 'transcribing' |
+        'thinking' | 'responding' | None (clear)."""
+        msg = {
+            "type": "voice_state",
+            "state": state,
+            "ts": time.time_ns(),
+            "emitted_by": "director.set_voice_state",
+        }
+        try:
+            await self._broadcast(msg)
+        except Exception:
+            logger.exception("[director] voice_state broadcast failed")
+
+    # ── Judge-object opener ───────────────────────────────────────────────
+    # Demo script beat 0:30-1:15: judge holds up an object, user says "sell
+    # this for $X targeting Y." We want the avatar to react INSTANTLY (before
+    # the LLM/TTS/render finishes) so the audience feels the responsiveness.
+    #
+    # This pre-warms the visual pipeline: snap to the most engaged idle
+    # (idle_reading_comments_speaking substrate), play a "I'm thinking"
+    # bridge clip, and broadcast the voice_state so the carousel rim light
+    # flares. Total cost: one bridge clip render time (already pre-rendered)
+    # plus the WS roundtrip. Subjectively feels like 0ms.
+    async def play_judge_object_opener(self, label: str | None = None) -> None:
+        """Snap to a thinking-attentive idle, play a generic acknowledgement
+        bridge clip, and signal voice 'thinking' state. Use this at the
+        moment the demo mic is pressed."""
+        # 1. Force the substrate to the engaged-attentive variant so the next
+        #    Wav2Lip render inherits the right body language.
+        engaged_substrate = "/workspace/idle_speaking/idle_reading_comments_speaking.mp4"
+        self._current_substrate_pod_path = engaged_substrate
+
+        # 2. Show the "reading" idle on tier 1 so the audience sees the
+        #    avatar visibly engage with the held-up object.
+        await self.emit(
+            "tier1",
+            "judge_object_engage",
+            READING_CHAT_FALLBACK_URL,
+            loop=True,
+            mode="crossfade",
+            ttl_ms=2200,
+            emitted_by="judge_object_opener",
+        )
+
+        # 3. Light the carousel rim — the spin reacts in 350ms.
+        await self.set_voice_state("thinking")
+
+        # 4. Optional bridge clip — "let me check that out" — fills audio
+        #    while the real pitch renders. Picks from the "neutral" or
+        #    "question" pool depending on what's available.
+        try:
+            await self.play_bridge("neutral")
+        except Exception:
+            logger.debug("[director] judge_object_opener: no bridge available, skipping")
+
+        if label:
+            logger.info("[director] judge_object_opener fired for label=%s", label)
 
     # ── Tier 0 idle rotation ──────────────────────────────────────────────
     def start_idle_rotation(self) -> None:

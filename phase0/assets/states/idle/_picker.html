@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Idle Picker — EMPIRE</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      background: #09090b; color: #fafafa;
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    }
+    h1 {
+      margin: 0 0 4px; font-size: 22px; letter-spacing: 1px;
+      background: linear-gradient(135deg, #7c3aed, #3b82f6);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .sub { color: #71717a; margin-bottom: 20px; }
+    .controls {
+      display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; align-items: center;
+    }
+    .controls input[type=text] {
+      flex: 1; min-width: 280px;
+      background: #18181b; border: 1px solid #27272a; color: #fafafa;
+      padding: 10px 12px; border-radius: 8px; outline: none;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+    }
+    .controls button {
+      background: #7c3aed; color: #fff; border: none; border-radius: 8px;
+      padding: 10px 16px; font-weight: 700; cursor: pointer;
+    }
+    .controls button.ghost { background: #27272a; color: #a1a1aa; }
+    .grid {
+      display: grid; gap: 16px;
+      grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    }
+    .card {
+      background: #18181b; border: 1px solid #27272a; border-radius: 12px;
+      padding: 12px; display: flex; flex-direction: column; gap: 10px;
+      transition: border-color 200ms ease, transform 200ms ease;
+    }
+    .card.winner { border-color: #22c55e; box-shadow: 0 0 24px rgba(34,197,94,0.15); }
+    .card video {
+      width: 100%; aspect-ratio: 9 / 16; background: #000; border-radius: 8px;
+      object-fit: cover;
+    }
+    .name {
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 12px; color: #a1a1aa; word-break: break-all;
+    }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row .meta { color: #52525b; font-size: 11px; flex: 1; }
+    .pick {
+      background: #16a34a; color: #fff; border: none; border-radius: 6px;
+      padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 12px;
+    }
+    .pick.active { background: #22c55e; }
+    .copy {
+      background: #27272a; color: #a1a1aa; border: 1px solid #3f3f46;
+      border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 11px;
+      font-family: ui-monospace, monospace;
+    }
+    .empty {
+      grid-column: 1 / -1; padding: 60px; text-align: center;
+      color: #52525b; border: 1px dashed #27272a; border-radius: 12px;
+    }
+    .toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #16a34a; color: #fff; padding: 10px 18px; border-radius: 999px;
+      font-weight: 700; opacity: 0; pointer-events: none;
+      transition: opacity 200ms ease;
+    }
+    .toast.show { opacity: 1; }
+    .winner-banner {
+      background: linear-gradient(135deg, rgba(34,197,94,0.16), rgba(34,197,94,0.06));
+      border: 1px solid #16a34a; border-radius: 12px; padding: 14px 16px;
+      margin-bottom: 16px; display: none;
+    }
+    .winner-banner.show { display: block; }
+    .winner-banner code {
+      display: block; font-family: ui-monospace, monospace;
+      background: #09090b; padding: 10px 12px; border-radius: 6px;
+      margin-top: 8px; color: #4ade80; font-size: 12px;
+      white-space: pre-wrap; word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <h1>IDLE PICKER</h1>
+  <div class="sub">
+    A/B the candidates for any idle. Mute them, watch the body language,
+    pick the take with least drift. Then run the printed <code>mv</code>
+    to make it canonical.
+  </div>
+
+  <div class="controls">
+    <input id="prefix" type="text" value="idle_reading_comments" />
+    <!-- ?prefix=idle_attentive deep-links the review for a specific state -->
+    <button id="reload">Reload</button>
+    <button id="muteall" class="ghost">Toggle mute</button>
+    <button id="syncplay" class="ghost">Sync play</button>
+  </div>
+
+  <div id="winnerBanner" class="winner-banner">
+    <strong>Pick:</strong> <span id="winnerName"></span>
+    <code id="winnerCmd"></code>
+  </div>
+
+  <div id="grid" class="grid">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <div id="toast" class="toast">Copied</div>
+
+<script>
+// Hardcoded list. We can't read the directory from the browser, so we list
+// every candidate the user might want to A/B. The script filters by the
+// prefix you type. Add new candidates here when you render them.
+const CANDIDATES = [
+  // idle_reading_comments
+  "idle_reading_comments.mp4",
+  "idle_reading_comments_1776472320.mp4",
+  "idle_reading_comments_1776472320_boom.mp4",
+  "idle_reading_comments_1776472582.mp4",
+  "idle_reading_comments_1776472582_boom.mp4",
+  "idle_reading_comments_1776482733.mp4",
+  "idle_reading_comments_1776482750.mp4",
+  "idle_reading_comments_1776482756.mp4",
+  "idle_reading_comments_1776482756_boom.mp4",
+  "idle_reading_comments_speaking.mp4",
+  "idle_reading_comments_speaking_1776482664.mp4",
+  // idle_calm
+  "idle_calm.mp4",
+  "idle_calm_1776456395.mp4",
+  "idle_calm_1776457385.mp4",
+  "idle_calm_1776457726.mp4",
+  "idle_calm_1776457726_boom.mp4",
+  "idle_calm_1776483380.mp4",
+  "idle_calm_1776483380_boom.mp4",
+  "idle_calm_from_attentive_1776461343.mp4",
+  "idle_calm_speaking.mp4",
+  "idle_calm_speaking_1776482589.mp4",
+  "idle_calm_speaking_1776551548.mp4",   // NEW — speaks 0-5.5s, settles to closed-mouth anchor 6-8s
+  // idle_attentive (all _boom variants regenerated at 12s total: first 6s of source, mirrored)
+  "idle_attentive.mp4",
+  "idle_attentive_1776456402.mp4",
+  "idle_attentive_1776456402_boom.mp4",
+  "idle_attentive_1776457384.mp4",
+  "idle_attentive_1776457384_boom.mp4",
+  "idle_attentive_1776457733.mp4",
+  "idle_attentive_1776457733_boom.mp4",
+  "idle_attentive_1776471766.mp4",
+  "idle_attentive_1776471766_boom.mp4",
+  "idle_attentive_1776472353.mp4",
+  "idle_attentive_1776472353_boom.mp4",
+  // idle_thinking
+  "idle_thinking.mp4",
+  "idle_thinking_1776456386.mp4",
+  "idle_thinking_1776456386_boom.mp4",
+  "idle_thinking_1776483353.mp4",
+  "idle_thinking_1776483353_boom.mp4",
+  "idle_thinking_speaking.mp4",
+  "idle_thinking_speaking_1776482604.mp4",
+  "idle_thinking_speaking_clean.mp4",      // 0-7s trim, kills end zoom-in (Wav2Lip substrate candidate)
+  "idle_thinking_speaking_boom12s.mp4",    // 12s boom from first 6s (silent-idle candidate)
+  // misc
+  "misc_glance_aside.mp4",
+  "misc_glance_aside_1776456395.mp4",
+  "misc_glance_aside_1776456395_boom.mp4",
+  "misc_glance_aside_1776483354.mp4",
+  "misc_glance_aside_1776483354_boom.mp4",
+  "misc_glance_aside_speaking.mp4",
+  "misc_glance_aside_speaking_1776482596.mp4",
+  "misc_hair_touch.mp4",
+  "misc_hair_touch_1776456488.mp4",
+  "misc_hair_touch_1776456488_boom.mp4",
+  "misc_hair_touch_1776483352.mp4",
+  "misc_hair_touch_1776483352_boom.mp4",
+  "misc_hair_touch_speaking.mp4",
+  "misc_hair_touch_speaking_1776482689.mp4",
+  "misc_hair_touch_speaking_1776551589.mp4",   // NEW — speaks 0-5.5s, settles to closed-mouth anchor 6-8s
+  "misc_sip_drink.mp4",
+  "misc_sip_drink_1776456505.mp4",
+  "misc_walk_off_return.mp4",
+  "misc_walk_off_return_1776456513.mp4",
+];
+
+const grid = document.getElementById("grid");
+const prefixInput = document.getElementById("prefix");
+const reloadBtn = document.getElementById("reload");
+const muteBtn = document.getElementById("muteall");
+const syncBtn = document.getElementById("syncplay");
+const banner = document.getElementById("winnerBanner");
+const winnerName = document.getElementById("winnerName");
+const winnerCmd = document.getElementById("winnerCmd");
+const toast = document.getElementById("toast");
+
+let muted = true;
+let pick = null;
+
+function render() {
+  const prefix = prefixInput.value.trim();
+  // Canonical name = prefix.mp4 (e.g. idle_reading_comments.mp4) — exclude it
+  // from the variants grid, but keep timestamped + suffixed variants.
+  const canonical = `${prefix}.mp4`;
+  const variants = CANDIDATES
+    .filter(n => n.startsWith(prefix))
+    .filter(n => n !== canonical);
+
+  grid.innerHTML = "";
+
+  if (!variants.length) {
+    grid.innerHTML = `<div class="empty">No variants found for prefix
+      <code style="background:#27272a;padding:2px 6px;border-radius:4px">${prefix}</code>.
+      Try a different prefix or render some candidates first.</div>`;
+    return;
+  }
+
+  // Show the canonical first (read-only reference), then variants.
+  if (CANDIDATES.includes(canonical)) {
+    grid.appendChild(card(canonical, /*isCanonical*/ true));
+  }
+  for (const name of variants) {
+    grid.appendChild(card(name, false));
+  }
+
+  applyMute();
+}
+
+function card(name, isCanonical) {
+  const el = document.createElement("div");
+  el.className = "card" + (pick === name ? " winner" : "");
+  el.innerHTML = `
+    <video src="./${name}" autoplay loop muted playsinline></video>
+    <div class="name">${name}${isCanonical ? "  ← current canonical" : ""}</div>
+    <div class="row">
+      <span class="meta" data-meta></span>
+      ${isCanonical ? "" : `<button class="pick">Pick</button>`}
+      <button class="copy">cp name</button>
+    </div>
+  `;
+  const v = el.querySelector("video");
+  const meta = el.querySelector("[data-meta]");
+  v.addEventListener("loadedmetadata", () => {
+    meta.textContent = `${v.videoWidth}×${v.videoHeight} · ${v.duration.toFixed(1)}s`;
+  });
+  el.querySelector(".copy").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(name);
+    flash("Copied " + name);
+  });
+  const pickBtn = el.querySelector(".pick");
+  if (pickBtn) {
+    pickBtn.addEventListener("click", () => choosePick(name));
+  }
+  return el;
+}
+
+function choosePick(name) {
+  pick = name;
+  const prefix = prefixInput.value.trim();
+  const canonical = `${prefix}.mp4`;
+  const cwd = "phase0/assets/states/idle";
+  const cmd =
+    `# from repo root:\n` +
+    `cd ${cwd}\n` +
+    `mv ${canonical} ${canonical.replace('.mp4', '_PREV.mp4')}  # backup current\n` +
+    `cp ${name} ${canonical}                # promote your pick`;
+  winnerName.textContent = name;
+  winnerCmd.textContent = cmd;
+  banner.classList.add("show");
+  // Re-render to highlight the winner and add a copy-cmd button to the banner.
+  render();
+}
+
+function applyMute() {
+  document.querySelectorAll("video").forEach(v => { v.muted = muted; });
+}
+
+reloadBtn.addEventListener("click", render);
+prefixInput.addEventListener("keydown", e => { if (e.key === "Enter") render(); });
+muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
+syncBtn.addEventListener("click", () => {
+  document.querySelectorAll("video").forEach(v => { v.currentTime = 0; v.play().catch(()=>{}); });
+});
+banner.addEventListener("click", async () => {
+  if (!winnerCmd.textContent) return;
+  await navigator.clipboard.writeText(winnerCmd.textContent);
+  flash("Command copied — paste in terminal");
+});
+
+let toastTimer;
+function flash(msg) {
+  toast.textContent = msg;
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 1400);
+}
+
+const urlPrefix = new URLSearchParams(window.location.search).get("prefix");
+if (urlPrefix) prefixInput.value = urlPrefix;
+
+render();
+</script>
+</body>
+</html>

@@ -20,6 +20,14 @@ from __future__ import annotations
 import argparse, json, pathlib, subprocess, sys, time
 import httpx
 
+# Reuse the freeze scanner so e2e and freeze checks live behind one command.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+try:
+    from verify_no_freeze import scan as freeze_scan
+    HAS_FREEZE_SCAN = True
+except Exception:
+    HAS_FREEZE_SCAN = False
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BENCH = ROOT / "bench" / "results"
 BENCH.mkdir(parents=True, exist_ok=True)
@@ -118,6 +126,20 @@ def run(base: str, budget_ms: int, out_height: int) -> list[dict]:
             "video_has_audio":   bool(probe_info.get("audio_codec")),
             "within_budget":     payload.get("total_ms", 0) <= budget_ms,
         }
+
+        # Per-item freeze scan: any contiguous run of frozen frames > 600ms
+        # is a fail. Catches Wav2Lip dropped batches / face-detect stalls
+        # / encoder duplicates that wouldn't show up in the dimension/codec
+        # checks above.
+        freeze_info: dict = {}
+        if HAS_FREEZE_SCAN:
+            try:
+                freeze_info = freeze_scan(out, freeze_threshold=0.5, max_freeze_ms=600)
+                checks["no_freeze"] = bool(freeze_info.get("ok"))
+            except Exception as e:
+                checks["no_freeze"] = False
+                freeze_info = {"error": str(e)}
+
         ok = all(checks.values())
 
         results.append({
@@ -132,6 +154,8 @@ def run(base: str, budget_ms: int, out_height: int) -> list[dict]:
             "url": url,
             "size_kb": size_kb,
             "probe": probe_info,
+            "freeze": {k: v for k, v in freeze_info.items()
+                       if k in ("longest_freeze_ms", "freeze_runs", "mean_diff", "ok", "error")},
         })
         flag = "OK" if ok else "FAIL"
         b = payload.get("breakdown", {})

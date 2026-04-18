@@ -44,32 +44,61 @@ SPIN_DIR.mkdir(parents=True, exist_ok=True)
 async def carousel_from_video(
     video_path: str,
     *,
-    n_frames: int = 12,
-    out_size: int = 512,
+    n_frames: int = 24,
+    out_size: int = 640,
     clean_bg: bool = True,
+    rembg_model: str = "u2net",
+    stabilize: bool = True,
+    drop_blurriest_pct: float = 0.15,
+    min_coverage: float = 0.01,
 ) -> dict[str, Any]:
-    """Extract N angle frames spread across the video, optionally rembg them,
-    save to /renders/spin/<hash>/. Returns the View3D dict."""
+    """Extract N angle frames spread across the video and produce a
+    polished spin-ready set under /renders/spin/<hash>/.
+
+    Quality steps (in order):
+      1. ffmpeg extracts 3x-density candidates so we have headroom to drop bad ones.
+      2. _pick_sharpest_per_slot picks the sharpest candidate per timeline slot.
+      3. rembg cuts the background; we use 'u2net' by default (~170MB, much
+         cleaner edges than u2netp) when available, falling back gracefully.
+      4. STABILIZATION: every frame's alpha mask gives us the product bbox.
+         We pick a *global* bbox (the union of all per-frame bboxes, padded
+         and squared) and crop every frame to it. Result: product stays at
+         constant size, centered, no breathing.
+      5. Frames whose product coverage is below `min_coverage` (% of pixels
+         with alpha > 0) are dropped — those are usually motion-blur shots
+         where rembg returned mostly-empty.
+
+    Args:
+      n_frames: target frame count after dropping bad ones (default 24).
+      out_size: output square edge in px (default 640 — looks crisp at the
+                ~280px dashboard render size and on retina).
+      rembg_model: "u2net" (sharper, ~170MB) or "u2netp" (smaller, faster).
+      stabilize: enable bbox stabilization. Disable to debug raw rembg.
+      min_sharpness: Laplacian variance threshold; frames below get dropped.
+      min_coverage: alpha coverage threshold (0..1); frames below get dropped.
+    """
     t_all = time.perf_counter()
 
     duration = await _video_duration(video_path)
     if duration <= 0:
         return {"kind": "frame_carousel", "frames": [], "ms": 0, "source": "video", "error": "no_duration"}
 
-    # Slug = sha256(video bytes)[:10] so re-runs on same video hit the cache
     slug = _video_slug(video_path)
     out_dir = SPIN_DIR / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # If we already have a full set cached, reuse
+    # Cache hit: every output frame already exists for this video hash.
     cached = sorted(out_dir.glob("*.png"))
     if len(cached) >= n_frames:
         urls = [f"/renders/spin/{slug}/{p.name}" for p in cached[:n_frames]]
         ms = int((time.perf_counter() - t_all) * 1000)
         logger.info("carousel cache hit: %s (%d frames, %dms)", slug, len(urls), ms)
-        return {"kind": "frame_carousel", "frames": urls, "ms": ms, "source": "video", "slug": slug, "cached": True}
+        return {
+            "kind": "frame_carousel", "frames": urls, "ms": ms,
+            "source": "video", "slug": slug, "cached": True,
+        }
 
-    # 1. Extract candidate frames at 3x density via ffmpeg, then pick sharpest per slot
+    # 1. Extract 3x candidates so we can drop blurry / motion-corrupt shots.
     candidates_per_slot = 3
     target_frames = n_frames * candidates_per_slot
     fps = max(target_frames / duration, 0.5)
@@ -80,43 +109,90 @@ async def carousel_from_video(
     if not raw:
         return {"kind": "frame_carousel", "frames": [], "ms": 0, "source": "video", "error": "extract_failed"}
 
-    # 2. Pick sharpest frame per timeline slot (good motion handling)
+    # 2. Pick sharpest candidate per timeline slot.
     t0 = time.perf_counter()
     picks = _pick_sharpest_per_slot(raw, n_slots=n_frames)
     pick_ms = int((time.perf_counter() - t0) * 1000)
 
-    # 3. Resize + (optional) rembg + save
-    t0 = time.perf_counter()
-    saved: list[str] = []
-
+    # 3. rembg setup. u2net = sharper edges than u2netp; if it isn't downloaded
+    #    yet rembg will fetch it on first init (one-time ~170MB).
+    session = None
     if clean_bg:
         try:
             from rembg import new_session, remove
-            session = new_session("u2netp")  # ~5MB model, fast
+            session = new_session(rembg_model)
         except Exception as e:
-            logger.warning("rembg unavailable, saving raw: %s", e)
-            session = None
-    else:
-        session = None
+            logger.warning("rembg %s unavailable, trying u2netp: %s", rembg_model, e)
+            try:
+                from rembg import new_session, remove
+                session = new_session("u2netp")
+            except Exception as e2:
+                logger.warning("rembg unavailable entirely: %s", e2)
+                session = None
 
+    # 4. First pass: rembg every frame, compute bbox + sharpness + coverage.
+    t0 = time.perf_counter()
+    frame_records: list[dict[str, Any]] = []
     for i, jpeg in enumerate(picks):
-        out_path = out_dir / f"{i:02d}.png"
         try:
             img = Image.open(io.BytesIO(jpeg)).convert("RGB")
-            img = _square_resize(img, out_size)
+            sharp = _img_sharpness(img)
+            if sharp < min_sharpness:
+                logger.debug("frame %d dropped (sharpness=%.1f < %.1f)", i, sharp, min_sharpness)
+                continue
             if session is not None:
-                img = remove(img, session=session)  # RGBA
-            img.save(out_path, format="PNG", optimize=False)
+                rgba = remove(img, session=session)  # RGBA
+                bbox, coverage = _alpha_bbox(rgba)
+            else:
+                rgba = img.convert("RGBA")
+                bbox, coverage = (0, 0, img.width, img.height), 1.0
+            if coverage < min_coverage:
+                logger.debug("frame %d dropped (coverage=%.3f < %.3f)", i, coverage, min_coverage)
+                continue
+            frame_records.append({
+                "idx": i, "rgba": rgba, "bbox": bbox,
+                "coverage": coverage, "sharpness": sharp,
+            })
+        except Exception as e:
+            logger.warning("frame %d rembg failed: %s", i, e)
+
+    if not frame_records:
+        return {"kind": "frame_carousel", "frames": [], "ms": 0,
+                "source": "video", "error": "all_frames_dropped"}
+
+    # 5. Compute global bbox = union of every kept frame's bbox, padded.
+    if stabilize:
+        global_bbox = _global_bbox([r["bbox"] for r in frame_records],
+                                   pad_pct=0.10,
+                                   square=True,
+                                   img_w=frame_records[0]["rgba"].width,
+                                   img_h=frame_records[0]["rgba"].height)
+    else:
+        global_bbox = None
+
+    # 6. Crop to global bbox, resize, save. Sequence-renumbered so dashboard
+    #    sees a clean 0..N-1 set even if some inputs were dropped.
+    saved: list[str] = []
+    for j, rec in enumerate(frame_records):
+        out_path = out_dir / f"{j:02d}.png"
+        rgba = rec["rgba"]
+        try:
+            if global_bbox is not None:
+                rgba = rgba.crop(global_bbox)
+            rgba = _square_resize_rgba(rgba, out_size)
+            rgba.save(out_path, format="PNG", optimize=False)
             saved.append(f"/renders/spin/{slug}/{out_path.name}")
         except Exception as e:
-            logger.warning("frame %d failed: %s", i, e)
+            logger.warning("frame %d save failed: %s", j, e)
 
     process_ms = int((time.perf_counter() - t0) * 1000)
     total_ms = int((time.perf_counter() - t_all) * 1000)
 
     logger.info(
-        "carousel built: %s, %d frames, %dms (extract=%d pick=%d process=%d, clean_bg=%s)",
-        slug, len(saved), total_ms, extract_ms, pick_ms, process_ms, clean_bg,
+        "carousel built: %s, %d frames (kept %d/%d), %dms "
+        "(extract=%d pick=%d process=%d, model=%s, stabilize=%s)",
+        slug, len(saved), len(frame_records), len(picks), total_ms,
+        extract_ms, pick_ms, process_ms, rembg_model, stabilize,
     )
 
     return {
@@ -130,6 +206,13 @@ async def carousel_from_video(
             "extract_ms": extract_ms,
             "pick_ms": pick_ms,
             "process_ms": process_ms,
+        },
+        "stats": {
+            "candidates": len(picks),
+            "kept": len(frame_records),
+            "dropped": len(picks) - len(frame_records),
+            "rembg_model": rembg_model if session is not None else None,
+            "stabilized": stabilize,
         },
     }
 
@@ -252,10 +335,78 @@ def _pick_sharpest_per_slot(frames: list[bytes], n_slots: int) -> list[bytes]:
 
 
 def _square_resize(img: Image.Image, size: int) -> Image.Image:
-    """Center-crop to square then resize."""
+    """Center-crop RGB to square then resize."""
     w, h = img.size
     side = min(w, h)
     left = (w - side) // 2
     top = (h - side) // 2
     img = img.crop((left, top, left + side, top + side))
     return img.resize((size, size), Image.LANCZOS)
+
+
+def _square_resize_rgba(img: Image.Image, size: int) -> Image.Image:
+    """Pad RGBA to square (preserving aspect ratio), then resize.
+    Uses a transparent canvas so the product floats cleanly on the dashboard
+    without a distorted aspect ratio."""
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    w, h = img.size
+    side = max(w, h)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+    return canvas.resize((size, size), Image.LANCZOS)
+
+
+def _img_sharpness(img: Image.Image) -> float:
+    """Laplacian variance on a grayscale PIL image (PIL → numpy → cv2)."""
+    arr = np.asarray(img.convert("L"))
+    return float(cv2.Laplacian(arr, cv2.CV_64F).var())
+
+
+def _alpha_bbox(rgba: Image.Image,
+                alpha_threshold: int = 16) -> tuple[tuple[int, int, int, int], float]:
+    """For a rembg RGBA image, return (bbox, coverage):
+      - bbox = tight (l, t, r, b) of pixels with alpha > threshold
+      - coverage = fraction of total pixels that exceed threshold
+    Both are 0-based; bbox is exclusive on r/b (PIL convention)."""
+    if rgba.mode != "RGBA":
+        rgba = rgba.convert("RGBA")
+    a = np.asarray(rgba.split()[-1])
+    mask = a > alpha_threshold
+    coverage = float(mask.mean()) if mask.size else 0.0
+    if not mask.any():
+        return (0, 0, rgba.width, rgba.height), 0.0
+    ys, xs = np.where(mask)
+    return (int(xs.min()), int(ys.min()),
+            int(xs.max()) + 1, int(ys.max()) + 1), coverage
+
+
+def _global_bbox(bboxes: list[tuple[int, int, int, int]],
+                 pad_pct: float,
+                 square: bool,
+                 img_w: int,
+                 img_h: int) -> tuple[int, int, int, int]:
+    """Union of bboxes (so the product never clips off-frame across the spin),
+    padded by `pad_pct` of the bbox's longer edge, optionally squared, and
+    clipped to image bounds. Squared = same crop applied to every frame so
+    the product can't drift off-center."""
+    ls = min(b[0] for b in bboxes)
+    ts = min(b[1] for b in bboxes)
+    rs = max(b[2] for b in bboxes)
+    bs = max(b[3] for b in bboxes)
+    w, h = rs - ls, bs - ts
+    pad = int(max(w, h) * pad_pct)
+    ls -= pad; ts -= pad; rs += pad; bs += pad
+    if square:
+        cw, ch = rs - ls, bs - ts
+        side = max(cw, ch)
+        cx, cy = (ls + rs) // 2, (ts + bs) // 2
+        ls = cx - side // 2
+        rs = ls + side
+        ts = cy - side // 2
+        bs = ts + side
+    # Clamp to image bounds. If clamping makes it non-square, accept the
+    # slight asymmetry; better than going out of frame.
+    ls = max(0, ls); ts = max(0, ts)
+    rs = min(img_w, rs); bs = min(img_h, bs)
+    return (ls, ts, rs, bs)

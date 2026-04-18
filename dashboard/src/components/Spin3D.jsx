@@ -22,15 +22,18 @@ export function Spin3D({ view, height = 220 }) {
 }
 
 function CarouselSpin({ frames, ms, height }) {
-  const [idx, setIdx] = useState(0);
+  // We track a *floating-point* phase (0..frames.length) so we can crossfade
+  // between adjacent frames instead of hard-cutting. Phase is updated by an
+  // rAF loop, not setInterval, so it stays smooth under load and lets us
+  // ease in/out at the wraparound for a sense of inertia.
+  const [phase, setPhase] = useState(0);
   const [paused, setPaused] = useState(false);
   const [loaded, setLoaded] = useState(0);
-  const totalRef = useRef(frames.length);
-  totalRef.current = frames.length;
   const containerRef = useRef(null);
   const dragStartRef = useRef(null);
+  const rafRef = useRef(0);
 
-  // Preload all frames before starting the spin so it never stalls mid-rotation.
+  // Preload all frames before starting so the spin never stalls mid-rotation.
   useEffect(() => {
     let cancel = false;
     setLoaded(0);
@@ -47,20 +50,33 @@ function CarouselSpin({ frames, ms, height }) {
     return () => { cancel = true; };
   }, [frames]);
 
-  // Auto-rotate at ~12 fps, only after all frames are loaded
+  // rAF rotation loop. Default speed: one full rotation in ~3.5s. Adds a
+  // mild ease so the spin breathes — slightly slower at the seam-line of the
+  // loop so the eye doesn't catch a discontinuity even though the carousel
+  // is technically wrapping around.
+  const SECONDS_PER_REVOLUTION = 3.5;
   useEffect(() => {
-    if (paused) return;
-    if (loaded < frames.length) return;
-    const id = setInterval(() => {
-      setIdx((i) => (i + 1) % totalRef.current);
-    }, 1000 / 12);
-    return () => clearInterval(id);
+    if (paused || loaded < frames.length) return;
+    let last = performance.now();
+    const tick = (now) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      setPhase((p) => {
+        const next = p + (frames.length / SECONDS_PER_REVOLUTION) * dt;
+        // Wrap, keeping the fractional component so the crossfade stays
+        // continuous across the seam.
+        return next % frames.length;
+      });
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
   }, [paused, loaded, frames.length]);
 
-  // Drag-to-scrub: while dragging, map x-delta to frame index
+  // Drag-to-scrub: while dragging, map x-delta to phase
   function onPointerDown(e) {
     setPaused(true);
-    dragStartRef.current = { x: e.clientX, idx };
+    dragStartRef.current = { x: e.clientX, phase };
     e.currentTarget.setPointerCapture?.(e.pointerId);
   }
   function onPointerMove(e) {
@@ -68,18 +84,24 @@ function CarouselSpin({ frames, ms, height }) {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
     const dx = e.clientX - dragStartRef.current.x;
-    const stride = rect.width / frames.length;
-    const next = (dragStartRef.current.idx + Math.round(dx / stride)) % frames.length;
-    setIdx((next + frames.length) % frames.length);
+    // One full rotation per container-width swipe.
+    const next = dragStartRef.current.phase + (dx / rect.width) * frames.length;
+    setPhase(((next % frames.length) + frames.length) % frames.length);
   }
   function onPointerUp(e) {
     dragStartRef.current = null;
     e.currentTarget.releasePointerCapture?.(e.pointerId);
-    setTimeout(() => setPaused(false), 800); // brief pause before auto-resume
+    // Resume after a brief beat so the user can read what they're looking at.
+    setTimeout(() => setPaused(false), 1200);
   }
 
   const ready = loaded >= frames.length;
-  const url = `${API_BASE}${frames[idx]}`;
+  // Two visible frames per moment: floor(phase) at (1 - frac) opacity, and
+  // ceil(phase) at frac opacity. Smooth linear blend; the rAF loop runs at
+  // 60fps so consecutive blends look continuous.
+  const lower = Math.floor(phase) % frames.length;
+  const upper = (lower + 1) % frames.length;
+  const frac = phase - Math.floor(phase);
 
   return (
     <div
@@ -93,17 +115,23 @@ function CarouselSpin({ frames, ms, height }) {
       onMouseLeave={() => { dragStartRef.current = null; setPaused(false); }}
       title="Drag to rotate"
     >
-      {/* Render all frames absolutely-positioned, hide all but current.
-          Browser holds them in cache so swaps are instant. */}
-      {frames.map((f, i) => (
-        <img
-          key={f}
-          src={`${API_BASE}${f}`}
-          alt=""
-          draggable={false}
-          style={{ ...styles.frame, opacity: i === idx ? 1 : 0 }}
-        />
-      ))}
+      {/* Render every frame absolutely-positioned. Show only the two adjacent
+          to the current phase, blended by `frac`. All other frames stay in the
+          DOM at opacity 0 so the browser keeps them decoded. */}
+      {frames.map((f, i) => {
+        let opacity = 0;
+        if (i === lower) opacity = 1 - frac;
+        else if (i === upper) opacity = frac;
+        return (
+          <img
+            key={f}
+            src={`${API_BASE}${f}`}
+            alt=""
+            draggable={false}
+            style={{ ...styles.frame, opacity }}
+          />
+        );
+      })}
       <div style={styles.badge}>3D · {frames.length}</div>
       {!ready && (
         <div style={styles.loading}>
@@ -111,15 +139,23 @@ function CarouselSpin({ frames, ms, height }) {
         </div>
       )}
       <div style={{ ...styles.scrubBar, opacity: paused ? 1 : 0 }}>
-        {frames.map((_, i) => (
-          <div
-            key={i}
-            style={{
-              ...styles.scrubTick,
-              background: i === idx ? '#7c3aed' : '#3f3f46',
-            }}
-          />
-        ))}
+        {frames.map((_, i) => {
+          // Highlight the lower-bound frame; tick subtly fades into the next
+          // one to telegraph that we're between frames.
+          const active = i === lower;
+          const next = i === upper;
+          return (
+            <div
+              key={i}
+              style={{
+                ...styles.scrubTick,
+                background: active ? '#7c3aed'
+                  : next ? `rgba(124,58,237,${0.3 + 0.7 * frac})`
+                    : '#3f3f46',
+              }}
+            />
+          );
+        })}
       </div>
     </div>
   );
@@ -156,8 +192,9 @@ const styles = {
   frame: {
     position: 'absolute', inset: 0,
     width: '100%', height: '100%', objectFit: 'contain',
-    transition: 'opacity 60ms linear',
     pointerEvents: 'none',
+    // No CSS transition — the rAF loop drives `opacity` directly via React.
+    // CSS easing on opacity would smear the crossfade and look laggy.
   },
   badge: {
     position: 'absolute', top: 8, left: 8,

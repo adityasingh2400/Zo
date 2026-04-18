@@ -1,21 +1,32 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-export function ChatPanel({ onSendComment, commentResponse }) {
+export function ChatPanel({ onSendComment, commentResponse, pendingComments = [] }) {
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState([]);
   const endRef = useRef(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, pendingComments]);
 
+  // Append a response row whenever a new commentResponse arrives.
+  // We key on response text + total_ms so duplicates are skipped.
   useEffect(() => {
-    if (!commentResponse) return;
-    setMessages(prev => [...prev, {
-      type: 'response',
-      text: commentResponse.response,
-      timestamp: Date.now(),
-    }]);
+    if (!commentResponse?.response) return;
+    setMessages(prev => {
+      const lastResp = [...prev].reverse().find(m => m.type === 'response');
+      if (lastResp && lastResp.text === commentResponse.response &&
+          lastResp.totalMs === commentResponse.total_ms) {
+        return prev;
+      }
+      return [...prev, {
+        type: 'response',
+        text: commentResponse.response,
+        comment: commentResponse.comment,
+        totalMs: commentResponse.total_ms,
+        timestamp: Date.now(),
+      }];
+    });
   }, [commentResponse]);
 
   function handleSend() {
@@ -48,10 +59,21 @@ export function ChatPanel({ onSendComment, commentResponse }) {
             alignSelf: msg.type === 'comment' ? 'flex-end' : 'flex-start',
             background: msg.type === 'comment' ? '#3b82f6' : '#27272a',
           }}>
-            <span style={{ fontSize: 11, color: msg.type === 'comment' ? '#93c5fd' : '#22c55e', fontWeight: 700 }}>
-              {msg.type === 'comment' ? 'Viewer' : 'AI Seller'}
-            </span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+              <span style={{ fontSize: 11, color: msg.type === 'comment' ? '#93c5fd' : '#22c55e', fontWeight: 700 }}>
+                {msg.type === 'comment' ? 'Viewer' : 'AI Seller'}
+              </span>
+              {msg.totalMs && (
+                <span style={styles.latencyChip}>⚡ {(msg.totalMs / 1000).toFixed(1)}s</span>
+              )}
+            </div>
             <span style={{ color: '#fafafa', fontSize: 13 }}>{msg.text}</span>
+          </div>
+        ))}
+        {pendingComments.map(p => (
+          <div key={p.id} style={{ ...styles.message, alignSelf: 'flex-start', background: '#3f3f46', opacity: 0.85 }}>
+            <span style={{ fontSize: 11, color: '#fde68a', fontWeight: 700 }}>AI Seller (rendering…)</span>
+            <span style={{ color: '#a1a1aa', fontSize: 13, fontStyle: 'italic' }}>responding to "{p.text}"</span>
           </div>
         ))}
         <div ref={endRef} />
@@ -101,5 +123,10 @@ const styles = {
   sendBtn: {
     background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 8,
     padding: '10px 20px', fontWeight: 700, cursor: 'pointer',
+  },
+  latencyChip: {
+    fontSize: 10, fontWeight: 800, color: '#bbf7d0',
+    background: 'rgba(22,163,74,0.25)', padding: '2px 6px', borderRadius: 999,
+    fontVariantNumeric: 'tabular-nums',
   },
 };

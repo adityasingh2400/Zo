@@ -137,15 +137,30 @@ def _face_detect_cached(source_path: pathlib.Path, out_height: int):
     pad_top, pad_bottom, pad_left, pad_right = 0, 20, 0, 0
 
     nb = (len(frames) + FACE_BATCH - 1) // FACE_BATCH
+    last_box = None
     for b in range(nb):
         batch = frames[b * FACE_BATCH:(b + 1) * FACE_BATCH]
         faces = DETECTOR(batch)
         for i, face_list in enumerate(faces):
             if not face_list:
-                raise RuntimeError(f"no face detected on frame {b*FACE_BATCH+i}")
+                if last_box is None:
+                    found = None
+                    for jj in range(i + 1, len(faces)):
+                        if faces[jj]:
+                            bb = faces[jj][0][0]
+                            y1_, y2_, x1_, x2_ = max(0, int(bb[1]) - pad_top), int(bb[3]) + pad_bottom, max(0, int(bb[0]) - pad_left), int(bb[2]) + pad_right
+                            found = [y1_, y2_, x1_, x2_]
+                            break
+                    if found is None:
+                        raise RuntimeError(f"no face detected anywhere starting at frame {b*FACE_BATCH+i}")
+                    last_box = found
+                log.warning("face miss on frame %d -> reusing last box", b * FACE_BATCH + i)
+                boxes.append(list(last_box))
+                continue
             bbox = face_list[0][0]
             y1, y2, x1, x2 = max(0, int(bbox[1]) - pad_top), int(bbox[3]) + pad_bottom, max(0, int(bbox[0]) - pad_left), int(bbox[2]) + pad_right
-            boxes.append([y1, y2, x1, x2])
+            last_box = [y1, y2, x1, x2]
+            boxes.append(last_box)
 
     smoothed = _get_smoothed(boxes, T=5)
     with CACHE_LOCK:
@@ -240,7 +255,7 @@ def _run_lipsync(source_path: pathlib.Path, audio_path: pathlib.Path, out_path: 
         for (img_t, mel_t), frm_batch, coord_batch in datagen():
             pred = MODEL(mel_t, img_t).cpu().numpy().transpose(0, 2, 3, 1) * 255.0
             for p, f, (y1, y2, x1, x2) in zip(pred, frm_batch, coord_batch):
-                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1), interpolation=cv2.INTER_LANCZOS4)
                 f[y1:y2, x1:x2] = p
                 writer.write(f)
     writer.release()
@@ -250,7 +265,7 @@ def _run_lipsync(source_path: pathlib.Path, audio_path: pathlib.Path, out_path: 
     t0 = time.perf_counter()
     subprocess.run([
         "ffmpeg", "-y", "-i", str(temp_avi), "-i", str(audio_path),
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", "-loglevel", "error", str(out_path),
     ], check=True)
     temp_avi.unlink(missing_ok=True)
@@ -276,6 +291,37 @@ def health():
         "models_loaded": True,
         "face_cache_size": len(list(CACHE_ROOT.glob("*.pkl"))),
     }
+
+
+@app.post("/lipsync_fast")
+async def lipsync_fast(source_path: str = Form(...), audio: UploadFile = File(...), out_height: int = Form(1080)):
+    """FAST path: source video already on the pod. Saves upload overhead per call."""
+    req_id = uuid.uuid4().hex[:8]
+    work = WORK_ROOT / req_id
+    work.mkdir(parents=True, exist_ok=True)
+    src = pathlib.Path(source_path)
+    if not src.exists():
+        raise HTTPException(400, f"source_path not found on pod: {source_path}")
+    audio_path = work / ("audio" + (pathlib.Path(audio.filename or "a.mp3").suffix or ".mp3"))
+    out_path = work / "out.mp4"
+    try:
+        with audio_path.open("wb") as f:
+            shutil.copyfileobj(audio.file, f)
+        with RENDER_LOCK:
+            timings = _run_lipsync(src, audio_path, out_path, out_height=out_height)
+        return FileResponse(
+            path=out_path, media_type="video/mp4",
+            headers={
+                "X-Request-Id": req_id,
+                "X-Total-Sec": str(timings["total_sec"]),
+                "X-Detect-Sec": str(timings["detect_sec"]),
+                "X-Predict-Sec": str(timings["predict_sec"]),
+                "X-Mux-Sec": str(timings["mux_sec"]),
+            },
+        )
+    except Exception as e:
+        log.exception("fast render failed")
+        raise HTTPException(500, str(e))
 
 
 @app.post("/lipsync")

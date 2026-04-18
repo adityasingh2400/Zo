@@ -266,7 +266,9 @@ async def process_video(video_path: str) -> dict:
     # Cleanup audio file
     Path(audio_path).unlink(missing_ok=True)
 
-    # Filter for best frames
+    # Filter for best frames. Transcript extraction runs as a background
+    # task in main.py — it's slower than the rest of intake on CPU and we
+    # don't want to gate the sell pipeline on it.
     t2 = time.perf_counter()
     best_frames = await asyncio.to_thread(filter_quality_frames, all_frames, max_output=4)
     timings.filter_sec = time.perf_counter() - t2

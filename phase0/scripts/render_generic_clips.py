@@ -164,7 +164,7 @@ def main():
 
         t1 = time.perf_counter()
         try:
-            video, headers = render_one(text, audio, src_bytes, args.steps, args.height)
+            video, _headers = render_one(text, audio, src_bytes, args.steps, args.height)
         except Exception as e:
             print(f"   LatentSync failed: {e}")
             continue

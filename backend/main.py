@@ -30,6 +30,9 @@ from agents.seller import (
     render_pitch_latentsync,
 )
 from agents.intake import process_video
+from agents.threed import carousel_from_video, glb_from_image
+from agents.bridge_clips import pick_bridge_clip, all_bridges
+from agents.avatar_director import Director
 
 # ── State ──────────────────────────────────────────────
 
@@ -42,6 +45,8 @@ pipeline_state: dict[str, Any] = {
     "product_photo_b64": None,
     "product_clean_b64": None,
     "model_3d": None,
+    "view_3d": None,  # {kind, frames|url, ms, source}
+    "transcript_extract": None,  # on-device structured pitch extraction
     "sales_script": None,
     "pitch_video_url": None,
     "last_response_video_url": None,
@@ -50,6 +55,10 @@ pipeline_state: dict[str, Any] = {
 
 dashboard_clients: list[WebSocket] = []
 phone_clients: list[WebSocket] = []
+
+# Single Director instance owns all play_clip emission. Bound to the
+# dashboard broadcast helper so it can talk to every connected client.
+director: "Director | None" = None  # set in app startup, see below
 
 
 def log_event(agent: str, message: str, data: Any = None):
@@ -81,7 +90,13 @@ async def broadcast_to_dashboards(msg: dict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global director
     print(f"EMPIRE backend running on {BACKEND_HOST}:{BACKEND_PORT}")
+    # Bring up the Avatar Director early so the first dashboard connect can
+    # immediately receive a Tier 0 idle clip.
+    director = Director(broadcast_to_dashboards)
+    director.start_idle_rotation()
+    logger.info("Avatar Director instantiated; idle rotation running.")
     # Pre-load Cactus model in background thread so first request isn't slow
     from agents.eyes import _get_cactus_model, CACTUS_AVAILABLE
     if CACTUS_AVAILABLE:
@@ -153,6 +168,9 @@ async def dashboard_ws(ws: WebSocket):
             "sales_script": pipeline_state.get("sales_script"),
             "pitch_video_url": pipeline_state.get("pitch_video_url"),
             "last_response_video_url": pipeline_state.get("last_response_video_url"),
+            "view_3d": pipeline_state.get("view_3d"),
+            "transcript_extract": pipeline_state.get("transcript_extract"),
+            "director_state": director.replay_state() if director else None,
             "agent_log": pipeline_state["agent_log"][-50:],
         },
     })
@@ -171,7 +189,7 @@ async def dashboard_ws(ws: WebSocket):
                         await api_respond_to_comment(comment=comment_text, out_height=1080)
                     except Exception as e:
                         log_event("SELLER", f"comment pipeline error: {e}")
-                asyncio.ensure_future(_run())
+                asyncio.create_task(_run())
 
             elif msg.get("type") == "simulate_sell":
                 frame = pipeline_state.get("product_photo_b64", "")
@@ -183,6 +201,17 @@ async def dashboard_ws(ws: WebSocket):
             elif msg.get("type") == "livetalking_session":
                 set_livetalking_session(msg.get("session_id", ""))
                 log_event("SYSTEM", f"LiveTalking WebRTC session: {msg.get('session_id', '')[:20]}...")
+
+            elif msg.get("type") == "stage_ready":
+                # Dashboard tells us Tier 0 is painting frames; safe to send tier 1.
+                if director:
+                    director.mark_ready()
+
+            elif msg.get("type") == "clip_ack":
+                # Dashboard playback telemetry: started / ended / stalled / skipped.
+                # Emit to logs for now; future versions can use this to detect stuck clips.
+                logger.info("[clip_ack] %s/%s status=%s",
+                            msg.get("intent"), msg.get("url"), msg.get("status"))
 
     except WebSocketDisconnect:
         dashboard_clients.remove(ws)
@@ -291,6 +320,24 @@ async def run_3d_generation(frame_b64: str):
         log_event("CREATOR", f"3D model skipped ({result})")
 
 
+async def run_carousel_pipeline(video_path: str):
+    """Tier-1 3D view: extract N rembg-cleaned angle frames, broadcast carousel."""
+    log_event("CREATOR", "Building 3D angle carousel from video...")
+    try:
+        view = await carousel_from_video(video_path, n_frames=12, out_size=512, clean_bg=True)
+    except Exception as e:
+        log_event("CREATOR", f"Carousel failed: {e}")
+        logger.exception("carousel pipeline error")
+        return
+    pipeline_state["view_3d"] = view
+    n = len(view.get("frames", []))
+    cached = " (cached)" if view.get("cached") else ""
+    log_event("CREATOR", f"3D spin ready: {n} frames in {view.get('ms', 0)}ms{cached}", {
+        "kind": view.get("kind"), "source": view.get("source"),
+    })
+    await broadcast_to_dashboards({"type": "view_3d", "data": view})
+
+
 # ── Comment Pipeline ──────────────────────────────────
 
 async def run_comment_pipeline(comment: str):
@@ -391,15 +438,20 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
 
     log_event("SYSTEM", "Video received. Starting intake pipeline...")
 
-    # Step 1: Video intake (parallel audio + frame extraction)
+    # Run intake (audio+frames+transcript) and carousel (angle spin) in
+    # parallel — both consume the same video, neither blocks the other.
     t0 = time.time()
     try:
-        logger.info("[INTAKE] Starting video processing...")
-        intake_result = await process_video(video_path)
+        logger.info("[INTAKE] Starting video processing + carousel in parallel...")
+        intake_result, _carousel_done = await asyncio.gather(
+            process_video(video_path),
+            run_carousel_pipeline(video_path),
+        )
     except Exception as e:
         logger.error("[INTAKE] FAILED: %s", e)
         logger.error(traceback.format_exc())
         log_event("SYSTEM", f"Video intake failed: {e}")
+        Path(video_path).unlink(missing_ok=True)
         return
     finally:
         Path(video_path).unlink(missing_ok=True)
@@ -422,8 +474,11 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
     if transcript:
         log_event("EYES", f'Seller said: "{transcript[:200]}..."')
         await broadcast_to_dashboards({"type": "transcript", "text": transcript})
+        # Fire on-device transcript extract in the background. It's CPU-slow
+        # (~10s on Mac) but runs in parallel with Claude vision. When it
+        # lands, we broadcast structured signals to the dashboard.
+        asyncio.ensure_future(run_transcript_extract(transcript))
 
-    # Use best frame for the main pipeline, pass transcript as voice_text
     if best_frames_b64:
         combined_voice = f"{voice_text}. Seller's narration: {transcript}" if transcript else voice_text
         pipeline_state["product_photo_b64"] = best_frames_b64[0]
@@ -431,6 +486,34 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         await run_sell_pipeline(best_frames_b64[0], combined_voice)
     else:
         log_event("SYSTEM", "No usable frames extracted from video")
+
+
+async def run_transcript_extract(transcript: str):
+    """Background: pull structured product hints from the seller's pitch.
+
+    Runs concurrently with Claude vision. Doesn't gate anything; arrives
+    when it arrives and enriches the dashboard. ~500ms (Cactus on NPU)
+    to ~15s (Cactus CPU prefill on Mac dev).
+    """
+    from agents.transcript_extract import extract_transcript_signals
+    try:
+        extract = await extract_transcript_signals(transcript)
+    except Exception as e:
+        logger.warning("[TRANSCRIPT_EXTRACT] failed: %s", e)
+        return
+
+    if not extract or extract.get("source") in (None, "empty"):
+        return
+
+    pipeline_state["transcript_extract"] = extract
+    await broadcast_to_dashboards({"type": "transcript_extract", "data": extract})
+    log_event("EYES", "On-device transcript extract ready", {
+        "source": extract.get("source"),
+        "latency_ms": extract.get("latency_ms"),
+        "name_hint": extract.get("name_hint"),
+        "claims_count": len(extract.get("claims") or []),
+        "selling_points_count": len(extract.get("selling_points") or []),
+    })
 
 
 @app.post("/api/comment")
@@ -454,6 +537,17 @@ async def api_state():
 
 from fastapi.staticfiles import StaticFiles
 app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
+
+# Static mount for the pre-rendered avatar clip library:
+#   - phase0/assets/clips/         (LatentSync bridges/intros/responses)
+#   - phase0/assets/clips/idle/    (Veo seamless idle + misc)
+#   - phase0/assets/states/        (8s state-pose loops, used as Tier 0 fallback)
+# All under one /clips URL so the Director and dashboard see one namespace.
+CLIPS_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "clips"
+STATES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "states"
+CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
+app.mount("/states", StaticFiles(directory=str(STATES_DIR)), name="states")
 
 
 def _save_render(label: str, data: bytes) -> str:
@@ -500,12 +594,13 @@ async def api_generate_pitch(
     }
 
 
-# Maps Gemma comment-type labels → pre-rendered LatentSync clip filenames.
-# Filled in by P1.3 (12-18 generic clips). Until then, falls back to live wav2lip.
+# Legacy stub — kept for backwards compat. Real bridge selection now lives
+# in agents/bridge_clips.py (manifest-driven, populated by `python -m
+# agents.bridge_clips render`). This dict is unused at runtime.
 CLIP_LIBRARY: dict[str, list[str]] = {
-    "question":   [],   # ["bridge_let_me_check.mp4", "bridge_great_question.mp4"]
-    "compliment": [],   # ["bridge_thanks.mp4", "bridge_glad.mp4"]
-    "objection":  [],   # ["bridge_understand.mp4"]
+    "question":   [],
+    "compliment": [],
+    "objection":  [],
     "spam":       [],
 }
 
@@ -522,16 +617,22 @@ async def api_classify_comment(comment: str = Form(...)):
         result = {"type": "question", "source": "fallback", "error": str(e)}
     label = (result.get("type") or "question").lower()
     elapsed_ms = int((time.time() - t0) * 1000)
-    clips = CLIP_LIBRARY.get(label, [])
-    bridge_url = f"/clips/{clips[0]}" if clips else None
+    bridge = pick_bridge_clip(label)
     return {
         "comment": comment,
         "label": label,
         "classify_ms": elapsed_ms,
         "source": result.get("source"),
-        "bridge_clip_url": bridge_url,
+        "bridge_clip_url": bridge.get("url") if bridge else None,
+        "bridge_clip_script": bridge.get("script") if bridge else None,
         "draft_response": result.get("draft_response"),
     }
+
+
+@app.get("/api/bridges")
+async def api_bridges():
+    """Inspect what bridge clips are loaded (for debugging the manifest)."""
+    return all_bridges()
 
 
 @app.post("/api/respond_to_comment")
@@ -539,13 +640,28 @@ async def api_respond_to_comment(
     comment: str = Form(...),
     out_height: int = Form(1080),
 ):
-    """LIVE comment response: Gemma classify → Claude refine → TTS → Wav2Lip.
-    Target: sub-8s end-to-end (warm pod, warm face cache)."""
+    """LIVE comment response with seamless avatar choreography.
+
+    Flow:
+      1. reading_chat clip fades in instantly (avatar 'reads the comment')
+      2. classify + LLM + TTS run in parallel, classify result picks the bridge
+      3. bridge clip crossfades over reading_chat the moment we know the label
+      4. Wav2Lip renders the response over the same source
+      5. response crossfades over the bridge when ready
+      6. fade_to_idle releases Tier 1 back to the always-on Tier 0 idle layer
+
+    Target: sub-8s end-to-end (warm pod, warm face cache).
+    """
     product_data = pipeline_state.get("product_data") or {}
     total_t0 = time.time()
 
-    # Fire classify + LLM in parallel. Classify is for telemetry/badging only;
-    # LLM response uses default "question" type to avoid blocking on Gemma (7-15s).
+    # 1) Reading the chat — instant visual feedback. Director holds it briefly
+    #    before the bridge takes over, so the viewer registers the moment.
+    if director:
+        asyncio.create_task(director.reading_chat())
+
+    # 2) Classify + LLM in parallel. Classify drives bridge selection; LLM gets
+    #    "question" as a safe default if classify is slow.
     class_t0 = time.time()
     classify_task = asyncio.create_task(classify_comment_gemma(comment))
 
@@ -557,12 +673,12 @@ async def api_respond_to_comment(
     resp_ms = int((time.time() - t0) * 1000)
     log_event("SELLER", f"response drafted ({resp_ms}ms)", {"response": response_text})
 
-    # Kick off TTS immediately; classify keeps running for badging
+    # 3) Kick off TTS immediately
     t0 = time.time()
     audio_bytes = await text_to_speech(response_text)
     tts_ms = int((time.time() - t0) * 1000)
 
-    # Collect classify result if it finished (non-blocking-ish)
+    # Collect classify result if it finished — used for both badging AND bridge pick
     comment_type = "question"
     class_ms = int((time.time() - class_t0) * 1000)
     if classify_task.done():
@@ -571,10 +687,19 @@ async def api_respond_to_comment(
         except Exception:
             pass
     else:
-        # Don't wait — cancel if it's still running to free the CPU for lipsync
         classify_task.cancel()
     log_event("EYES", f'Comment "{comment[:40]}" → {comment_type} ({class_ms}ms)')
 
+    # 4) Bridge clip — crossfades over reading_chat. Best-effort; if no clip
+    #    in the manifest for this label, dashboard just keeps reading_chat
+    #    until the response lands.
+    if director:
+        try:
+            await director.play_bridge(comment_type)
+        except Exception:
+            logger.exception("[director] play_bridge failed (non-fatal)")
+
+    # 5) Wav2Lip render
     t0 = time.time()
     video_bytes, headers = await render_comment_response_wav2lip(audio_bytes, out_height=out_height)
     lipsync_ms = int((time.time() - t0) * 1000)
@@ -587,6 +712,20 @@ async def api_respond_to_comment(
         "url": url, "classify_ms": class_ms, "llm_ms": resp_ms,
         "tts_ms": tts_ms, "lipsync_ms": lipsync_ms,
     })
+
+    # 6) Crossfade in the live response, then release back to idle when done.
+    if director:
+        await director.play_response(url)
+        # Schedule the idle release after the response has had time to play.
+        # Wav2Lip output duration ≈ TTS audio duration ≈ ~3-5s for short replies.
+        # Estimate 1s per 3 words and add a safety buffer.
+        word_count = len(response_text.split())
+        estimated_play_ms = int(max(2500, word_count * 350) + 600)
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after(estimated_play_ms))
 
     await broadcast_to_dashboards({
         "type": "comment_response_video",
@@ -616,6 +755,37 @@ async def api_respond_to_comment(
             "predict_sec": headers.get("x-predict-sec"),
         },
     }
+
+
+@app.post("/api/build_carousel")
+async def api_build_carousel(
+    file: UploadFile = File(...),
+    n_frames: int = Form(12),
+    out_size: int = Form(512),
+    clean_bg: bool = Form(True),
+):
+    """Build a 3D-spin carousel from an uploaded video. For local testing
+    without going through the full sell pipeline."""
+    import tempfile
+    contents = await file.read()
+    suffix = Path(file.filename).suffix if file.filename else ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(contents)
+        video_path = f.name
+    try:
+        view = await carousel_from_video(
+            video_path, n_frames=n_frames, out_size=out_size, clean_bg=clean_bg,
+        )
+    finally:
+        Path(video_path).unlink(missing_ok=True)
+    pipeline_state["view_3d"] = view
+    await broadcast_to_dashboards({"type": "view_3d", "data": view})
+    return view
+
+
+@app.get("/api/view_3d")
+async def api_view_3d():
+    return pipeline_state.get("view_3d") or {"kind": None}
 
 
 @app.get("/api/photo")

@@ -1,0 +1,13 @@
+[WARN] [npu] [gemma4] model.mlpackage not found; using CPU prefill
+Cactus available: True
+Warming up Cactus (Gemma 4) model...
+  warmup 6.57s
+  ✓ 'how much does this cost?'               -> type=question     rt=3771ms  src=cactus_on_device
+  · 'omg i love it!!!'                       -> type=question     rt=4478ms  src=cactus_on_device
+  ✓ 'looks kinda cheap tho'                  -> type=objection    rt=2253ms  src=cactus_on_device
+  · 'WHERE DO I BUY'                         -> type=question     rt=920ms  src=cactus_on_device
+  · 'yooo this is fire'                      -> type=compliment   rt=1967ms  src=cactus_on_device
+
+p50=2253ms  p90=4478ms  (target <500ms)
+GATE: FAIL — classification too slow for live demo comments
+Report: /Users/aditya/Desktop/ychackathon/phase0/bench/results/cactus_bench.json

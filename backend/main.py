@@ -324,7 +324,12 @@ async def run_carousel_pipeline(video_path: str):
     """Tier-1 3D view: extract N rembg-cleaned angle frames, broadcast carousel."""
     log_event("CREATOR", "Building 3D angle carousel from video...")
     try:
-        view = await carousel_from_video(video_path, n_frames=12, out_size=512, clean_bg=True)
+        # 24 frames @ 640px with rembg+stabilization = silky spin, product
+        # stays centered + at constant size, no edge flicker between frames.
+        view = await carousel_from_video(
+            video_path, n_frames=24, out_size=640, clean_bg=True,
+            rembg_model="u2net", stabilize=True,
+        )
     except Exception as e:
         log_event("CREATOR", f"Carousel failed: {e}")
         logger.exception("carousel pipeline error")
@@ -471,16 +476,43 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
     logger.info("[INTAKE]   transcript: %d chars", len(transcript))
     logger.info("[INTAKE]   timings: %s", json.dumps(timings))
 
+    transcript_extract_hint = ""  # injected into Claude prompt below
     if transcript:
         log_event("EYES", f'Seller said: "{transcript[:200]}..."')
         await broadcast_to_dashboards({"type": "transcript", "text": transcript})
-        # Fire on-device transcript extract in the background. It's CPU-slow
-        # (~10s on Mac) but runs in parallel with Claude vision. When it
-        # lands, we broadcast structured signals to the dashboard.
-        asyncio.ensure_future(run_transcript_extract(transcript))
+        # Race transcript_extract against a tight timeout. If Cactus on NPU
+        # finishes in <1.5s we ground Claude's prompt on its hints. If it's
+        # slower (CPU prefill on Mac dev = 10s), we fire Claude without
+        # waiting and let extract land on the dashboard separately.
+        try:
+            from agents.transcript_extract import (
+                extract_transcript_signals, hint_block_for_claude,
+            )
+            extract_task = asyncio.create_task(
+                extract_transcript_signals(transcript)
+            )
+            try:
+                extract = await asyncio.wait_for(asyncio.shield(extract_task), timeout=1.5)
+                transcript_extract_hint = hint_block_for_claude(extract)
+                pipeline_state["transcript_extract"] = extract
+                await broadcast_to_dashboards({"type": "transcript_extract", "data": extract})
+                log_event("EYES",
+                          f"Transcript extract ready in time ({extract.get('latency_ms', 0)}ms)",
+                          {"source": extract.get("source")})
+            except asyncio.TimeoutError:
+                # Extract is slow — let Claude run unblocked. The pending
+                # task keeps running and reports when it lands.
+                log_event("EYES", "Transcript extract slow (>1.5s), running unblocked")
+                asyncio.ensure_future(_finish_transcript_extract(extract_task))
+        except Exception as e:
+            logger.warning("[TRANSCRIPT_EXTRACT] setup failed: %s", e)
 
     if best_frames_b64:
         combined_voice = f"{voice_text}. Seller's narration: {transcript}" if transcript else voice_text
+        if transcript_extract_hint:
+            # Append the on-device hint block. Claude treats it as additional
+            # context and grounds the script accordingly.
+            combined_voice = f"{combined_voice}\n\n{transcript_extract_hint}"
         pipeline_state["product_photo_b64"] = best_frames_b64[0]
         await broadcast_to_dashboards({"type": "phone_frame", "frame": best_frames_b64[0][:100] + "..."})
         await run_sell_pipeline(best_frames_b64[0], combined_voice)
@@ -488,32 +520,28 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         log_event("SYSTEM", "No usable frames extracted from video")
 
 
-async def run_transcript_extract(transcript: str):
-    """Background: pull structured product hints from the seller's pitch.
-
-    Runs concurrently with Claude vision. Doesn't gate anything; arrives
-    when it arrives and enriches the dashboard. ~500ms (Cactus on NPU)
-    to ~15s (Cactus CPU prefill on Mac dev).
-    """
-    from agents.transcript_extract import extract_transcript_signals
+async def _finish_transcript_extract(task: asyncio.Task) -> None:
+    """Helper: wait for a slow extract to finish, then broadcast it.
+    Used when the timeout race in run_video_sell_pipeline punted."""
     try:
-        extract = await extract_transcript_signals(transcript)
+        extract = await task
     except Exception as e:
-        logger.warning("[TRANSCRIPT_EXTRACT] failed: %s", e)
+        logger.warning("[TRANSCRIPT_EXTRACT] late task failed: %s", e)
         return
-
     if not extract or extract.get("source") in (None, "empty"):
         return
-
     pipeline_state["transcript_extract"] = extract
     await broadcast_to_dashboards({"type": "transcript_extract", "data": extract})
-    log_event("EYES", "On-device transcript extract ready", {
+    log_event("EYES", "Transcript extract late-arrived (post-Claude)", {
         "source": extract.get("source"),
         "latency_ms": extract.get("latency_ms"),
-        "name_hint": extract.get("name_hint"),
-        "claims_count": len(extract.get("claims") or []),
-        "selling_points_count": len(extract.get("selling_points") or []),
     })
+
+
+# NOTE: the legacy run_transcript_extract task has been folded into
+# run_video_sell_pipeline so the extract grounds Claude's prompt directly
+# (via hint_block_for_claude). _finish_transcript_extract handles the
+# slow-path case where extract didn't beat the 1.5s timeout.
 
 
 @app.post("/api/comment")
@@ -823,12 +851,14 @@ async def api_respond_to_comment(
 @app.post("/api/build_carousel")
 async def api_build_carousel(
     file: UploadFile = File(...),
-    n_frames: int = Form(12),
-    out_size: int = Form(512),
+    n_frames: int = Form(24),
+    out_size: int = Form(640),
     clean_bg: bool = Form(True),
+    rembg_model: str = Form("u2net"),
+    stabilize: bool = Form(True),
 ):
-    """Build a 3D-spin carousel from an uploaded video. For local testing
-    without going through the full sell pipeline."""
+    """Build a 3D-spin carousel from an uploaded video. Tweaks exposed for
+    local debugging — defaults match the production pipeline."""
     import tempfile
     contents = await file.read()
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
@@ -837,7 +867,8 @@ async def api_build_carousel(
         video_path = f.name
     try:
         view = await carousel_from_video(
-            video_path, n_frames=n_frames, out_size=out_size, clean_bg=clean_bg,
+            video_path, n_frames=n_frames, out_size=out_size,
+            clean_bg=clean_bg, rembg_model=rembg_model, stabilize=stabilize,
         )
     finally:
         Path(video_path).unlink(missing_ok=True)

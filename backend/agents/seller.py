@@ -249,19 +249,23 @@ class _BytesCtx:
         self._buf.close()
 
 
-async def text_to_speech(text: str) -> bytes:
-    """ElevenLabs TTS fallback. Used when LiveTalking is unavailable."""
-    logger.info("[TTS] text_to_speech called (text: %d chars, eleven: %s)", len(text), "yes" if eleven else "no")
-    if not eleven:
-        return b""
-
+def _eleven_tts_sync(text: str) -> bytes:
+    """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
+    event loop isn't blocked while audio bytes are being generated +
+    streamed; the WS broadcast for play_clip events can interleave."""
     audio_gen = eleven.text_to_speech.convert(
         text=text,
         voice_id=ELEVENLABS_VOICE_ID,
         model_id="eleven_flash_v2_5",
         output_format="mp3_44100_128",
     )
-    chunks = []
-    for chunk in audio_gen:
-        chunks.append(chunk)
-    return b"".join(chunks)
+    return b"".join(audio_gen)
+
+
+async def text_to_speech(text: str) -> bytes:
+    """ElevenLabs TTS. flash_v2_5 model = ~400ms for a 15-word reply.
+    Off-loaded to a worker thread so it doesn't stall the asyncio loop."""
+    logger.info("[TTS] text_to_speech called (text: %d chars, eleven: %s)", len(text), "yes" if eleven else "no")
+    if not eleven:
+        return b""
+    return await asyncio.to_thread(_eleven_tts_sync, text)

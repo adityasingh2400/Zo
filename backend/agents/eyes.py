@@ -227,27 +227,51 @@ Extract as JSON only: {{"action": "sell|describe|compare", "price": "$X or null"
 
 async def analyze_and_script_claude(frame_b64: str, voice_text: str) -> dict:
     """Single Claude call: product analysis + sales script from image.
-    Returns dict with product_data and sales_script."""
+    Returns dict with product_data and sales_script.
+
+    The script is structured as a 4-beat livestream pitch (HOOK → DEMO →
+    PROOF → CTA) so it sounds like a TikTok Live creator, not generic
+    marketing copy. Hallucination guard: must reference at least 2 visual
+    details from the image AND 1 specific phrase from the seller's voice.
+    """
     logger.info("[CLAUDE] analyze_and_script called (frame: %d chars)", len(frame_b64))
-    prompt = f"""You are analyzing a product for a live e-commerce stream.
+    prompt = f"""You are writing copy for a live e-commerce stream where an AI avatar
+will read the script aloud in real time. Treat this like TikTok Live, not Amazon
+copy — punchy, conversational, second-person.
 
-SELLER'S VOICE (TRUST THIS for product identity — the seller knows what they're selling):
-"{voice_text}"
+SELLER'S VOICE (CONTEXT — trust this for product identity, anything the seller
+explicitly said is true; do NOT contradict them):
+\"\"\"
+{voice_text}
+\"\"\"
 
-Look at the product image for visual details (color, condition, materials, accessories visible).
+VISUAL: study the product image for color, materials, condition, accessories,
+notable details visible in frame.
 
-Do TWO things. Return ONLY valid JSON:
+Return ONLY valid JSON:
 {{
     "product": {{
-        "name": "exact product name from seller's narration + visual confirmation",
-        "category": "category",
-        "materials": ["material1", "material2"],
-        "selling_points": ["point1", "point2", "point3", "point4", "point5"],
-        "target_audience": "who would buy this",
+        "name": "exact product name (from seller's words + visual confirmation)",
+        "category": "broad category — e.g. watches, sneakers, headphones",
+        "materials": ["primary material", "secondary material"],
+        "selling_points": ["5 short benefit phrases the script will draw from"],
+        "target_audience": "one-line buyer persona",
         "suggested_price_range": "$X - $Y"
     }},
-    "script": "A compelling 30-second sales pitch (under 100 words). Enthusiastic but genuine. Reference specific visual details from the image. Include 2-3 selling points and a call to action. Spoken dialogue only, no stage directions."
-}}"""
+    "script": "A 30-second spoken pitch with FOUR beats: HOOK (1 sentence — get
+attention), DEMO (1-2 sentences — name 2 specific visual details from the image
+so the audience knows you're really looking at the product), PROOF (1-2
+sentences — quote or paraphrase 1 specific phrase from the seller's voice
+above), CTA (1 sentence — call to action with urgency). No stage directions,
+no '[pause]', no headings — just the spoken words run together as one paragraph.
+Under 90 words total. Conversational, second person ('you'), genuine
+enthusiasm."
+}}
+
+HALLUCINATION GUARD: every sentence in the script must be supported by either
+a visual detail YOU CAN SEE in the image or a specific phrase YOU CAN QUOTE
+from the seller's voice. Do not invent features, dimensions, prices, or
+specs that aren't in either source."""
 
     media_type = "image/jpeg"
     if frame_b64[:4] == "iVBO":

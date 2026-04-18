@@ -80,6 +80,17 @@ CLIPS: dict[str, list[str]] = {
     ],
 }
 
+# Per-category audio tag prefixes for Eleven v3 (--v3 mode).
+# v3 reads bracketed cues like [warm] or [gentle laugh] as expressive
+# direction. They DON'T appear in the spoken output — they shape delivery.
+V3_TAGS: dict[str, str] = {
+    "intro":      "[warm][bright]",
+    "bridge":     "[curious][casual]",
+    "question":   "[enthusiastic][curious]",
+    "compliment": "[gentle laugh][warm]",
+    "objection":  "[soft][confident]",
+}
+
 
 def slugify(text: str) -> str:
     base = "".join(c.lower() if c.isalnum() else "_" for c in text)
@@ -88,13 +99,29 @@ def slugify(text: str) -> str:
     return base.strip("_")[:40]
 
 
-def tts(text: str, eleven: ElevenLabs) -> bytes:
-    audio = eleven.text_to_speech.convert(
-        voice_id=ELEVEN_VOICE,
-        text=text,
-        model_id="eleven_turbo_v2_5",
-        output_format="mp3_44100_128",
-    )
+def tts(text: str, eleven: ElevenLabs, v3: bool = False, category: str = "") -> bytes:
+    """Eleven TTS. v3=True uses the expressive Eleven v3 model with audio
+    tags — slower (~3-5x latency) but dramatically more human delivery,
+    correct trade-off for offline pre-renders. Tag prefix per category."""
+    if v3:
+        prefix = V3_TAGS.get(category, "[warm]")
+        prompt = f"{prefix} {text}"
+        # Eleven v3 model id. The SDK accepts either eleven_v3 or the
+        # 'eleven-v3-alpha' string depending on plan; we let the API
+        # error speak if neither works.
+        audio = eleven.text_to_speech.convert(
+            voice_id=ELEVEN_VOICE,
+            text=prompt,
+            model_id="eleven_v3",
+            output_format="mp3_44100_128",
+        )
+    else:
+        audio = eleven.text_to_speech.convert(
+            voice_id=ELEVEN_VOICE,
+            text=text,
+            model_id="eleven_turbo_v2_5",
+            output_format="mp3_44100_128",
+        )
     return b"".join(audio)
 
 
@@ -121,6 +148,9 @@ def main():
     ap.add_argument("--steps", type=int, default=10, help="LatentSync inference steps")
     ap.add_argument("--height", type=int, default=1080, help="Output height in px")
     ap.add_argument("--force", action="store_true", help="Re-render even if file exists")
+    ap.add_argument("--v3", action="store_true",
+                    help="Use Eleven v3 with audio tags ([warm][curious][gentle laugh] etc.) "
+                         "for dramatically more expressive delivery. Slower, fine for offline.")
     args = ap.parse_args()
 
     categories = args.category or list(CLIPS.keys())
@@ -156,7 +186,7 @@ def main():
         print(f"[{i:2d}/{len(plan)}] {cat}: {text!r}")
         t0 = time.perf_counter()
         try:
-            audio = tts(text, eleven)
+            audio = tts(text, eleven, v3=args.v3, category=cat)
         except Exception as e:
             print(f"   TTS failed: {e}")
             continue

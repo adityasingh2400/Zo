@@ -364,8 +364,8 @@ struct StreamView: View {
     // MARK: - Data
 
     private func refreshBestFrames() async {
-        guard let host = GemmaClient.backendHost else { return }
-        guard let url = URL(string: "http://\(host):8000/api/best_frames") else { return }
+        guard let base = GemmaClient.backendBaseURL else { return }
+        let url = base.appendingPathComponent("api/best_frames")
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -381,9 +381,11 @@ struct StreamView: View {
     }
 
     private func relativeURL(_ path: String) -> URL? {
-        guard let host = GemmaClient.backendHost else { return nil }
+        guard let base = GemmaClient.backendBaseURL else { return nil }
         if path.hasPrefix("http") { return URL(string: path) }
-        return URL(string: "http://\(host):8000\(path)")
+        // path from the backend starts with "/", e.g. "/renders/..."
+        let trimmed = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        return base.appendingPathComponent(trimmed)
     }
 }
 

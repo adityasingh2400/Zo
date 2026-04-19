@@ -247,17 +247,39 @@ final class EmpireSocket {
     // ── Helpers ──────────────────────────────────────────────────────────
 
     private func buildURL() -> URL? {
-        guard let host = GemmaClient.backendHost else { return nil }
-        var components = URLComponents()
-        components.scheme = "ws"
-        components.host = host
-        components.port = port
-        components.path = "/ws/dashboard"
+        // Route through GemmaClient.websocketBaseURL so the phone supports:
+        //   - Plain hostname/IP   → ws://host:8000
+        //   - http:// full URL    → ws://host
+        //   - https:// full URL   → wss://host  (cloudflared tunnels require wss)
+        // The `port` property is still used for plain-host fallback.
+        guard let wsBase = GemmaClient.websocketBaseURL else { return nil }
         let token = EmpireWSAuth.token
-        if !token.isEmpty {
-            components.queryItems = [URLQueryItem(name: "token", value: token)]
+
+        // If wsBase is a full tunnel URL it already has scheme+host (+ maybe
+        // port), so just append the path. If it's plain-host-based we need
+        // to rebuild with the configured port to support non-defaults.
+        let pathURL: URL
+        if GemmaClient.backendIsFullURL {
+            pathURL = wsBase.appendingPathComponent("ws/dashboard")
+        } else {
+            // Rebuild with the explicit port — websocketBaseURL uses 8000
+            // by default but the caller may have overridden it.
+            guard var components = URLComponents(url: wsBase, resolvingAgainstBaseURL: false) else {
+                return nil
+            }
+            components.port = port
+            components.path = "/ws/dashboard"
+            if !token.isEmpty {
+                components.queryItems = [URLQueryItem(name: "token", value: token)]
+            }
+            return components.url
         }
-        return components.url
+
+        // Tunnel path — add token as query if present.
+        if token.isEmpty { return pathURL }
+        var components = URLComponents(url: pathURL, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "token", value: token)]
+        return components?.url ?? pathURL
     }
 
     /// Exponential backoff: 2, 4, 8, 16, 30, 30, 30… seconds. Capped at 30

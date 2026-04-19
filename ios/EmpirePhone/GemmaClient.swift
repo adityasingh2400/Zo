@@ -82,18 +82,66 @@ enum GemmaClient {
         }
     }
 
+    // ── Base-URL helpers ─────────────────────────────────────────────────
+    //
+    // The backendHost value is overloaded: it accepts EITHER
+    //   - a plain host/IP like "172.20.10.2"  → we prepend http:// and :8000
+    //   - a full URL like "https://xxx.trycloudflare.com" → use as-is
+    //
+    // This lets the same long-press sheet configure both LAN mode (same-WiFi
+    // hotspot) and tunnel mode (cloudflared / ngrok / Tailscale funnel)
+    // without a separate toggle or UI. Auto-detect by checking the prefix.
+
+    /// True if the configured host is a full URL (starts with http:// or
+    /// https://). Callers can use this to switch protocol schemes or build
+    /// the correct WS URL.
+    static var backendIsFullURL: Bool {
+        guard let h = backendHost else { return false }
+        return h.hasPrefix("http://") || h.hasPrefix("https://")
+    }
+
+    /// HTTP(S) base URL for the backend API — no trailing slash.
+    /// - Plain host input → `http://<host>:8000`
+    /// - Full URL input   → returned as-is (with trailing slash stripped)
+    static var backendBaseURL: URL? {
+        guard let h = backendHost else { return nil }
+        if backendIsFullURL {
+            var s = h
+            while s.hasSuffix("/") { s.removeLast() }
+            return URL(string: s)
+        }
+        return URL(string: "http://\(h):8000")
+    }
+
+    /// WebSocket base URL for /ws/dashboard subscriptions.
+    /// - Plain host input → `ws://<host>:8000`
+    /// - `http://...`     → `ws://...`  (same origin)
+    /// - `https://...`    → `wss://...` (secure tunnels require wss)
+    static var websocketBaseURL: URL? {
+        guard let h = backendHost else { return nil }
+        if backendIsFullURL {
+            var s = h
+            while s.hasSuffix("/") { s.removeLast() }
+            if s.hasPrefix("https://") {
+                s = "wss://" + s.dropFirst("https://".count)
+            } else if s.hasPrefix("http://") {
+                s = "ws://" + s.dropFirst("http://".count)
+            }
+            return URL(string: s)
+        }
+        return URL(string: "ws://\(h):8000")
+    }
+
     /// POST the transcript to the Mac's /api/classify_comment. Sub-5s typical
     /// (Cactus Gemma 4 on CPU prefill is 2-4s; add ~50ms LAN RTT). Returns
     /// nil if the host isn't configured (caller hides the Gemma card).
+    ///
+    /// The `port` parameter is ignored when the configured backend is a
+    /// full URL (e.g. https://xxx.trycloudflare.com) — the tunnel host
+    /// already implies its own port via the scheme.
     static func classify(comment: String, port: Int = 8000) async throws -> GemmaClassify {
-        guard let host = backendHost else { throw Failure.backendNotConfigured }
-
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = host
-        components.port = port
-        components.path = "/api/classify_comment"
-        guard let url = components.url else { throw Failure.backendNotConfigured }
+        guard let base = backendBaseURL else { throw Failure.backendNotConfigured }
+        let url = base.appendingPathComponent("api/classify_comment")
 
         var req = URLRequest(url: url)
         req.httpMethod = "POST"

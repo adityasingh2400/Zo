@@ -33,23 +33,18 @@ enum SellerCaptureUploader {
         voiceText: String = "",
         port: Int = 8000
     ) async throws -> [String: Any] {
-        guard let host = GemmaClient.backendHost else {
+        // Route through GemmaClient.backendBaseURL so LAN hostnames AND full
+        // tunnel URLs (cloudflared / ngrok / Tailscale) both work without
+        // any caller changes. `port` is honored for LAN mode; tunnels embed
+        // their own port via the URL scheme.
+        guard let base = GemmaClient.backendBaseURL else {
             throw NSError(
                 domain: "SellerCaptureUploader",
                 code: -1,
                 userInfo: [NSLocalizedDescriptionKey: "backend host not configured — long-press the status pill"]
             )
         }
-
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = host
-        components.port = port
-        components.path = "/api/sell-video"
-        guard let url = components.url else {
-            throw NSError(domain: "SellerCaptureUploader", code: -2,
-                          userInfo: [NSLocalizedDescriptionKey: "bad URL"])
-        }
+        let url = base.appendingPathComponent("api/sell-video")
 
         let boundary = "Boundary-\(UUID().uuidString)"
         var req = URLRequest(url: url)

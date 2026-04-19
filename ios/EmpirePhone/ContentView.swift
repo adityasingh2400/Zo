@@ -98,14 +98,14 @@ struct ContentView: View {
     /// If no (or if the host isn't reachable) → camera path.
     /// This is a plain HTTP call so it works regardless of WS state.
     private func resolveLaunchPhase() async {
-        guard let host = GemmaClient.backendHost,
-              let url = URL(string: "http://\(host):8000/api/state") else {
+        guard let base = GemmaClient.backendBaseURL else {
             await MainActor.run {
                 phase = .needsProduct
                 showingCapture = true
             }
             return
         }
+        let url = base.appendingPathComponent("api/state")
         do {
             var req = URLRequest(url: url)
             req.timeoutInterval = 3

@@ -223,7 +223,7 @@ struct ContentView: View {
         state = .loading
         currentProduct = ProductLoader.loadActive()
 
-        guard let whisperPath = Bundle.main.path(forResource: "whisper-tiny", ofType: nil, inDirectory: "Models") else {
+        guard let whisperPath = Bundle.main.path(forResource: "whisper-base", ofType: nil, inDirectory: "Models") else {
             state = .error("whisper model not bundled")
             return
         }

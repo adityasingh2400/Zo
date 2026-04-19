@@ -182,7 +182,7 @@ Feeds improvements back to CREATOR and SELLER in real-time. The system gets smar
 
 1. **Pre-launch IP protection.** Products photographed and analyzed on-device never touch a server until you go live. For sellers with unreleased products, this is non-negotiable.
 2. **Selling strategy is proprietary.** The BRAIN agent's knowledge of what converts is your competitive advantage. Can't live on HeyGen's servers.
-3. **Real-time comment response.** Sub-200ms understanding of viewer comments enables natural conversation flow. Cloud adds 1-2 seconds — the viewer has scrolled away.
+3. **Real-time comment response.** Today: 2-4s classify on CPU prefill (target <500ms with the upcoming Cactus NPU mlpackage). Cloud adds another 1-2s on top of model time — on-device still wins on latency for routine comment classes, and the local-first router lets us play a pre-rendered MP4 in <1s for the 90% of comments that match the Q/A index.
 4. **Customer conversations are private.** DMs contain personal info, addresses, payment discussions.
 5. **Zero marginal cost.** Processing 1,000 comments per stream on cloud APIs = expensive. On-device = free.
 

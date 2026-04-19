@@ -147,7 +147,7 @@ Escalate is 6 s warm, 16 s cold. The bridge clip fills the silence. For the 10% 
 | stage | warm target | what it is |
 |---|---|---|
 | voice transcription (Cactus local) | ≤500 ms | whisper-base on Cactus |
-| comment classification | ≤200 ms | Gemma 4 classify_comment_gemma |
+| comment classification | 2-4s today (target ≤500ms with NPU mlpackage) | Gemma 4 classify_comment_gemma |
 | router decision (local) | ≤1 ms | rule-based dispatcher |
 | local response (pre-rendered MP4 play) | ≤50 ms | disk read + HLS stream |
 | cloud response (when escalated) | 1-2 s | Claude streaming |

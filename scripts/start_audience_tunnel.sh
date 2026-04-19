@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
 # scripts/start_audience_tunnel.sh
-# Bring up the audience-facing comment intake.
+# Bring up the operator phone surface (and audience comment fallback).
 #
 # Boots a Cloudflare quick-tunnel pointing at the backend (default
-# http://localhost:8000), captures the trycloudflare URL, generates a QR
-# PNG that points at /comment, and prints both the URL and a terminal-
-# rendered QR. Tunnel runs in the foreground — Ctrl-C to tear it down.
+# http://localhost:8000), captures the trycloudflare URL, generates two
+# QR PNGs — one for /phone (operator's hand-held control: record + push-
+# to-talk) and one for /comment (audience text-comment fallback) — and
+# prints both URLs and terminal-rendered QRs. Tunnel runs in the
+# foreground — Ctrl-C to tear it down.
 #
 # Stage usage:
 #   1. Run this in a separate terminal before going on stage.
-#   2. Drop the printed QR PNG into the intro slide.
-#   3. Tape a printout of the same QR to the back of the demo laptop as
-#      a fallback — projectors fail, audience phones don't.
+#   2. The /phone QR is the one you scan with YOUR iPhone — it gives you
+#      the record + push-to-talk surface that drives the avatar pipeline.
+#   3. The /comment QR is the audience-facing text-comment form (optional;
+#      drop into the intro slide if you want a way for the room to type
+#      questions in without your phone).
 #
 # Env overrides:
 #   BACKEND_PORT  default 8000
-#   QR_PNG        default /tmp/empire_audience_qr.png
+#   QR_PNG        default /tmp/empire_phone_qr.png  (operator)
+#   QR_AUD_PNG    default /tmp/empire_audience_qr.png (audience comment fallback)
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BACKEND_PORT="${BACKEND_PORT:-8000}"
-QR_PNG="${QR_PNG:-/tmp/empire_audience_qr.png}"
+QR_PNG="${QR_PNG:-/tmp/empire_phone_qr.png}"
+QR_AUD_PNG="${QR_AUD_PNG:-/tmp/empire_audience_qr.png}"
 
 if ! command -v cloudflared >/dev/null 2>&1; then
   printf '\033[31m✗\033[0m cloudflared not installed.\n'
@@ -75,21 +81,30 @@ if [ -z "$URL" ]; then
   exit 1
 fi
 
+PHONE_URL="${URL}/phone"
 COMMENT_URL="${URL}/comment"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════════"
-printf '  \033[1mAudience comment URL\033[0m\n'
+printf '  \033[1mOperator phone URL\033[0m  (scan with YOUR iPhone — record + push-to-talk)\n'
+printf '    %s\n' "$PHONE_URL"
+echo "─────────────────────────────────────────────────────────────────"
+printf '  \033[1mAudience comment URL\033[0m  (optional text-comment fallback)\n'
 printf '    %s\n' "$COMMENT_URL"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
 
 if [ "$HAS_QRENCODE" -eq 1 ]; then
-  qrencode -o "$QR_PNG" -s 14 -m 4 "$COMMENT_URL"
-  echo "  QR PNG saved → $QR_PNG"
-  echo "  (drop into intro slide; print + tape to laptop as fallback)"
+  qrencode -o "$QR_PNG" -s 14 -m 4 "$PHONE_URL"
+  echo "  Operator QR PNG → $QR_PNG"
+  echo "  (this is the one you scan to control the demo from your iPhone)"
   echo ""
-  qrencode -t ansiutf8 "$COMMENT_URL"
+  qrencode -t ansiutf8 "$PHONE_URL"
+  echo ""
+
+  qrencode -o "$QR_AUD_PNG" -s 14 -m 4 "$COMMENT_URL"
+  echo "  Audience QR PNG → $QR_AUD_PNG"
+  echo "  (drop into intro slide if you want the room to type questions in)"
   echo ""
 fi
 

@@ -1210,6 +1210,41 @@ async def comment_form() -> HTMLResponse:
     return HTMLResponse(_COMMENT_FORM_HTML, headers={"Cache-Control": "no-store"})
 
 
+# ── Operator phone surface ────────────────────────────────────────────────
+# /phone is the OPERATOR's hand-held control (not the audience comment form
+# above). Scan the QR with the demo presenter's iPhone, get a single-page
+# mobile UI with two buttons: RECORD (camera → /ws/phone sell_video → fires
+# the avatar pitch pipeline) and HOLD TO TALK (mic → /api/voice_comment →
+# routed via on-device Cactus/Gemma 4 → avatar reactive response).
+#
+# This is the web equivalent of the native Cody iOS app at ios/EmpirePhone.
+# Backend contract is identical (/ws/phone + /api/voice_comment) so either
+# surface plugs in interchangeably. Web wins for demo-day setup speed:
+# zero install, scan-and-go, works in any phone browser. The iOS app stays
+# in the repo as future polish (on-device whisper for sub-200ms transcription
+# instead of round-tripping audio to the Mac), but for now the web client
+# is the canonical operator phone.
+_OPERATOR_PHONE_HTML_PATH = (
+    Path(__file__).resolve().parent / "static" / "operator_phone.html"
+)
+
+
+@app.get("/phone", response_class=HTMLResponse)
+async def operator_phone() -> HTMLResponse:
+    """Operator's phone control surface — record product video + push-to-talk.
+    Single self-contained HTML; no build step. Loads on Safari + Chrome
+    over the Cloudflare tunnel printed by start_audience_tunnel.sh."""
+    try:
+        html = _OPERATOR_PHONE_HTML_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail=("operator_phone.html missing — should be at "
+                    f"{_OPERATOR_PHONE_HTML_PATH} in shipped builds."),
+        )
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/audience_comment")
 async def api_audience_comment(payload: dict, request: Request):
     """Audience-submitted comment from a phone. Two side effects:

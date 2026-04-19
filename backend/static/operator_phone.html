@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Operator</title>
+  <style>
+    :root {
+      --bg: #000;
+      --fg: #fff;
+      --muted: #8a8a8e;
+      --rec: #ff3b30;
+      --talk: #30d158;
+      --pill: rgba(255, 255, 255, 0.12);
+      --pill-strong: rgba(255, 255, 255, 0.22);
+      --safe-top: env(safe-area-inset-top);
+      --safe-bottom: env(safe-area-inset-bottom);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+      font: 15px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      overflow: hidden; overscroll-behavior: none; user-select: none;
+      -webkit-user-select: none; -webkit-touch-callout: none;
+    }
+    body { display: flex; flex-direction: column;
+      padding-top: var(--safe-top); padding-bottom: var(--safe-bottom); }
+
+    /* status bar */
+    .top { flex: 0 0 auto; display: flex; align-items: center;
+      justify-content: space-between; padding: 10px 14px; gap: 8px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px;
+      background: var(--pill); border-radius: 999px;
+      padding: 6px 11px; font-size: 12px; font-weight: 500; color: var(--fg); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .dot.connected { background: var(--talk); box-shadow: 0 0 6px rgba(48, 209, 88, 0.7); }
+    .dot.connecting { background: #ff9f0a; animation: blink 1s linear infinite; }
+    .dot.error { background: var(--rec); }
+    @keyframes blink { 50% { opacity: 0.25; } }
+    .timer { font-variant-numeric: tabular-nums; font-weight: 600;
+      opacity: 0; transition: opacity 0.15s ease; }
+    .timer.on { opacity: 1; }
+    .rec-mark { width: 8px; height: 8px; border-radius: 50%; background: var(--rec);
+      margin-right: 7px; animation: pulse 1.1s ease-in-out infinite; display: inline-block; }
+    @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.8); } }
+
+    /* live preview */
+    .stage { flex: 1 1 auto; position: relative; overflow: hidden; background: #0a0a0b;
+      display: flex; align-items: center; justify-content: center; }
+    video.preview { width: 100%; height: 100%; object-fit: cover; background: #000; }
+    .placeholder { position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 8px; color: var(--muted); }
+    .placeholder .icon { font-size: 48px; opacity: 0.3; }
+
+    /* status overlay (acks from backend) */
+    .ack { position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.72); border-radius: 12px;
+      padding: 10px 16px; font-size: 13px; font-weight: 500;
+      max-width: 80%; text-align: center; pointer-events: none;
+      opacity: 0; transition: opacity 0.25s ease;
+      backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
+    .ack.show { opacity: 1; }
+
+    /* controls */
+    .controls { flex: 0 0 auto; display: grid; grid-template-columns: 1fr 1fr;
+      gap: 12px; padding: 16px 16px calc(16px + var(--safe-bottom)); }
+
+    .btn { display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 6px; padding: 22px 12px; border-radius: 18px; border: 0; cursor: pointer;
+      font: inherit; color: var(--fg); -webkit-appearance: none;
+      transition: transform 0.06s ease, background 0.15s ease; user-select: none;
+      -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+    .btn:active { transform: scale(0.97); }
+    .btn .label { font-size: 13px; font-weight: 600; letter-spacing: 0.02em;
+      text-transform: uppercase; opacity: 0.95; }
+    .btn .hint { font-size: 11px; opacity: 0.6; font-weight: 500; }
+
+    .btn-record { background: linear-gradient(180deg, #2a2a2d 0%, #1c1c1e 100%);
+      border: 1px solid rgba(255,255,255,0.08); }
+    .btn-record.recording { background: linear-gradient(180deg, #ff453a 0%, #ff3b30 100%);
+      border-color: rgba(255,255,255,0.2); }
+    .btn-record .dot-rec { width: 14px; height: 14px; border-radius: 50%;
+      background: var(--rec); transition: all 0.2s ease; }
+    .btn-record.recording .dot-rec { background: #fff; border-radius: 4px; width: 16px; height: 16px; }
+
+    .btn-talk { background: linear-gradient(180deg, #2a2a2d 0%, #1c1c1e 100%);
+      border: 1px solid rgba(255,255,255,0.08); position: relative; }
+    .btn-talk.holding { background: linear-gradient(180deg, #34d35a 0%, #30d158 100%);
+      border-color: rgba(255,255,255,0.2); }
+    .btn-talk .mic { font-size: 22px; line-height: 1; }
+
+    .perm-msg { padding: 24px; text-align: center; color: var(--muted); font-size: 14px; }
+    .perm-msg button { margin-top: 16px; background: var(--pill-strong); color: var(--fg);
+      border: 0; border-radius: 999px; padding: 10px 22px; font: inherit; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <!-- status bar -->
+  <div class="top">
+    <div class="pill" id="conn-pill">
+      <span class="dot connecting" id="conn-dot"></span>
+      <span id="conn-label">connecting…</span>
+    </div>
+    <div class="timer" id="timer">
+      <span class="rec-mark"></span><span id="timer-text">0:00</span>
+    </div>
+  </div>
+
+  <!-- camera preview / placeholder -->
+  <div class="stage">
+    <video class="preview" id="preview" autoplay muted playsinline></video>
+    <div class="placeholder" id="placeholder">
+      <div class="icon">📷</div>
+      <div>tap RECORD to start camera</div>
+    </div>
+    <div class="ack" id="ack"></div>
+  </div>
+
+  <!-- buttons -->
+  <div class="controls">
+    <button class="btn btn-record" id="btn-record">
+      <div class="dot-rec"></div>
+      <div class="label" id="record-label">Record</div>
+      <div class="hint">tap to start / stop</div>
+    </button>
+    <button class="btn btn-talk" id="btn-talk">
+      <div class="mic">🎙</div>
+      <div class="label">Hold to Talk</div>
+      <div class="hint">push & hold</div>
+    </button>
+  </div>
+
+<script>
+'use strict';
+
+// ── WebSocket plumbing ──────────────────────────────────────────────────
+const WS_PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_URL = `${WS_PROTO}//${location.host}/ws/phone`;
+const els = {
+  connDot:  document.getElementById('conn-dot'),
+  connLbl:  document.getElementById('conn-label'),
+  timer:    document.getElementById('timer'),
+  timerTxt: document.getElementById('timer-text'),
+  preview:  document.getElementById('preview'),
+  placeholder: document.getElementById('placeholder'),
+  ack:      document.getElementById('ack'),
+  btnRecord: document.getElementById('btn-record'),
+  recLabel: document.getElementById('record-label'),
+  btnTalk:  document.getElementById('btn-talk'),
+};
+
+let ws = null;
+let wsBackoffMs = 500;
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  els.connDot.className = 'dot connecting';
+  els.connLbl.textContent = 'connecting…';
+  ws.onopen = () => {
+    wsBackoffMs = 500;
+    els.connDot.className = 'dot connected';
+    els.connLbl.textContent = 'live';
+  };
+  ws.onclose = () => {
+    els.connDot.className = 'dot error';
+    els.connLbl.textContent = 'disconnected';
+    setTimeout(connectWS, wsBackoffMs);
+    wsBackoffMs = Math.min(wsBackoffMs * 2, 8000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'phone_ack') handleAck(msg);
+    } catch {}
+  };
+}
+connectWS();
+
+// ── Toast helper ────────────────────────────────────────────────────────
+let ackHideTimer = null;
+function flash(text, ms = 2200) {
+  els.ack.textContent = text;
+  els.ack.classList.add('show');
+  if (ackHideTimer) clearTimeout(ackHideTimer);
+  ackHideTimer = setTimeout(() => els.ack.classList.remove('show'), ms);
+}
+function handleAck(msg) {
+  if (msg.stage === 'received')         flash(`✓ received ${(msg.bytes/1024/1024).toFixed(1)} MB`);
+  else if (msg.stage === 'pipeline_started') flash(`▶ analyzing — going live…`, 3500);
+  else if (msg.stage === 'error')       flash(`✗ ${msg.reason || 'error'}`, 3500);
+}
+
+// ── Camera + recording ─────────────────────────────────────────────────
+let cameraStream = null;
+let videoRecorder = null;
+let videoChunks = [];
+let videoStartedAt = 0;
+let timerHandle = null;
+const TIMER_MAX_S = 30;  // sanity stop after 30s
+
+async function ensureCamera() {
+  if (cameraStream) return cameraStream;
+  cameraStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' },  // rear camera for product shots
+             width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: true,
+  });
+  els.preview.srcObject = cameraStream;
+  els.placeholder.style.display = 'none';
+  return cameraStream;
+}
+
+function pickVideoMime() {
+  // iOS Safari: video/mp4 with H.264. Android/Chrome: video/webm with VP8/VP9.
+  // Browser picks first supported; backend extension follows.
+  const candidates = [
+    'video/mp4;codecs=avc1,mp4a',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  for (const m of candidates) if (MediaRecorder.isTypeSupported(m)) return m;
+  return '';  // browser picks default
+}
+
+function startTimer() {
+  videoStartedAt = Date.now();
+  els.timer.classList.add('on');
+  timerHandle = setInterval(() => {
+    const s = Math.floor((Date.now() - videoStartedAt) / 1000);
+    els.timerTxt.textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    if (s >= TIMER_MAX_S) stopRecording();  // safety cutoff
+  }, 250);
+}
+function stopTimer() {
+  clearInterval(timerHandle);
+  timerHandle = null;
+  els.timer.classList.remove('on');
+}
+
+async function startRecording() {
+  try {
+    await ensureCamera();
+  } catch (e) {
+    flash(`camera denied: ${e.message || e.name}`, 3500);
+    return;
+  }
+  const mime = pickVideoMime();
+  videoChunks = [];
+  videoRecorder = new MediaRecorder(cameraStream, mime ? { mimeType: mime } : undefined);
+  videoRecorder.ondataavailable = (e) => { if (e.data.size > 0) videoChunks.push(e.data); };
+  videoRecorder.onstop = onVideoStopped;
+  videoRecorder.start(250);  // 250ms chunks
+  els.btnRecord.classList.add('recording');
+  els.recLabel.textContent = 'Stop';
+  startTimer();
+}
+
+function stopRecording() {
+  if (!videoRecorder || videoRecorder.state === 'inactive') return;
+  videoRecorder.stop();
+  els.btnRecord.classList.remove('recording');
+  els.recLabel.textContent = 'Record';
+  stopTimer();
+}
+
+async function onVideoStopped() {
+  if (!videoChunks.length) return;
+  const mime = videoRecorder.mimeType || 'video/mp4';
+  const ext = mime.includes('webm') ? 'webm' : 'mp4';
+  const blob = new Blob(videoChunks, { type: mime });
+  videoChunks = [];
+
+  flash(`uploading ${(blob.size/1024/1024).toFixed(1)} MB…`, 4000);
+
+  // Convert blob → base64 for the WS contract. For very large files this
+  // can be slow on a phone CPU; FileReader.readAsDataURL is async + chunked
+  // internally so it doesn't block the UI thread.
+  const b64 = await blobToBase64(blob);
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: 'sell_video',
+      video_b64: b64,
+      filename: `phone_${Date.now()}.${ext}`,
+      mime,
+      voice_text: 'sell this',
+    }));
+  } else {
+    flash('not connected — try again', 3500);
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      // strip "data:<mime>;base64," prefix
+      const s = r.result;
+      const i = s.indexOf(',');
+      resolve(i >= 0 ? s.slice(i + 1) : s);
+    };
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+els.btnRecord.addEventListener('click', () => {
+  if (videoRecorder && videoRecorder.state === 'recording') stopRecording();
+  else startRecording();
+});
+
+// ── Push-to-talk audio → /api/voice_comment ─────────────────────────────
+let micStream = null;
+let audioRecorder = null;
+let audioChunks = [];
+
+async function ensureMic() {
+  if (micStream) return micStream;
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1, sampleRate: 16000,
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+    },
+  });
+  return micStream;
+}
+
+function pickAudioMime() {
+  // /api/voice_comment hands the bytes to whisper-base via librosa, which
+  // takes whatever ffmpeg can decode — webm/opus, mp4/aac, wav all fine.
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/wav'];
+  for (const m of candidates) if (MediaRecorder.isTypeSupported(m)) return m;
+  return '';
+}
+
+async function startTalking(e) {
+  e.preventDefault();
+  try { await ensureMic(); }
+  catch (err) { flash(`mic denied: ${err.message || err.name}`, 3500); return; }
+  const mime = pickAudioMime();
+  audioChunks = [];
+  audioRecorder = new MediaRecorder(micStream, mime ? { mimeType: mime } : undefined);
+  audioRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+  audioRecorder.onstop = onAudioStopped;
+  audioRecorder.start();
+  els.btnTalk.classList.add('holding');
+}
+
+function stopTalking(e) {
+  if (e) e.preventDefault();
+  if (!audioRecorder || audioRecorder.state === 'inactive') return;
+  audioRecorder.stop();
+  els.btnTalk.classList.remove('holding');
+}
+
+async function onAudioStopped() {
+  if (!audioChunks.length) return;
+  const mime = audioRecorder.mimeType || 'audio/webm';
+  const ext = mime.includes('mp4') ? 'm4a' : (mime.includes('wav') ? 'wav' : 'webm');
+  const blob = new Blob(audioChunks, { type: mime });
+  audioChunks = [];
+
+  flash('transcribing…', 1800);
+  const fd = new FormData();
+  fd.append('audio', blob, `mic_${Date.now()}.${ext}`);
+  try {
+    const r = await fetch('/api/voice_comment', { method: 'POST', body: fd });
+    if (!r.ok) { flash(`✗ ${r.status}`, 3000); return; }
+    const j = await r.json();
+    const txt = j.transcript?.text || j.dispatch || '';
+    flash(txt ? `“${txt}”` : '✓ sent', 3000);
+  } catch (err) {
+    flash(`✗ ${err.message || 'send failed'}`, 3000);
+  }
+}
+
+// Both pointer (covers mouse + most touch) and touch fallbacks for
+// older iOS where pointer events on buttons can mis-fire.
+els.btnTalk.addEventListener('pointerdown', startTalking);
+els.btnTalk.addEventListener('pointerup',   stopTalking);
+els.btnTalk.addEventListener('pointerleave', stopTalking);
+els.btnTalk.addEventListener('pointercancel', stopTalking);
+els.btnTalk.addEventListener('touchstart', startTalking, { passive: false });
+els.btnTalk.addEventListener('touchend',   stopTalking,  { passive: false });
+
+// Prevent the page from scrolling when the user holds a button.
+document.addEventListener('touchmove', (e) => {
+  if (e.target.closest('.btn')) e.preventDefault();
+}, { passive: false });
+</script>
+</body>
+</html>

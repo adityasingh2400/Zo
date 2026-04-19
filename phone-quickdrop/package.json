@@ -1,0 +1,22 @@
+{
+  "name": "phone-quickdrop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phone records video, lands on laptop instantly via WebSocket. Faster than AirDrop.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}

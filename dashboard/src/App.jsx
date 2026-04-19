@@ -64,7 +64,11 @@ export default function App() {
 
   return (
     <div
-      style={{ ...styles.app, ...(dragging ? styles.appDragging : {}) }}
+      style={{
+        ...styles.app,
+        ...(controlRoomMode ? styles.appControlRoom : {}),
+        ...(dragging ? styles.appDragging : {}),
+      }}
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
       onDrop={handleDrop}
@@ -119,31 +123,35 @@ export default function App() {
         </div>
       </div>
 
-      {/* Demo Controls */}
-      <div style={styles.controls}>
-        <ProductSelector />
-        <input
-          value={sellInput}
-          onChange={e => setSellInput(e.target.value)}
-          style={styles.sellInput}
-          placeholder='e.g. "sell this for $49 targeting young professionals"'
-        />
-        <VoiceMic voiceTranscript={voiceTranscript} />
-        <label style={styles.uploadLabel}>
-          🎬 Upload Video
+      {/* Demo Controls — hidden in Control Room mode (it has its own nav +
+           the mockup doesn't include this kind of demo-ops row). Flip back
+           to Legacy to regain the controls. */}
+      {!controlRoomMode && (
+        <div style={styles.controls}>
+          <ProductSelector />
           <input
-            type="file" accept="video/*" style={{ display: 'none' }}
-            onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            value={sellInput}
+            onChange={e => setSellInput(e.target.value)}
+            style={styles.sellInput}
+            placeholder='e.g. "sell this for $49 targeting young professionals"'
           />
-        </label>
-        <label style={styles.uploadLabel}>
-          📷 Photo
-          <input
-            type="file" accept="image/*" style={{ display: 'none' }}
-            onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
-          />
-        </label>
-      </div>
+          <VoiceMic voiceTranscript={voiceTranscript} />
+          <label style={styles.uploadLabel}>
+            🎬 Upload Video
+            <input
+              type="file" accept="video/*" style={{ display: 'none' }}
+              onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            />
+          </label>
+          <label style={styles.uploadLabel}>
+            📷 Photo
+            <input
+              type="file" accept="image/*" style={{ display: 'none' }}
+              onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            />
+          </label>
+        </div>
+      )}
 
       {controlRoomMode ? (
         // ── Control Room layout (Item 2, mockup-driven) ─────────────────
@@ -261,6 +269,11 @@ const styles = {
   app: {
     minHeight: '100vh', display: 'flex', flexDirection: 'column',
     padding: 16, gap: 12, maxWidth: 1600, margin: '0 auto',
+  },
+  // Viewport-bounded variant — applied when Control Room is on, so the
+  // sidebar-driven layout fits without scrolling the outer page.
+  appControlRoom: {
+    height: '100vh', overflow: 'hidden',
   },
   header: {
     display: 'flex', alignItems: 'center', padding: '8px 0',

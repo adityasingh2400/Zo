@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 
 /**
  * AvatarRail — vertical rail of avatar cards matching the empire-mac.jsx
@@ -24,6 +24,16 @@ export function AvatarRail() {
   const [activeId, setActiveId] = useState('maya');
   const [busy, setBusy] = useState(false);
   const [hasBackend, setHasBackend] = useState(false);
+  const activeCardRef = useRef(null);
+
+  // Keep the active avatar in view whenever selection changes. Without this
+  // the rail defaults to scrollTop=0 and the active can fall off the bottom
+  // (4 avatars × ~90px each ≈ 360px; the rail is ~280px tall in the grid).
+  useEffect(() => {
+    activeCardRef.current?.scrollIntoView({
+      behavior: 'smooth', block: 'nearest',
+    });
+  }, [activeId]);
 
   const refetch = useCallback(async () => {
     try {
@@ -70,6 +80,7 @@ export function AvatarRail() {
           return (
             <button
               key={a.id}
+              ref={sel ? activeCardRef : null}
               type="button"
               onClick={() => selectAvatar(a.id)}
               style={{

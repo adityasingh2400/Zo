@@ -10,7 +10,7 @@ start: stop
 	@echo "================================="
 	@echo "  EMPIRE — Starting services"
 	@echo "================================="
-	@cd backend && source venv/bin/activate && python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+	@cd backend && source venv/bin/activate && python -m uvicorn main:app --host 0.0.0.0 --port 8000 --ws-max-size 67108864 --reload &
 	@cd dashboard && npm run dev &
 	@sleep 2
 	@echo ""

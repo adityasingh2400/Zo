@@ -34,6 +34,10 @@ COST_PER_CLOUD_COMMENT_USD = 0.00035
 COST_SAVED_USD_PER_TOOL = {
     "respond_locally":  COST_PER_CLOUD_COMMENT_USD,
     "play_canned_clip": COST_PER_CLOUD_COMMENT_USD,
+    # block_comment earns the full saving because the naive path (no router)
+    # would have entered the Claude drafting pipeline before anyone noticed
+    # the comment was spam — we'd pay for the draft even if we never rendered
+    # an avatar response. Blocking pre-draft is a real avoided cost.
     "block_comment":    COST_PER_CLOUD_COMMENT_USD,
     "escalate_to_cloud": 0.0,
 }

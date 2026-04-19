@@ -1304,48 +1304,53 @@ def _dlog_fmt(v):
     return f'"{s}"' if isinstance(v, str) else s
 
 
+_WELCOME_CLIP_PATH = Path(__file__).parent.parent / "phase0" / "assets" / "bridges" / "welcome" / "welcome.mp4"
+_WELCOME_CLIP_URL = "/bridges/welcome/welcome.mp4"
+_WELCOME_CLIP_MS = 2200  # video 2.21s; audio fades by 2.1s, then 100ms silent tail
+
+
 @app.post("/api/go_live")
 async def api_go_live():
-    """Stage-view G-hotkey target. Plays a generic intro clip ("hey
-    everyone, welcome back to the stream") via the Director so the
-    avatar starts speaking instantly when the operator triggers Go Live.
+    """Stage-view G-hotkey target. Plays the canonical welcome clip
+    (Veo-native render of "Welcome to the stream, guys!" with a
+    two-handed wave + idle-pose closing frame, audio cut at ~2.1s,
+    video ends at 2.2s). The Director then crossfades back to Tier 0
+    idle so the next state takes over cleanly.
 
-    Falls back through the bridge_clips manifest chain:
-      1. intro_arbitrary label (added in BRIDGE_SCRIPTS, populated by
-         scripts/render_generic_clips.py)
-      2. neutral fallback pool
-      3. phase0 LatentSync library
-      4. None — returns 503 so the operator knows nothing rendered
+    Falls back to the legacy bridge-clip pick chain only if the canonical
+    welcome MP4 is missing on disk — useful in local dev where someone
+    hasn't pulled the asset yet.
 
-    Idempotent: spamming G plays back-to-back intros, which the Director's
-    crossfade machinery handles cleanly. Useful for nervous demo restarts.
+    Idempotent: spamming G plays back-to-back welcomes, which the
+    Director's crossfade machinery handles cleanly.
     """
-    clip = pick_bridge_clip("intro_arbitrary")
-    if not clip:
-        # No intros rendered yet — fall through to a neutral acknowledgment
-        # so the avatar at least says SOMETHING when the operator presses G.
-        clip = pick_bridge_clip("neutral")
-    if not clip:
-        log_event("DIRECTOR", "go_live: no clips available — render bridges first")
-        raise HTTPException(
-            status_code=503,
-            detail=("No intro/neutral clips on disk. Run "
-                    "`python scripts/render_generic_clips.py` first."),
-        )
-    url = clip.get("url")
-    script = clip.get("script", "")
-    log_event("DIRECTOR", f"go_live: playing intro — {script[:60]}", {"url": url})
+    if _WELCOME_CLIP_PATH.exists():
+        url = _WELCOME_CLIP_URL
+        script = "Welcome to the stream, guys!"
+        play_ms = _WELCOME_CLIP_MS
+        log_event("DIRECTOR", "go_live: playing canonical welcome clip", {"url": url})
+    else:
+        # Legacy fallback so dev environments without the rendered asset
+        # still produce SOME opener. Render path: phase0/scripts/render_*.
+        clip = pick_bridge_clip("intro_arbitrary") or pick_bridge_clip("neutral")
+        if not clip:
+            log_event("DIRECTOR", "go_live: no welcome / intro clips on disk")
+            raise HTTPException(
+                status_code=503,
+                detail=("No welcome.mp4 or fallback intro clips on disk. "
+                        "Render `phase0/assets/bridges/welcome/welcome.mp4`."),
+            )
+        url = clip.get("url")
+        script = clip.get("script", "")
+        play_ms = clip.get("ms") or int(max(4, len(script.split())) * 350)
+        log_event("DIRECTOR", f"go_live: fallback intro — {script[:60]}", {"url": url})
 
     if director:
         await director.play_response(url)
-        # Probe the actual file duration when it's a renders/ MP4 so the
-        # idle release fires when the avatar finishes. Bridge clips are
-        # short (~2s) so a word-count fallback is tight enough.
-        play_ms = (clip.get("ms") or 0)
-        if not play_ms:
-            words = max(4, len(script.split()))
-            play_ms = int(words * 350)
-        play_ms_with_tail = play_ms + 400
+        # Tail buffer so the idle layer takes over only after the video
+        # has fully ended — avoids a hard cut while the wave is still
+        # settling.
+        play_ms_with_tail = play_ms + 200
 
         async def _release_after(delay_ms: int):
             await asyncio.sleep(delay_ms / 1000)
@@ -1393,12 +1398,20 @@ async def dev_transitions() -> HTMLResponse:
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
                  "Segoe UI", Roboto, Inter, Arial, sans-serif; }
   body { display: grid; grid-template-columns: 1fr 360px;
-         gap: 18px; padding: 18px; min-height: 100vh; }
-  .stage-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+         gap: 18px; padding: 18px; min-height: 100vh;
+         /* Make sizes available to children's calc() — see .stage-wrap */
+         --stage-h: calc(100vh - 36px);
+         --stage-w: calc((100vh - 36px) * 9 / 16); }
+  .stage-col { display: flex; flex-direction: column; align-items: center;
+               gap: 12px; min-width: 0; }
+  /* Explicit width + height keeps the 9:16 frame intact across browsers
+     that flake on `aspect-ratio` + `max-height` inside a flex column
+     (which collapses to 0×0 in Safari and some Chromium versions, leaving
+     the video AND the in-stage badges invisible — that was the bug). */
   .stage-wrap { background: #000; border-radius: 14px; overflow: hidden;
-                position: relative; aspect-ratio: 9/16;
-                max-height: calc(100vh - 36px);
-                margin: 0 auto; }
+                position: relative;
+                width: var(--stage-w); height: var(--stage-h);
+                max-width: 100%; }
   .stage-wrap video { position: absolute; inset: 0;
                        width: 100%; height: 100%; object-fit: contain;
                        background: #000; display: block;
@@ -1563,7 +1576,7 @@ const T1 = [
   { intent: 'misc_sip_drink',       url: '/states/idle/misc_sip_drink.mp4',            weight: 0.40 },
   { intent: 'misc_walk_off_return', url: '/states/idle/misc_walk_off_return.mp4',      weight: 0.20 },
   { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_speaking.mp4',weight: 0.25 },
-  { intent: 'welcome',              url: '/bridges/welcome/welcome_B.mp4',             weight: 0.15 },
+  { intent: 'welcome',              url: '/bridges/welcome/welcome.mp4',               weight: 0.15 },
 ];
 
 let interjectionProbability = 0.35;
@@ -1759,6 +1772,9 @@ function scheduleNext() {
 }
 
 setInterval(() => {
+  // While paused, freeze the displayed elapsed at pausedAt (not Date.now())
+  // so the badges stop ticking when the videos are stopped.
+  const now = paused ? pausedAt : Date.now();
   if (!paused) {
     const remain = Math.max(0, nextRotationAt - Date.now());
     els.nextRot.textContent = `${(remain / 1000).toFixed(1)}s`;
@@ -1766,12 +1782,10 @@ setInterval(() => {
     els.nextRot.textContent = '(paused)';
   }
   if (currentT0) {
-    els.badgeT0Elapsed.textContent =
-      `${((Date.now() - t0StartedAt) / 1000).toFixed(1)}s`;
+    els.badgeT0Elapsed.textContent = `${((now - t0StartedAt) / 1000).toFixed(1)}s`;
   }
   if (currentT1) {
-    els.badgeT1Elapsed.textContent =
-      `${((Date.now() - t1StartedAt) / 1000).toFixed(1)}s`;
+    els.badgeT1Elapsed.textContent = `${((now - t1StartedAt) / 1000).toFixed(1)}s`;
   }
 }, 100);
 
@@ -1784,11 +1798,38 @@ document.querySelectorAll('button.speed').forEach(b => {
     logEvt('skip', `speed → ${speed}×`);
   });
 });
+// Pause does THREE things: stop the rotation scheduler, pause whichever
+// video elements are currently playing, and freeze the elapsed counters.
+// Resume reverses all three. Without the video.pause() the playback kept
+// going while the state machine was idle — confusing because "paused" only
+// stopped FUTURE transitions, not the current one.
+let pausedAt = 0;
+function pausedVideos() {
+  const out = [];
+  if (currentT0) out.push(t0ActiveIsA ? els.t0a : els.t0b);
+  if (currentT1) out.push(t1ActiveIsA ? els.t1a : els.t1b);
+  return out;
+}
 document.getElementById('btn-pause').addEventListener('click', (e) => {
   paused = !paused;
   e.target.textContent = paused ? 'resume' : 'pause';
   e.target.classList.toggle('on', paused);
-  logEvt('skip', paused ? 'paused' : 'resumed');
+  if (paused) {
+    pausedAt = Date.now();
+    if (rotationTimer) { clearTimeout(rotationTimer); rotationTimer = null; }
+    pausedVideos().forEach(v => { try { v.pause(); } catch {} });
+    logEvt('skip', 'paused (videos + rotation frozen)');
+  } else {
+    // Shift the startedAt timestamps forward by the pause duration so
+    // the elapsed counters resume from where they were, not from zero.
+    const dt = Date.now() - pausedAt;
+    if (currentT0) t0StartedAt += dt;
+    if (currentT1) t1StartedAt += dt;
+    pausedAt = 0;
+    pausedVideos().forEach(v => { v.play().catch(() => {}); });
+    scheduleNext();
+    logEvt('skip', `resumed (after ${(dt / 1000).toFixed(1)}s pause)`);
+  }
 });
 document.getElementById('btn-skip').addEventListener('click', () => {
   if (rotationTimer) clearTimeout(rotationTimer);

@@ -12,12 +12,59 @@ The shortlist + the full architecture this enables. Updated 2026-04-19.
 | `objection` | **E** | Wav2Lip substrate when classifier returns `type: objection` |
 | `compliment` | **B** (default), **E** (special) | Wav2Lip substrate when classifier returns `type: compliment`. See routing note below for E. |
 | `intro` | **C** | `/api/go_live` (G hotkey on /stage) — demo opener |
-| `pitch` | TBD (rendering 2 variants) | Wav2Lip substrate looped under the post-video-upload pitch audio |
-| `welcome` | TBD (rendering 2 variants) | Tier 1 ambient interjection — re-greet new viewers occasionally during idle |
+| `pitch` | **`pitch_chained.mp4`** (3-segment Veo chain, 20.6s, neutral-frame stitched at 6.2s + 12.4s) | Wav2Lip substrate looped under the post-video-upload pitch audio. Replaces `state_pitching_pose_speaking_1080p.mp4` in `_DEFAULT_PITCH_VIDEO_URL`. |
+| `welcome` | **`welcome.mp4`** (Veo-native render with baked audio — see below) | Tier 1 ambient + `/api/go_live` (G hotkey on /stage) — demo opener |
+
+## Welcome architecture — Veo-native render, no Wav2Lip needed
+
+**Decision (2026-04-19):** Skip the Wav2Lip composite entirely. Veo 3.1
+generates the video AND the spoken audio in a single diffusion pass,
+which means the lip-sync is INHERENT to the rendering — no mouth-region
+inpainting, no edge-frame artifacts, no runtime pod inference cost.
+
+Rendered file: `phase0/assets/bridges/welcome/welcome.mp4`
+- **Video:** 2.21s, 1080×1920, h264, locked-off 9:16 medium shot
+- **Audio:** 2.20s, AAC 192k, single line: *"Welcome to the stream, guys!"*
+- **Audio profile:**
+  - 0.0s – 1.5s: clean speech with two-handed wave gesture
+  - 1.5s – 2.0s: natural acoustic decay tail (full final word lands)
+  - 2.0s – 2.1s: 100ms fade-out window (kills any click)
+  - 2.1s – 2.2s: pure silence (-inf dB) — body language settles into closing pose
+- **Visual end frame:** hands at waist, soft smile, eye contact (matches Tier 0
+  idle anchor pose so the crossfade-to-idle on completion is invisible)
+
+Render pipeline + post-process recipe:
+```
+1. Veo 3.1 native render (Vertex AI, 6s @ 1080p 9:16, generate_audio=True)
+   prompt = explicit two-phase structure (PHASE 1 speak + wave 0-2.5s,
+            PHASE 2 silence + closed-mouth + return-to-pose 2.5s-6s).
+   Veo produces native lip-synced audio in Phase 1 + ~silent Phase 2,
+   though often with residual breath/babble at -36 dB or extra
+   vocalizations beyond the spoken line.
+2. ffmpeg -t 2.4 + afade=out:st=2.0:d=0.1 trims the tail and replaces
+   any post-speech Veo babble with deterministic pure silence.
+3. Final trim to 2.2s so audio and video end essentially together,
+   leaving 100ms of silent body language for the idle crossfade.
+4. We tried ElevenLabs voice-changer (speech-to-speech) on top of the
+   Veo audio to align the timbre with our canonical bridge voice
+   (yj30vwTGJxSHezdAGsv9). Rejected — added artifacts that the Veo
+   native voice did not have. Veo's voice was already close enough.
+```
+
+Director wiring:
+- `/api/go_live` plays `welcome.mp4` directly (no `pick_bridge_clip`
+  fallback needed — the asset is canonical and always on disk in
+  shipped builds). 200ms tail buffer on `_release_after()` lets the
+  video fully end before the idle crossfade kicks in.
+- Tier 1 ambient pool also includes `welcome.mp4` (15% weight) so it
+  re-fires occasionally during idle to re-greet new viewers, but the
+  G hotkey is the primary entry point.
 
 **Total in shipping library: 6 picked clips** (after pitch + welcome reviewed).
 Everything else stays on disk under `phase0/assets/bridges/<intent>/` as
-backup variants we can swap to without re-rendering.
+backup variants we can swap to without re-rendering. The original silent
+`welcome_A.mp4` and `welcome_B.mp4` substrates are kept as backup in
+case we ever want to revert to the Wav2Lip composite path.
 
 ---
 

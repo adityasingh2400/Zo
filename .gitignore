@@ -13,6 +13,11 @@ build/
 # Local lipsync benchmark renders / scratch outputs (large mp4s, not source-of-truth)
 phase0/bench/videos/
 phase0/renders_e2e/
+# Dev test outputs (welcome trim experiments, voice-changer A/B, scratch mp4s)
+# kept local for iteration but never shipped.
+phase0/assets/bridges/_test/
+# Veo pitch chain intermediate segments (only the stitched final mp4 is shipped)
+phase0/assets/bridges/pitch/_chain/
 
 # Generated media (carousel spins, pitch renders, comment renders, voice answers)
 # Cody's local_answers regenerate via scripts/render_local_answers.py.

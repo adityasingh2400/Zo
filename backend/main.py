@@ -118,6 +118,16 @@ def _load_active_product() -> None:
     respond_locally path can match against its qa_index immediately —
     no prior /api/sell upload required for the demo.
 
+    INTENTIONALLY EMPTY (`{}`) for the judge-item demo. The judge hands
+    over an arbitrary item live → /api/sell or /api/sell-video →
+    run_sell_pipeline → product_data populates dynamically from Gemma 4
+    vision + Claude. Pre-loading a product here would (a) show the wrong
+    item name in the BUY card before the judge's item analysis lands and
+    (b) cause respond_locally to fire wrong pre-rendered answers for any
+    audience question whose keywords accidentally match the pre-loaded
+    product's qa_index. Add products back here ONLY for non-judge-item
+    rehearsal demos.
+
     Selection order:
       1. ACTIVE_PRODUCT_ID env var if set and present in the file
       2. First key in the JSON (dicts preserve insertion order)

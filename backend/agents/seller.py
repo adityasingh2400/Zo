@@ -1,23 +1,29 @@
-import json
-import base64
 import asyncio
+import json
 import logging
 import re
 import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
+
 import boto3
 import httpx
 from elevenlabs import ElevenLabs
-from pathlib import Path
-from config import (
-    AWS_REGION, BEDROCK_MODEL_ID,
-    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
-    RUNPOD_POD_IP, RUNPOD_LIVETALKING_PORT,
-    WAV2LIP_URL, LATENTSYNC_URL, POD_SPEAKING_1080P,
-)
+
 from agents import _spend
+from config import (
+    AWS_REGION,
+    BEDROCK_MODEL_ID,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
+    LATENTSYNC_URL,
+    POD_SPEAKING_1080P,
+    RUNPOD_LIVETALKING_PORT,
+    RUNPOD_POD_IP,
+    WAV2LIP_URL,
+)
 
 logger = logging.getLogger("empire.seller")
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)

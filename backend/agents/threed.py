@@ -395,12 +395,12 @@ async def carousel_from_video(
     session = None
     if clean_bg:
         try:
-            from rembg import new_session, remove
+            from rembg import new_session
             session = new_session(rembg_model)
         except Exception as e:
             logger.warning("rembg %s unavailable, trying u2netp: %s", rembg_model, e)
             try:
-                from rembg import new_session, remove
+                from rembg import new_session
                 session = new_session("u2netp")
             except Exception as e2:
                 logger.warning("rembg unavailable entirely: %s", e2)
@@ -641,6 +641,7 @@ async def glb_from_image(image_b64: str) -> dict[str, Any]:
     """Send single product image to remote 3D server (TripoSR / Hunyuan3D),
     get back GLB. Cached by image hash."""
     import base64
+
     import httpx
 
     from config import RUNPOD_POD_IP, RUNPOD_TRIPOSR_PORT

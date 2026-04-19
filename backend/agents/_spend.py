@@ -23,13 +23,12 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Deque
 
 logger = logging.getLogger("empire.spend")
 
 # (timestamp, usd_estimate) tuples. Trimmed to the last 60s on every check.
 _LOG_LOCK = threading.Lock()
-_LOG: dict[str, Deque[tuple[float, float]]] = {}
+_LOG: dict[str, deque[tuple[float, float]]] = {}
 
 
 def _cap_for(provider: str) -> float:
@@ -45,7 +44,7 @@ def _cap_for(provider: str) -> float:
         return 0.0
 
 
-def _trim(provider: str, now: float) -> Deque[tuple[float, float]]:
+def _trim(provider: str, now: float) -> deque[tuple[float, float]]:
     """Return the deque for `provider`, dropping entries older than 60s."""
     dq = _LOG.setdefault(provider, deque())
     cutoff = now - 60.0

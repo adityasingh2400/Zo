@@ -1,15 +1,24 @@
 import asyncio
+import base64
 import json
+import logging
 import os
 import time
-import base64
-import logging
 import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
@@ -20,29 +29,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("empire")
 
-from config import (
-    BACKEND_HOST, BACKEND_PORT,
-    USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO, USE_BACKCHANNEL,
-    USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
+from agents import brain
+from agents import router as comment_router
+from agents.avatar_director import Director
+from agents.bridge_clips import all_bridges, pick_bridge_clip
+from agents.creator import build_all as creator_build_all
+from agents.creator import generate_3d_model, remove_background
+from agents.eyes import (
+    analyze_and_script_claude,
+    analyze_with_claude,
+    classify_comment_gemma,
+    transcribe_voice,
 )
-from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
-from agents.creator import remove_background, generate_3d_model, build_all as creator_build_all
+from agents.intake import process_video
+from agents.router import _match_product_field  # used by speculative bridge
 from agents.seller import (
     generate_comment_response,
     make_avatar_speak,
-    text_to_speech,
-    synthesize_word_timings,
-    set_livetalking_session,
     render_comment_response_wav2lip,
     render_pitch_latentsync,
+    set_livetalking_session,
+    text_to_speech,
 )
-from agents.intake import process_video
-from agents.threed import carousel_from_video, glb_from_image
-from agents.bridge_clips import pick_bridge_clip, all_bridges
-from agents.avatar_director import Director
-from agents import router as comment_router
-from agents.router import _match_product_field  # used by speculative bridge
-from agents import brain
+from agents.threed import carousel_from_video
+from config import (
+    BACKEND_HOST,
+    BACKEND_PORT,
+    LIPSYNC_PROVIDER,
+    USE_AUDIO_FIRST,
+    USE_BACKCHANNEL,
+    USE_KARAOKE,
+    USE_PITCH_VEO,
+    USE_SPECULATIVE_BRIDGE,
+)
 
 logger.info(
     "[flags] USE_AUDIO_FIRST=%s USE_KARAOKE=%s USE_PITCH_VEO=%s "
@@ -209,7 +228,7 @@ async def lifespan(app: FastAPI):
     # slow. Gemma 4 (vision + classify + script) and whisper-base (voice
     # transcription) live on separate Cactus handles; we load them
     # sequentially to avoid any re-entrant SDK init on startup.
-    from agents.eyes import _get_cactus_model, _get_cactus_whisper_model, CACTUS_AVAILABLE
+    from agents.eyes import CACTUS_AVAILABLE, _get_cactus_model, _get_cactus_whisper_model
     if CACTUS_AVAILABLE:
         logger.info("Pre-loading Cactus Gemma 4 model (background thread)...")
         await asyncio.to_thread(_get_cactus_model)
@@ -223,8 +242,9 @@ async def lifespan(app: FastAPI):
     # doesn't eat 30+ extra seconds. Fire and forget; if it fails the live
     # path still works (just pays the compile cost on first real call).
     try:
-        from agents.threed import prewarm_rembg
         import asyncio as _aio
+
+        from agents.threed import prewarm_rembg
         _aio.create_task(prewarm_rembg("u2net"))
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
@@ -740,7 +760,8 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         # waiting and let extract land on the dashboard separately.
         try:
             from agents.transcript_extract import (
-                extract_transcript_signals, hint_block_for_claude,
+                extract_transcript_signals,
+                hint_block_for_claude,
             )
             extract_task = asyncio.create_task(
                 extract_transcript_signals(transcript)
@@ -753,7 +774,7 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
                 log_event("EYES",
                           f"Transcript extract ready in time ({extract.get('latency_ms', 0)}ms)",
                           {"source": extract.get("source")})
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Extract is slow — let Claude run unblocked. The pending
                 # task keeps running and reports when it lands.
                 log_event("EYES", "Transcript extract slow (>1.5s), running unblocked")
@@ -886,7 +907,7 @@ async def api_creator_build(
         result = await creator_build_all(photo_b64, product, include_3d=include_3d)
     except Exception as e:
         logger.exception("[creator] build_all failed")
-        raise HTTPException(status_code=500, detail=f"creator failed: {e}")
+        raise HTTPException(status_code=500, detail=f"creator failed: {e}") from e
     log_event("CREATOR", f"built {len(result['photos'])} photos + promo "
               f"({result['timing_ms']['total']}ms)",
               {"request_id": result["request_id"]})
@@ -1186,6 +1207,7 @@ async def api_go_live():
 # ── Lip-sync endpoints (Phase 1 pipeline) ──────────────
 
 from fastapi.staticfiles import StaticFiles
+
 app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
 
 # Static mount for the pre-rendered avatar clip library:

@@ -225,7 +225,7 @@ async def render_all(
     """Generate TTS for each script, send through LatentSync, save to disk,
     write/update manifest. Idempotent — skips already-rendered clips by
     matching the (script, sha256) slug."""
-    from agents.seller import text_to_speech, render_pitch_latentsync
+    from agents.seller import render_pitch_latentsync, text_to_speech
 
     manifest = load_manifest()
     rendered = 0

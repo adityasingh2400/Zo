@@ -92,12 +92,12 @@ def _load_font(size: int):
     ):
         try:
             return ImageFont.truetype(path, size=size)
-        except (OSError, IOError):
+        except OSError:
             continue
     return ImageFont.load_default()
 
 
-def _measure_text(draw: "ImageDraw.ImageDraw", text: str, font) -> int:
+def _measure_text(draw: ImageDraw.ImageDraw, text: str, font) -> int:
     """Width of `text` in pixels under `font`. Uses textbbox on modern Pillow,
     falls back to textsize on legacy."""
     try:

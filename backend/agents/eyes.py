@@ -1,15 +1,17 @@
-import json
 import asyncio
 import base64
+import json
+import logging
 import os
-import sys
 import subprocess
+import sys
 import tempfile
 import threading
 import time
-import logging
-import httpx
+
 import boto3
+import httpx
+
 from config import AWS_REGION, BEDROCK_MODEL_ID
 
 logger = logging.getLogger("empire.eyes")
@@ -38,7 +40,7 @@ _cactus_model_lock = threading.Lock()
 if CACTUS_PYTHON_PATH and os.path.exists(CACTUS_PYTHON_PATH):
     sys.path.insert(0, CACTUS_PYTHON_PATH)
     try:
-        from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_transcribe
+        from cactus import cactus_complete, cactus_destroy, cactus_init, cactus_transcribe
         CACTUS_AVAILABLE = True
         logger.info("Cactus SDK loaded from %s", CACTUS_PYTHON_PATH)
     except ImportError as e:
@@ -552,7 +554,7 @@ async def transcribe_voice(audio_bytes: bytes) -> dict:
                     "latency_ms": result.get("latency_ms", 0),
                     "reason": f"heard silence/filler (cactus: {text!r})"}
         return result
-    except AudioDecodeError as e:
+    except AudioDecodeError:
         return {"text": "", "source": "transcription_failed",
                 "latency_ms": 0, "error": "bad_audio"}
     except Exception as e:
@@ -570,7 +572,7 @@ async def transcribe_voice(audio_bytes: bytes) -> dict:
     except AudioDecodeError:
         return {"text": "", "source": "transcription_failed",
                 "latency_ms": 0, "error": "bad_audio"}
-    except Exception as e:
+    except Exception:
         logger.exception("Gemini transcription failed")
         return {
             "text": "",

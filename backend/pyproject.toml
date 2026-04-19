@@ -1,0 +1,47 @@
+# Backend dev tooling. Test deps live in requirements-dev.txt; this file is
+# just the ruff config (and a stub for pytest).
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "venv",
+    "renders",
+    "test_fixtures",
+    "data",
+]
+
+[tool.ruff.lint]
+# Conservative rule set — flag the common stuff (unused imports, undefined
+# names, mutable defaults) without picking style fights with the existing
+# 1700-LOC main.py. Tighten in a later sprint after a S2.1 main.py refactor.
+select = [
+    "E",    # pycodestyle errors (subset)
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear (common bugs)
+    "UP",   # pyupgrade (modern syntax)
+]
+ignore = [
+    "E501",  # line too long — many existing lines exceed 100 by design
+    "E402",  # module-level import not at top — Cactus sys.path tricks need it
+    "B008",  # function call in default arg — FastAPI Depends() pattern uses this
+    "UP007", # use X | Y over Optional[X] — fine but noisy migration; defer
+    "UP045", # same family
+    # Pre-S2.1 tech debt (addressed when main.py / threed.py get refactored).
+    # Keeping CI clean today without touching 1700 LOC of legacy code.
+    "E702",  # multi-stmt line (threed.py, a few spots in main.py)
+    "E741",  # ambiguous var name `l` (threed.py)
+    "B023",  # loop var binding in closures (main.py FastAPI handler pattern)
+    "B905",  # zip without strict= (threed.py)
+    "F841",  # unused local assignment (main.py)
+    "F401",  # unused import `cactus.cactus_destroy` in eyes.py (probe pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts are the point in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"

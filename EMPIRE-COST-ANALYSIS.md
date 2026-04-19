@@ -1,5 +1,35 @@
 # EMPIRE Cost Analysis: Two Routes
 
+> **Honest framing (added Sprint 1):** The numbers below are *modeled at the
+> assumed scale of 10 simultaneous streams × 50 products per seller*. As of
+> today's build, EMPIRE runs **single-tenant: one product, one stream, one
+> dashboard**. Multi-product is shipped (Sprint 1.3) but multi-stream
+> isolation is roadmap (Sprint 5+).
+>
+> Two known math errors in the original write-up below, kept inline for
+> transparency rather than silently fixed:
+>
+> 1. **RunPod cost.** The "~$50/mo for RunPod" figure assumed ~3 active
+>    hours/day. A 5090 spot at $0.40/hr × 24h × 30d = **$288/mo if the pod
+>    runs continuously.** For a 24/7 multilingual seller (the pitch's
+>    headline), the real number is ~$288, not $50.
+> 2. **Scale mismatch.** The cloud column models 10 streams × 50 products
+>    × 24/7. The on-device column models one laptop's electricity. Apples
+>    to oranges. To get a defensible number, both columns should be at the
+>    same scale and the on-device side should account for the fact that
+>    one laptop can't serve 10 simultaneous streams (CPU/mic/GPU bottleneck).
+>
+> Today's defensible single-stream number: **~$30 electricity + ~$60
+> ElevenLabs (Starter) + ~$25 Bedrock + ~$288 RunPod = ~$403/mo for a
+> 24/7 single-stream seller.** Still 12-30× cheaper than a human host
+> team ($5K-$12K/mo) but not the headline $144 figure.
+>
+> The 90%+ gross-margin claim and the local-first thesis hold up; the
+> specific dollars need a Sprint 2/3 rebuild against measured load.
+
+---
+
+
 ## Route 1: Human Live Sellers (What You're Replacing)
 
 ### What humans cost
@@ -202,7 +232,7 @@ MONTHLY COST AT SCALE (10 streams, 50 products, 24/7)
 
 If you try to replace them with cloud AI, you just trade the human cost for API bills — $9,600/month at scale.
 
-EMPIRE runs 24/7, in 140 languages, on 10 simultaneous streams, for $144/month. That's because Gemma 4 on-device handles 90-95% of the compute for free. The phone is the server. The model is the employee. The only cloud cost is the 5% of questions too complex for on-device.
+EMPIRE will run 24/7 in 140 languages on 10 simultaneous streams for $144/month — *at the modeled scale described in this doc*. **As of today's build, English-only, single-stream, and the realistic single-stream cost is ~$400/mo (see honest-framing note at the top).** The local-first thesis still wins: Gemma 4 + Cactus on-device handles 90-95% of comment compute for $0 marginal cost, and that's the load-bearing claim. The phone is the server. The model is the employee. The only cloud cost is the 5-10% of questions that escalate.
 
 On-device AI isn't a nice-to-have. It's the entire business model. Without it, the unit economics don't work."
 

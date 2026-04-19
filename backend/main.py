@@ -26,7 +26,7 @@ from config import (
     USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
 )
 from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
-from agents.creator import remove_background, generate_3d_model
+from agents.creator import remove_background, generate_3d_model, build_all as creator_build_all
 from agents.seller import (
     generate_comment_response,
     make_avatar_speak,
@@ -42,6 +42,7 @@ from agents.bridge_clips import pick_bridge_clip, all_bridges
 from agents.avatar_director import Director
 from agents import router as comment_router
 from agents.router import _match_product_field  # used by speculative bridge
+from agents import brain
 
 logger.info(
     "[flags] USE_AUDIO_FIRST=%s USE_KARAOKE=%s USE_PITCH_VEO=%s "
@@ -108,13 +109,14 @@ director: "Director | None" = None  # set in app startup, see below
 PRODUCTS_PATH = Path(__file__).resolve().parent / "data" / "products.json"
 
 
-def _load_active_product() -> None:
-    """Read backend/data/products.json and pick an active product. The active
-    product lives in pipeline_state["product_data"] so the router's
-    respond_locally path can match against its qa_index immediately —
-    no prior /api/sell upload required for the demo.
+def _load_products() -> None:
+    """Read backend/data/products.json into pipeline_state["products_catalog"]
+    (full dict) + set the initial active product. The active product lives in
+    pipeline_state["product_data"] (kept in sync with active_product_id) so
+    the router's respond_locally path can match against its qa_index without
+    requiring a /api/sell upload first.
 
-    Selection order:
+    Selection order for initial active:
       1. ACTIVE_PRODUCT_ID env var if set and present in the file
       2. First key in the JSON (dicts preserve insertion order)
     Missing file or unreadable JSON: log + skip (router falls back to cloud).
@@ -135,20 +137,31 @@ def _load_active_product() -> None:
                        "(got %s) — skipping", type(products).__name__)
         return
 
-    active_id = os.getenv("ACTIVE_PRODUCT_ID") or next(iter(products.keys()))
-    product = products.get(active_id)
-    if not isinstance(product, dict):
-        logger.warning("Product %r is not an object — skipping", active_id)
-        return
-    if not product:
-        logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json", active_id)
-        return
+    pipeline_state["products_catalog"] = products
+    initial = os.getenv("ACTIVE_PRODUCT_ID") or next(iter(products.keys()))
+    if initial not in products:
+        logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json — falling back", initial)
+        initial = next(iter(products.keys()))
+    _set_active_product(initial)
+    logger.info("[products] Loaded %d products: %s", len(products), list(products.keys()))
 
+
+def _set_active_product(product_id: str) -> dict | None:
+    """Switch the currently-active product. Updates active_product_id +
+    keeps the legacy product_data accessor in sync so existing routes
+    (router, /api/state, agents that read product_data) don't need to change.
+    Returns the product dict on success, None if product_id isn't loaded."""
+    catalog = pipeline_state.get("products_catalog") or {}
+    product = catalog.get(product_id)
+    if not isinstance(product, dict) or not product:
+        logger.warning("[products] _set_active_product: %r not in catalog", product_id)
+        return None
+    pipeline_state["active_product_id"] = product_id
     pipeline_state["product_data"] = product
-    pipeline_state["active_product_id"] = active_id
     qa_count = len(product.get("qa_index") or {})
-    logger.info('[products] Loaded "%s" (id=%s) with %d Q/A entries',
-                product.get("name", "?"), active_id, qa_count)
+    logger.info('[products] Active product → "%s" (id=%s, %d Q/A entries)',
+                product.get("name", "?"), product_id, qa_count)
+    return product
 
 
 def log_event(agent: str, message: str, data: Any = None):
@@ -221,7 +234,7 @@ async def lifespan(app: FastAPI):
     # prior /api/sell call. ACTIVE_PRODUCT_ID env var overrides the first-
     # key default if you want to swap between demo objects without editing
     # code on stage.
-    _load_active_product()
+    _load_products()
     yield
 
 app = FastAPI(title="EMPIRE", lifespan=lifespan)
@@ -765,13 +778,85 @@ async def api_comment(text: str = Form(...)):
 
 @app.get("/api/state")
 async def api_state():
+    catalog = pipeline_state.get("products_catalog") or {}
     return {
         "status": pipeline_state["status"],
         "product_data": pipeline_state["product_data"],
+        "active_product_id": pipeline_state.get("active_product_id"),
+        # Lightweight catalog summary — id + name only, not full product_data.
+        # Dashboard renders the dropdown from this; full data is available via
+        # /api/state on demand for the active product.
+        "products": [
+            {"id": pid, "name": (p.get("name") or pid),
+             "qa_count": len(p.get("qa_index") or {})}
+            for pid, p in catalog.items()
+        ],
         "has_photo": pipeline_state["product_clean_b64"] is not None,
         "has_3d": pipeline_state["model_3d"] is not None,
         "log_count": len(pipeline_state["agent_log"]),
     }
+
+
+@app.post("/api/state/active_product")
+async def api_set_active_product(product_id: str = Form(...)):
+    """Switch the active product. Dashboard's product selector posts here.
+    Broadcasts a state_sync event so all dashboard clients re-pull /api/state
+    and reflect the change without a hard refresh."""
+    product = _set_active_product(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail=f"product_id {product_id!r} not in catalog")
+    await broadcast_to_dashboards({
+        "type": "active_product_changed",
+        "product_id": product_id,
+        "product_name": product.get("name", product_id),
+    })
+    return {
+        "active_product_id": product_id,
+        "product_name": product.get("name", product_id),
+        "qa_count": len(product.get("qa_index") or {}),
+    }
+
+
+@app.get("/api/brain/stats")
+async def api_brain_stats(stream_id: str | None = None, since_seconds: float | None = None):
+    """Aggregate stats for the BRAIN dashboard panel. Defaults to all streams,
+    all time. Pass `?since_seconds=3600` for the last hour, `?stream_id=foo`
+    to scope to one stream."""
+    return brain.get_stats(stream_id=stream_id, since_seconds=since_seconds)
+
+
+@app.post("/api/creator/build")
+async def api_creator_build(
+    file: UploadFile = File(...),
+    include_3d: bool = Form(True),
+):
+    """CREATOR v0: generate 3 marketplace photos + 1 promo video + optional
+    3D model from one input photo + the currently-active product's metadata.
+    Returns URLs to the generated assets under /renders/creator/<request_id>/.
+
+    `include_3d=false` skips the TripoSR call (saves ~15-30s when the pod
+    isn't running TripoSR — Wav2Lip is on :8010, TripoSR would be on :8020)."""
+    product = pipeline_state.get("product_data")
+    if not product:
+        raise HTTPException(
+            status_code=400,
+            detail="no active product loaded — POST /api/state/active_product first",
+        )
+    photo_bytes = await file.read()
+    if not photo_bytes:
+        raise HTTPException(status_code=400, detail="empty file upload")
+    photo_b64 = base64.b64encode(photo_bytes).decode()
+    log_event("CREATOR", f"build_all (include_3d={include_3d})",
+              {"product": product.get("name"), "input_bytes": len(photo_bytes)})
+    try:
+        result = await creator_build_all(photo_b64, product, include_3d=include_3d)
+    except Exception as e:
+        logger.exception("[creator] build_all failed")
+        raise HTTPException(status_code=500, detail=f"creator failed: {e}")
+    log_event("CREATOR", f"built {len(result['photos'])} photos + promo "
+              f"({result['timing_ms']['total']}ms)",
+              {"request_id": result["request_id"]})
+    return result
 
 
 # ── Audience-facing endpoints (QR-driven comment intake) ───────────────────
@@ -1445,6 +1530,18 @@ async def run_routed_comment(comment: str) -> dict:
     })
     log_event("ROUTER", f'{decision["tool"]} — {decision["reason"]} ({decision["ms"]}ms)',
               {"classify": classify.get("type"), "was_local": decision["was_local"]})
+
+    # 3b. Persist for BRAIN aggregation. Hardcoded stream_id="default" until
+    #     multi-stream isolation lands (Sprint 5+); active_product_id mirrors
+    #     pipeline_state which the dashboard sets via /api/state/active_product
+    #     once multi-product (S1.3) ships.
+    brain.record_event(
+        stream_id="default",
+        product_id=pipeline_state.get("active_product_id") or "unknown",
+        comment=comment,
+        classify=classify,
+        decision=decision,
+    )
 
     # 4. Dispatch.
     tool = decision["tool"]

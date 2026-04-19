@@ -3,6 +3,18 @@
 > 24/7 multilingual AI livestream-shopping seller, built in 24 hours.
 > Voice in → product analyzed → avatar pitches → comments answered → all on a budget.
 
+## Not in scope today (read this first)
+
+To set expectations cleanly:
+
+- **No live platform integration.** No actual TikTok Shop / Instagram Live / WhatsApp connection. The dashboard chat panel simulates comments. The router + response pipeline is identical to what would feed a real platform integration; the integration adapter itself (planned Sprint 4 for TikTok Shop) is not yet built.
+- **Single-tenant.** One product, one stream, one operator at a time. Multi-product is shipped (Sprint 1.3) but multi-stream isolation is roadmap (Sprint 5+).
+- **English only.** ElevenLabs `language_code="en"` is hardcoded today. Multi-language is roadmap (Sprint 3).
+- **CLOSER agent is not built.** The pitched DM auto-responder is planned for Sprint 4.
+- **Cloud generative photo variants** (Vertex AI Imagen / Stability AI) not integrated. CREATOR v0 ships rembg + PIL + ffmpeg variants only.
+
+Everything else in this doc is shipped and runnable.
+
 ## The local-first thesis
 
 Every step a small seller does on TikTok Shop or Whatnot — analyzing the product, drafting the script, answering the same five questions an hour — costs money and a human if you do it on the cloud. We push the obvious ones onto the seller's own machine via on-device LLM (Cactus + Gemma 4), and only escalate to cloud (Claude, Veo, ElevenLabs, RunPod) when the question genuinely needs it.

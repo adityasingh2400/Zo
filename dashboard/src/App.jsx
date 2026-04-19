@@ -6,6 +6,8 @@ import { AgentLog } from './components/AgentLog';
 import { ChatPanel } from './components/ChatPanel';
 import { VoiceMic } from './components/VoiceMic';
 import { RoutingPanel } from './components/RoutingPanel';
+import { BrainPanel } from './components/BrainPanel';
+import { ProductSelector } from './components/ProductSelector';
 
 export default function App() {
   const {
@@ -86,6 +88,7 @@ export default function App() {
 
       {/* Demo Controls */}
       <div style={styles.controls}>
+        <ProductSelector />
         <input
           value={sellInput}
           onChange={e => setSellInput(e.target.value)}
@@ -149,6 +152,9 @@ export default function App() {
             <div style={styles.telemetryBody}>
               <div style={styles.telemetryCol}>
                 <RoutingPanel routingDecisions={routingDecisions} routingStats={routingStats} />
+              </div>
+              <div style={styles.telemetryCol}>
+                <BrainPanel />
               </div>
               <div style={styles.telemetryCol}>
                 <AgentLog log={agentLog} />
@@ -256,7 +262,7 @@ const styles = {
   },
   telemetryBody: {
     flex: 1, display: 'grid',
-    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)',
     gap: 14, padding: 14, minHeight: 0,
   },
   telemetryCol: { minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' },

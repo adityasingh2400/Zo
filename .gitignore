@@ -20,3 +20,6 @@ phase0/renders_e2e/
 backend/renders/
 backend/local_answers/
 *.log
+
+# Runtime SQLite stores (BRAIN telemetry, future per-stream state)
+*.db

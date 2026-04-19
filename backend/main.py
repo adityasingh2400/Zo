@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -406,7 +407,8 @@ async def dashboard_ws(ws: WebSocket):
 
 # ── Sell Pipeline ──────────────────────────────────────
 
-async def run_sell_pipeline(frame_b64: str, voice_text: str):
+async def run_sell_pipeline(frame_b64: str, voice_text: str,
+                            request_id: str | None = None):
     pipeline_state["status"] = "analyzing"
     pipeline_state["agent_log"] = []
     logger.info("=" * 60)
@@ -418,6 +420,7 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     # PHASE 1: Single Claude call (vision + script) + background removal in parallel
     log_event("EYES", "Analyzing product + writing script (single Claude call + bg removal)...")
+    await _emit_pipeline_step(request_id, "claude", "active")
     t0 = time.time()
 
     async def _claude_combined():
@@ -447,6 +450,7 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
         script = f"Check out this amazing {product_data.get('name', 'product')}!"
 
     log_event("EYES", f"Claude: {product_data.get('name', 'done')} ({phase1_ms}ms)")
+    await _emit_pipeline_step(request_id, "claude", "done", ms=phase1_ms)
     pipeline_state["product_data"] = product_data
     await broadcast_to_dashboards({"type": "product_data", "data": product_data})
 
@@ -485,18 +489,23 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
     pitch_t0 = time.time()
     try:
         # 2a. TTS
+        await _emit_pipeline_step(request_id, "eleven", "active")
         t0 = time.time()
         audio_bytes = await text_to_speech(script)
         tts_ms = int((time.time() - t0) * 1000)
         if not audio_bytes:
+            await _emit_pipeline_step(request_id, "eleven", "failed",
+                                       detail="empty audio")
             raise RuntimeError("TTS returned empty audio")
         log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
+        await _emit_pipeline_step(request_id, "eleven", "done", ms=tts_ms)
 
         # 2b. Wav2Lip render against the substrate the Director picked for
         #     whatever Tier 0 is visible. Falls back to default substrate if
         #     the configured one isn't on the pod (the Director caches a
         #     "missing" mark so we don't repeatedly retry the bad path).
         substrate = director.current_substrate_pod_path() if director else None
+        await _emit_pipeline_step(request_id, "wav2lip", "active")
         t0 = time.time()
         try:
             if substrate:
@@ -519,12 +528,15 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
                 raise
         lipsync_ms = int((time.time() - t0) * 1000)
         log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
+        await _emit_pipeline_step(request_id, "wav2lip", "done", ms=lipsync_ms)
 
         # 2c. Save + broadcast through Director so the carousel crossfade
         #     machinery and idle-release timing work the same way as comment
         #     responses (single source of truth for stage state).
         url = _save_render("pitch", video_bytes)
         pipeline_state["pitch_video_url"] = url
+        await _emit_pipeline_step(request_id, "going_live", "done",
+                                   ms=lipsync_ms + tts_ms + phase1_ms)
 
         if director:
             await director.play_response(url)
@@ -687,12 +699,35 @@ async def api_sell(file: UploadFile = File(...), voice_text: str = Form("sell th
     return {"status": "pipeline_started"}
 
 
+async def _emit_pipeline_step(request_id: str | None, step: str, status: str,
+                              ms: int | None = None, detail: str | None = None):
+    """Broadcast a pipeline_step event scoped to a request_id so the iPhone's
+    PipelineProgressView can render the 'Building your avatar' rail. Called
+    from run_video_sell_pipeline + run_sell_pipeline at each major boundary.
+
+    When request_id is None (legacy callers that didn't generate one), this
+    is a no-op — backward-compatible with the pre-Phase-1 flow."""
+    if not request_id:
+        return
+    payload = {"type": "pipeline_step", "request_id": request_id,
+               "step": step, "status": status}
+    if ms is not None:
+        payload["ms"] = ms
+    if detail is not None:
+        payload["detail"] = detail
+    await broadcast_to_dashboards(payload)
+
+
 @app.post("/api/sell-video")
 async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("sell this")):
-    """Upload a product video. Extracts frames + transcript, runs full pipeline."""
+    """Upload a product video. Extracts frames + transcript, runs full pipeline.
+
+    Returns a request_id so the caller (iPhone SellerCaptureView) can scope
+    its pipeline_step subscription on the WS bus and render per-stage progress."""
     import tempfile
-    logger.info("[API] /api/sell-video called — file: %s, size: uploading, voice: %s",
-                file.filename, voice_text[:50])
+    request_id = uuid.uuid4().hex[:12]
+    logger.info("[API] /api/sell-video called — file: %s, voice: %s, request_id: %s",
+                file.filename, voice_text[:50], request_id)
     contents = await file.read()
     logger.info("[API] Video received: %d bytes (%s)", len(contents), file.filename)
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
@@ -701,11 +736,18 @@ async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("s
         video_path = f.name
     logger.info("[API] Saved to temp: %s", video_path)
 
-    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text))
-    return {"status": "video_pipeline_started", "bytes": len(contents)}
+    # Fire the "uploaded" pipeline_step immediately so the iPhone sees the
+    # first checkmark light up without waiting for intake to start.
+    asyncio.ensure_future(_emit_pipeline_step(request_id, "uploaded", "done",
+                                               ms=0, detail=f"{len(contents)}B"))
+    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text,
+                                                   request_id=request_id))
+    return {"status": "video_pipeline_started", "bytes": len(contents),
+            "request_id": request_id}
 
 
-async def run_video_sell_pipeline(video_path: str, voice_text: str):
+async def run_video_sell_pipeline(video_path: str, voice_text: str,
+                                   request_id: str | None = None):
     """Full pipeline from video: intake → analyze → sell."""
     pipeline_state["status"] = "ingesting"
     pipeline_state["agent_log"] = []
@@ -716,6 +758,7 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
     logger.info("=" * 60)
 
     log_event("SYSTEM", "Video received. Starting intake pipeline...")
+    await _emit_pipeline_step(request_id, "deepgram", "active")
 
     # Run intake (audio+frames+transcript) and carousel (angle spin) in
     # parallel — both consume the same video, neither blocks the other.
@@ -730,12 +773,15 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         logger.error("[INTAKE] FAILED: %s", e)
         logger.error(traceback.format_exc())
         log_event("SYSTEM", f"Video intake failed: {e}")
+        await _emit_pipeline_step(request_id, "deepgram", "failed",
+                                   detail=str(e)[:120])
         Path(video_path).unlink(missing_ok=True)
         return
     finally:
         Path(video_path).unlink(missing_ok=True)
 
     intake_ms = int((time.time() - t0) * 1000)
+    await _emit_pipeline_step(request_id, "deepgram", "done", ms=intake_ms)
     transcript = intake_result["transcript"]
     best_frames_b64 = intake_result["best_frames_b64"]
     timings = intake_result["timings"]
@@ -790,9 +836,12 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
             combined_voice = f"{combined_voice}\n\n{transcript_extract_hint}"
         pipeline_state["product_photo_b64"] = best_frames_b64[0]
         await broadcast_to_dashboards({"type": "phone_frame", "frame": best_frames_b64[0][:100] + "..."})
-        await run_sell_pipeline(best_frames_b64[0], combined_voice)
+        await run_sell_pipeline(best_frames_b64[0], combined_voice,
+                                 request_id=request_id)
     else:
         log_event("SYSTEM", "No usable frames extracted from video")
+        await _emit_pipeline_step(request_id, "claude", "failed",
+                                   detail="no usable frames")
 
 
 async def _finish_transcript_extract(task: asyncio.Task) -> None:

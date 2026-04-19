@@ -94,12 +94,12 @@ struct ContentView: View {
 
             if state == .loading { splash }
         }
-        .sheet(isPresented: $showingCapture) {
-            SellerCaptureShim { url in
-                showingCapture = false
-                Task { await uploadCapturedVideo(url) }
+        .fullScreenCover(isPresented: $showingCapture) {
+            SellerCaptureView { requestID in
+                if let id = requestID {
+                    uploadState = .success(requestID: id)
+                }
             }
-            .ignoresSafeArea()
         }
         .alert("Backend host", isPresented: $showingHostSheet) {
             TextField("e.g. 192.168.1.42", text: $hostInput)
@@ -384,21 +384,6 @@ struct ContentView: View {
                     .foregroundColor(.red.opacity(0.85))
                     .lineLimit(2)
                     .padding(.horizontal, 12)
-            }
-        }
-    }
-
-    private func uploadCapturedVideo(_ url: URL) async {
-        await MainActor.run { uploadState = .uploading }
-        do {
-            let result = try await SellerCaptureUploader.upload(videoURL: url)
-            let requestID = (result["request_id"] as? String)
-                ?? (result["id"] as? String)
-                ?? "ok"
-            await MainActor.run { uploadState = .success(requestID: requestID) }
-        } catch {
-            await MainActor.run {
-                uploadState = .failed(message: error.localizedDescription)
             }
         }
     }

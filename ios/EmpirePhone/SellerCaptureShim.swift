@@ -1,73 +1,14 @@
-// SellerCaptureShim.swift — Phase 0.2 camera shim.
+// SellerCaptureShim.swift — upload helper for SellerCaptureView.
 //
-// Wraps the native iOS camera (UIImagePickerController) so we can record a
-// short product clip and POST it to /api/sell-video WITHOUT managing an
-// AVFoundation session. The real AVFoundation pipeline (live preview, REC
-// pill, shutter, pipeline progress card) lives in Phase 1.1's
-// SellerCaptureView.swift — not shipped yet.
+// Originally Phase 0.2 wrapped UIImagePickerController; that's been replaced
+// by Phase 1.1's SellerCaptureView (real AVFoundation pipeline). This file
+// kept the `SellerCaptureUploader` enum + multipart-body builder since both
+// are used by the new view.
 //
-// Why a shim: the pitch demo is stage-critical; we want the "phone → film
-// → avatar sells it" beat available without rebuilding the iPhone app's
-// recording infrastructure from scratch. UIImagePickerController is
-// Apple-stock, handles permissions, and hands back a movie file at a
-// file:// URL. Good enough for the pitch, cheap to ship, risk-contained.
-//
-// Gated behind FeatureFlags.sellerMode (default false).
+// File name retained for git history continuity — a future cleanup could
+// rename to Uploader.swift.
 
-import SwiftUI
-import UIKit
-
-struct SellerCaptureShim: UIViewControllerRepresentable {
-    /// Called with the recorded video's file URL on successful capture.
-    var onVideoPicked: (URL) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onVideoPicked: onVideoPicked)
-    }
-
-    func makeUIViewController(context: Context) -> UIImagePickerController {
-        let picker = UIImagePickerController()
-        // Camera source; movie mode; cap at 15s to match the pitch spec
-        // ("10-second phone clip"). If the device has no camera (simulator),
-        // UIImagePickerController.isSourceTypeAvailable(.camera) returns
-        // false and we fall back to photoLibrary so the sheet still opens.
-        if UIImagePickerController.isSourceTypeAvailable(.camera) {
-            picker.sourceType = .camera
-            picker.cameraCaptureMode = .video
-        } else {
-            picker.sourceType = .photoLibrary
-        }
-        picker.mediaTypes = ["public.movie"]
-        picker.videoMaximumDuration = 15
-        picker.allowsEditing = false
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_: UIImagePickerController, context _: Context) {}
-
-    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
-        let onVideoPicked: (URL) -> Void
-
-        init(onVideoPicked: @escaping (URL) -> Void) {
-            self.onVideoPicked = onVideoPicked
-        }
-
-        func imagePickerController(
-            _ picker: UIImagePickerController,
-            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
-        ) {
-            picker.dismiss(animated: true)
-            if let url = info[.mediaURL] as? URL {
-                onVideoPicked(url)
-            }
-        }
-
-        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            picker.dismiss(animated: true)
-        }
-    }
-}
+import Foundation
 
 // ── Upload ──────────────────────────────────────────────────────────────
 

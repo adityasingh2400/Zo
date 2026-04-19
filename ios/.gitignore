@@ -1,0 +1,28 @@
+# Xcode
+build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+xcuserdata/
+
+# Cactus iOS framework — rebuild via ~/cactus/apple/build.sh (with patched
+# CMakeLists.txt) using Xcode 16 toolchain. See HANDOFF.md for full steps.
+cactus-ios.xcframework/
+
+# Vendored libcurl static lib + xcframework wrapper. Source: ~/cactus/libs/curl/ios/.
+libcurl.xcframework/
+libs/
+
+# Bundled model weights — 700+ MB, regenerate via `cactus download`
+EmpirePhone/Models/
+
+# Bundled response MP4s — mirror of backend/local_answers/ + phase0 bridges.
+# Regenerate by copying from the repo root:
+#   cp ../backend/local_answers/*.mp4 EmpirePhone/Clips/
+#   cp ../phase0/assets/clips/{compliment,objection}_*.mp4 EmpirePhone/Clips/
+#   cp ../phase0/assets/states/idle/idle_calm.mp4 EmpirePhone/Clips/idle_loop.mp4
+EmpirePhone/Clips/*.mp4
+
+# macOS
+.DS_Store

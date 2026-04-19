@@ -59,12 +59,11 @@ export default function StageView() {
     productData, pitchVideoUrl, responseVideo, pendingComments,
     liveStage, routingDecisions, routingStats, wsRef, connected,
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
-    // 3D product viewer + hero carousel data — populated by the backend
-    // /api/build_carousel pipeline (auto-triggered by run_sell_pipeline
-    // on every video upload). Carries `frames` (48-angle stack for Spin3D)
-    // and `heroes` (4 best hero shots for HeroGallery), plus per-hero
-    // metadata. When null, the right bezel shows a placeholder slot so
-    // the layout reads as intentional even before the first product loads.
+    // view3d is the carousel + hero shots dispatch from threed.py. Drives
+    // the floating top-right product showcase (Spin3D + HeroSlideshow)
+    // inside the 9:16 phone frame so the audience sees the actual product
+    // alongside the avatar narrating it. voiceState feeds the same
+    // showcase's idle/thinking/talking pulse animation.
     view3d, voiceState,
   } = useEmpireSocket();
   // `connected` flips false→true via ws.onopen — it's the trigger every
@@ -195,6 +194,7 @@ export default function StageView() {
         audioResponse={audioResponse}
         pitchAudio={pitchAudio}
         onAudioEnded={handleAudioEnded}
+        view3d={view3d}
         minimalChrome={MINIMAL_STAGE}
       />
 

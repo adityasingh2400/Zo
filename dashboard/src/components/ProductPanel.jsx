@@ -1,56 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React from 'react';
 import { Spin3D } from './Spin3D';
+import { useSpin3DVoiceState } from '../hooks/useSpin3DVoiceState';
 
-// Subscribe to voice_state events directly so the Spin3D rim light + speed
-// react in lockstep with the voice pipeline, without prop-drilling through App.
-//
-// Dep includes `connected`, not just `wsRef`. wsRef is a stable ref object
-// whose identity never changes, and useEmpireSocket assigns wsRef.current
-// inside its OWN useEffect — which fires AFTER child effects (effects run
-// bottom-up). On first mount this effect would see wsRef.current=null,
-// bail, and never re-trigger; the Spin3D rim light would silently never
-// react to voice events. `connected` flips false→true via ws.onopen so
-// the effect re-runs once the socket is live.
-function useSpin3DVoiceState({ wsRef, connected }) {
-  const [state, setState] = useState('idle');
-  const clearTimerRef = useRef(null);
-  useEffect(() => {
-    const ws = wsRef?.current;
-    if (!ws) return;
-    function setStateSafe(s) {
-      setState(s || 'idle');
-      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
-      if (s && s !== 'idle') {
-        clearTimerRef.current = setTimeout(() => setState('idle'), 12_000);
-      }
-    }
-    function onMessage(e) {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { return; }
-      switch (msg.type) {
-        case 'voice_state':
-          // Director-driven, authoritative.
-          setStateSafe(msg.state || 'idle');
-          break;
-        case 'voice_transcript':
-          setStateSafe('thinking');
-          break;
-        case 'routing_decision':
-          setStateSafe('responding');
-          break;
-        case 'comment_response_video':
-          setStateSafe('idle');
-          break;
-      }
-    }
-    ws.addEventListener('message', onMessage);
-    return () => {
-      ws.removeEventListener('message', onMessage);
-      if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
-    };
-  }, [wsRef, connected]);
-  return state;
-}
+// useSpin3DVoiceState lifted to a shared hook (../hooks/useSpin3DVoiceState)
+// so the new TikTokShopOverlay product showcase on /stage drives its Spin3D
+// off the exact same WS subscription / state machine. Behavior here is
+// unchanged.
 
 export function ProductPanel({ productData, productPhoto, transcript, view3d, transcriptExtract, wsRef, connected }) {
   const spinState = useSpin3DVoiceState({ wsRef, connected });

@@ -173,6 +173,7 @@ export function TikTokShopOverlay({
             audioResponse={audioResponse}
             pitchAudio={pitchAudio}
             onAudioEnded={onAudioEnded}
+            inOverlay
           />
         </div>
 

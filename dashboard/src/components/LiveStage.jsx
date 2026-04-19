@@ -33,6 +33,9 @@ export function LiveStage({
   audioResponse,           // audio-first dispatch: {url, word_timings, expected_duration_ms, ...}
   pitchAudio,              // 30s Veo pitch audio: same shape, separate slot
   onAudioEnded,            // (kind: 'response' | 'pitch') -> void; parent clears state
+  inOverlay = false,       // /stage: TikTokShopOverlay wraps us — suppress chrome that
+                            // duplicates the overlay's chat rail / LIVE badge / BUY card.
+                            // Default off keeps the operator dashboard at / pixel-identical.
 }) {
   // Voice/routing state listened off the shared WS directly so LiveStage stays
   // self-contained — no prop changes needed in App.jsx (which Cody is also
@@ -515,8 +518,10 @@ export function LiveStage({
           }}
         />
 
-        {/* LIVE pill — visible whenever Tier 1 is active (i.e. avatar is reactive) */}
-        {tier1Opacity > 0 && (
+        {/* LIVE pill — visible whenever Tier 1 is active (i.e. avatar is reactive).
+            Hidden in overlay mode because TikTokShopOverlay paints its own
+            (more prominent) LIVE badge in the top-right of the 9:16 frame. */}
+        {tier1Opacity > 0 && !inOverlay && (
           <div style={styles.livePill}>
             <span style={styles.liveDot} />
             LIVE
@@ -536,13 +541,19 @@ export function LiveStage({
           <RoutingBadge decision={routingDecision} />
         )}
 
-        {/* Pending comment chip */}
-        {oldestPending && !overlayVisible && (
+        {/* Pending comment chip — operator dashboard only. In /stage the
+            TikTokShopOverlay chat rail already shows incoming comments
+            with @username:text, and this chip would land on top of the
+            LIVE badge / viewers pill cluster (top-right). */}
+        {oldestPending && !overlayVisible && !inOverlay && (
           <PendingChip text={oldestPending.text} startedAt={oldestPending.t0} />
         )}
 
-        {/* Floating comment card */}
-        {overlayVisible && responseVideo && (
+        {/* Floating comment card — operator dashboard only. In /stage the
+            chat rail surfaces the comment text and the avatar speaks the
+            answer aloud; the floating card would just bury behind the
+            buyDock + chatRail and add visual noise. */}
+        {overlayVisible && responseVideo && !inOverlay && (
           <div style={styles.commentOverlay}>
             <div style={styles.commentCard}>
               <div style={styles.commentHeader}>

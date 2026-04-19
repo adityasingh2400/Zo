@@ -17,6 +17,7 @@ from config import (
     RUNPOD_POD_IP, RUNPOD_LIVETALKING_PORT,
     WAV2LIP_URL, LATENTSYNC_URL, POD_SPEAKING_1080P,
 )
+from agents import _spend
 
 logger = logging.getLogger("empire.seller")
 bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
@@ -75,7 +76,12 @@ Rules:
 async def generate_comment_response(
     comment: str, product_data: dict, comment_type: str = "question"
 ) -> str:
-    """Generate a natural response to a viewer comment via Claude on Bedrock."""
+    """Generate a natural response to a viewer comment via Claude on Bedrock.
+    Guarded by BEDROCK_USD_PER_MIN_CAP — if the rolling 1-min spend would
+    exceed it, returns a graceful placeholder instead of placing the call."""
+    if not _spend.check("bedrock", _spend.EST_BEDROCK_COMMENT_RESPONSE_USD):
+        return "Hold on a sec — let me think about that one."
+
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 60,
@@ -97,6 +103,7 @@ No preamble, no stage directions, no hedging like "Great question". Start with t
         accept="application/json",
         body=body,
     )
+    _spend.record("bedrock", _spend.EST_BEDROCK_COMMENT_RESPONSE_USD)
     result = json.loads(response["body"].read())
     return result["content"][0]["text"]
 
@@ -416,7 +423,16 @@ async def text_to_speech(
             return b"", []
         return b""
 
+    # Spend guard. Cap is per-minute USD across all TTS calls. When exceeded
+    # we return empty bytes — same shape callers handle when ElevenLabs is
+    # unconfigured, so no downstream breakage. Cap fires only when set in env.
+    if not _spend.check("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD):
+        if return_word_timings:
+            return b"", []
+        return b""
+
     audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice)
+    _spend.record("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD)
 
     if not return_word_timings:
         return audio_bytes

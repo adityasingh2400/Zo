@@ -238,17 +238,49 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="EMPIRE", lifespan=lifespan)
+
+# CORS: default to localhost:5173 (dev dashboard). Override via FRONTEND_ORIGIN
+# env (comma-separated for multiple origins, e.g. dev + cloudflare tunnel).
+# Replaces the prior allow_origins=["*"] which let any origin call the API.
+_FRONTEND_ORIGINS = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_FRONTEND_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info("[cors] allow_origins=%s", _FRONTEND_ORIGINS)
+
+
+async def _ws_auth_check(ws: WebSocket) -> bool:
+    """Validate ?token=<secret> against WS_SHARED_SECRET env. Returns True
+    when OK; closes the socket with 1008 (policy violation) on mismatch.
+
+    Default-off: when WS_SHARED_SECRET is unset, all connections are allowed
+    (matches the prior unauth behavior so this change doesn't break a fresh
+    clone). Set WS_SHARED_SECRET in .env + VITE_WS_TOKEN in the dashboard env
+    to enable. Required before exposing the backend on a public network."""
+    expected = os.getenv("WS_SHARED_SECRET", "").strip()
+    if not expected:
+        return True
+    provided = ws.query_params.get("token", "")
+    if provided != expected:
+        await ws.close(code=1008, reason="invalid or missing token")
+        logger.warning("[ws] rejected %s connection: bad token", ws.url.path)
+        return False
+    return True
+
 
 # ── WebSocket: Phone ───────────────────────────────────
 
 @app.websocket("/ws/phone")
 async def phone_ws(ws: WebSocket):
+    if not await _ws_auth_check(ws):
+        return
     await ws.accept()
     phone_clients.append(ws)
     log_event("SYSTEM", "Phone connected")
@@ -288,6 +320,8 @@ async def handle_phone_message(msg: dict, ws: WebSocket):
 
 @app.websocket("/ws/dashboard")
 async def dashboard_ws(ws: WebSocket):
+    if not await _ws_auth_check(ws):
+        return
     await ws.accept()
     dashboard_clients.append(ws)
 

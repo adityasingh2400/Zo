@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws/dashboard`;
+// Backend's /ws/dashboard requires `?token=<value>` when WS_SHARED_SECRET
+// is set in backend .env (Sprint 2.6). We forward VITE_WS_TOKEN if defined;
+// blank token is fine in dev mode (backend default-allows when secret unset).
+const WS_TOKEN = import.meta.env?.VITE_WS_TOKEN || '';
+const WS_URL = `ws://${window.location.hostname}:8000/ws/dashboard`
+  + (WS_TOKEN ? `?token=${encodeURIComponent(WS_TOKEN)}` : '');
 // Live-mode states: how the dashboard chrome interprets `status`.
 // idle → analyzing/creating (INTRO) → selling/live (PITCH/LIVE), with BRIDGE
 // inserted whenever a comment response is mid-flight.

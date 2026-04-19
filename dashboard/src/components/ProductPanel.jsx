@@ -31,7 +31,7 @@ export function ProductPanel({ productData, productPhoto, transcript, view3d, tr
           <div style={styles.dataGrid}>
             <DataRow label="Name" value={productData.name} />
             <DataRow label="Category" value={productData.category} />
-            <DataRow label="Materials" value={productData.materials?.join(', ')} />
+            <DataRow label="Materials" value={Array.isArray(productData.materials) ? productData.materials.join(', ') : productData.materials} />
             <DataRow label="Price Range" value={productData.suggested_price_range} />
             <DataRow label="Target" value={productData.target_audience} />
             {productData.selling_points?.map((pt, i) => (

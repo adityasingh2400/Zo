@@ -9,3 +9,8 @@ build/
 *.egg-info/
 .expo/
 .agents/
+
+# Generated media — regenerate via scripts/render_local_answers.py
+backend/local_answers/
+backend/renders/
+*.log

@@ -117,19 +117,6 @@ export function useEmpireSocket() {
           // Director-driven explicit voice state. Authoritative.
           setVoiceStateSafe(msg.state || null);
           break;
-        case 'voice_transcript':
-          // Cody's POST /api/voice_comment broadcasts this once Cactus/Gemma
-          // has the text. We're now mid-route → reflect that in the UI.
-          setVoiceTranscript({ text: msg.text, source: msg.source, ms: msg.ms });
-          setVoiceStateSafe('thinking');
-          break;
-        case 'routing_decision':
-          // Router has picked a tool. If it stays local, response will come
-          // very fast (sub-second often). If it escalates, render kicks off.
-          setRoutingDecision(msg);
-          setRoutingDecisions(prev => [...prev.slice(-19), msg]);
-          setVoiceStateSafe('responding');
-          break;
         case 'pitch_video':
           setPitchVideoUrl(msg.url);
           setLiveStage('PITCH');
@@ -138,13 +125,14 @@ export function useEmpireSocket() {
           setTranscript(msg.text);
           break;
         case 'routing_decision':
-          // Keep a rolling window of the last 50 decisions + roll up counters.
-          // Panel reads both: counters for the big headline, list for the
-          // per-comment feed judges see from 10ft.
+          // Router has picked a tool. Keep the last decision (drives the
+          // badge), a rolling 50-item window (drives RoutingPanel feed), and
+          // rolled-up counters (KPI cards).
           //
           // Attach a stable sequence id so React keys don't shift when new
           // decisions arrive — otherwise old rows remount and their pulse
           // animation re-fires, which looks like every row is blinking.
+          setRoutingDecision(msg);
           setRoutingDecisions(prev => {
             const nextSeq = (prev[prev.length - 1]?.seq ?? 0) + 1;
             return [...prev.slice(-49), {
@@ -166,6 +154,9 @@ export function useEmpireSocket() {
               cost_saved_usd: prev.cost_saved_usd + delta,
             };
           });
+          // Advance the voice-state pill — the router has picked a tool, so
+          // the avatar is about to respond.
+          setVoiceStateSafe('responding');
           break;
         case 'comment_blocked':
           // Router decided the comment is spam. Drop its pending chip so
@@ -197,6 +188,9 @@ export function useEmpireSocket() {
           // flash an empty bubble.
           if (msg.text) {
             setVoiceTranscript({ text: msg.text, source: msg.source, ms: msg.ms });
+            // Advance the voice-state pill — whisper has text, router is
+            // next.
+            setVoiceStateSafe('thinking');
             // Add as a pending comment so ChatPanel renders the
             // "AI Seller (rendering...)" placeholder alongside the bubble,
             // matching the typed-comment UX. Cleared by comment_response_video.

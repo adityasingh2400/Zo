@@ -46,6 +46,19 @@ enum EmpireWSAuth {
     }
 }
 
+// ── Live comment model ──────────────────────────────────────────────────
+
+/// One row in StreamView's comments card. Mutable on purpose so the
+/// "replying" state can flip to "replied" when comment_response_video
+/// lands for this comment's text.
+struct LiveComment: Identifiable {
+    let id: UUID
+    let handle: String
+    let text: String
+    var badge: String     // "now" | "1s" | "replied"
+    var replying: Bool    // drives the pulsing dot in StreamView
+}
+
 // ── Socket ───────────────────────────────────────────────────────────────
 
 @MainActor
@@ -67,6 +80,13 @@ final class EmpireSocket {
     private(set) var lastRoutingDecision: RoutingDecisionEvent?
     private(set) var lastResponseVideo: CommentResponseVideoEvent?
     private(set) var productData: ProductDataPayload?
+    /// Current 3D spin state — StreamView renders this as a revolving frame
+    /// carousel when kind=="frames".
+    private(set) var view3d: View3dPayload?
+    /// Rolling list of audience + response comments. Capped at 30 entries
+    /// so the on-device list stays bounded even for long-running streams.
+    /// StreamView reverses this for display (newest at top).
+    private(set) var comments: [LiveComment] = []
 
     private var task: URLSessionWebSocketTask?
     private var session: URLSession = .shared
@@ -181,6 +201,14 @@ final class EmpireSocket {
 
         case .commentResponseVideo(let v):
             lastResponseVideo = v
+            // When the avatar just replied to a comment, mark the matching
+            // pending comment as "replied" so StreamView's pulsing indicator
+            // settles. Keep the comment in the list — viewers like to see
+            // the reply context.
+            if let text = v.comment, let idx = comments.lastIndex(where: { $0.text == text && $0.replying }) {
+                comments[idx].replying = false
+                comments[idx].badge = "replied"
+            }
 
         case .agentLog(let log):
             agentLog.append(log.entry)
@@ -193,6 +221,23 @@ final class EmpireSocket {
 
         case .productData(let p):
             productData = p.data
+
+        case .audienceComment(let c):
+            guard let text = c.text, !text.isEmpty else { return }
+            let comment = LiveComment(
+                id: UUID(),
+                handle: c.username.map { "@\($0)" } ?? "@guest",
+                text: text,
+                badge: "now",
+                replying: true  // optimistic — will clear when response_video fires
+            )
+            comments.append(comment)
+            if comments.count > 30 {
+                comments.removeFirst(comments.count - 30)
+            }
+
+        case .view3d(let v):
+            view3d = v.data
 
         case .unknown:
             break  // forward-compat: new event types we haven't modeled yet

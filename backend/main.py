@@ -1078,6 +1078,27 @@ async def api_hands_publish():
     }
 
 
+@app.get("/api/best_frames")
+async def api_best_frames():
+    """Return the most recent intake's best frames as base64 JPEG strings.
+    Used by the iPhone StreamView's "best 6 frames" rotator — the frames
+    themselves are already in pipeline_state['best_frames_b64'] after intake
+    completes; we just surface them via HTTP for the phone to fetch on demand
+    (rather than pushing them over WS, which would bloat the broadcast)."""
+    frames = pipeline_state.get("best_frames_b64") or []
+    # pipeline_state may also store a single "product_photo_b64" from older
+    # paths; include it as index 0 when best_frames_b64 is empty.
+    if not frames:
+        single = pipeline_state.get("product_photo_b64")
+        if single:
+            frames = [single]
+    return {
+        "count": len(frames),
+        "frames": frames,  # each string is base64-encoded JPEG
+        "product_name": (pipeline_state.get("product_data") or {}).get("name"),
+    }
+
+
 @app.get("/api/avatars")
 async def api_avatars():
     """Return the avatar catalog + currently active id. Used by the

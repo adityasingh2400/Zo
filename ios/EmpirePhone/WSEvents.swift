@@ -31,6 +31,8 @@ enum WSEvent {
     case agentLog(AgentLogEvent)
     case stateSync(StateSyncEvent)
     case productData(ProductDataEvent)
+    case audienceComment(AudienceCommentEvent)
+    case view3d(View3dEvent)
     case unknown(type: String, raw: Data)
 
     static func decode(from data: Data) throws -> WSEvent {
@@ -49,6 +51,10 @@ enum WSEvent {
             return .stateSync(try decoder.decode(StateSyncEvent.self, from: data))
         case "product_data":
             return .productData(try decoder.decode(ProductDataEvent.self, from: data))
+        case "audience_comment":
+            return .audienceComment(try decoder.decode(AudienceCommentEvent.self, from: data))
+        case "view_3d":
+            return .view3d(try decoder.decode(View3dEvent.self, from: data))
         default:
             return .unknown(type: envelope.type, raw: data)
         }
@@ -136,4 +142,31 @@ struct ProductDataPayload: Decodable {
     let price: String?
     let visual_details: [String]?
     let active_avatar_id: String?
+    let buy_url: String?   // StreamView's Link-to-Buy destination
+}
+
+/// Audience viewer comment — fires when someone on the QR form submits
+/// a question, OR when a typed comment from the dashboard lands.
+/// Also fed by voice_transcript on the operator's iPhone.
+struct AudienceCommentEvent: Decodable {
+    let type: String
+    let text: String?
+    let username: String?
+    let ts: Double?
+}
+
+/// 3D spin view — backend emits this after threed.py renders a carousel
+/// of frames (kind='frames') or a GLB mesh URL (kind='glb'). Phone only
+/// renders the 'frames' variant; GLB needs a native mesh viewer.
+struct View3dEvent: Decodable {
+    let type: String
+    let data: View3dPayload?
+}
+
+struct View3dPayload: Decodable {
+    let kind: String?          // "frames" | "glb" | null
+    let frames: [String]?      // list of /renders/... URLs for kind=frames
+    let url: String?           // single URL for kind=glb
+    let ms: Int?
+    let source: String?
 }

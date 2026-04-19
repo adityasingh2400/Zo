@@ -518,9 +518,13 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
     )
     phase1_ms = int((time.time() - t0) * 1000)
 
-    # Extract product data and script from combined result
+    # Extract product data and script from combined result. Preserve the
+    # analyzer's own `source` tag (cactus_on_device | claude_cloud |
+    # gemma_failed | claude_error) so the verify curl + dashboards can
+    # tell which engine actually wrote this product — the pipeline shell
+    # shouldn't overwrite truth with a hardcoded label.
     product_data = claude_result.get("product", claude_result)
-    product_data["source"] = "claude_cloud"
+    product_data["source"] = claude_result.get("source", "claude_cloud")
     script = claude_result.get("script", "")
     if not script:
         script = f"Check out this amazing {product_data.get('name', 'product')}!"

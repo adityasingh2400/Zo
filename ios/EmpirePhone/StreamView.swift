@@ -36,12 +36,16 @@ import Combine
 struct StreamView: View {
     @ObservedObject var director: VideoDirector
     let socket: EmpireSocket
+    /// Called when the user taps the film button — ContentView opens the
+    /// camera full-screen. StreamView doesn't manage the sheet because
+    /// the camera flow is owned by the app shell (re-enters .needsProduct
+    /// if the capture errors mid-upload).
+    var onRefilm: (() -> Void)? = nil
 
     @State private var showingHostSheet = false
     @State private var hostInput = ""
     @State private var bestFrames: [String] = []  // base64-encoded JPEGs
     @State private var bestFramesIndex: Int = 0
-    @State private var showingCapture = false
 
     var body: some View {
         GeometryReader { geo in
@@ -88,11 +92,6 @@ struct StreamView: View {
                        : "Info.plist / default"
             Text("Current: \(resolved) · \(source)\nipconfig getifaddr en0 on the Mac")
         }
-        .fullScreenCover(isPresented: $showingCapture) {
-            SellerCaptureView { _ in
-                Task { await refreshBestFrames() }
-            }
-        }
     }
 
     // MARK: - Head shot
@@ -110,13 +109,13 @@ struct StreamView: View {
                     showingHostSheet = true
                 }
 
-            // Small floating LIVE pill + optional Capture entry
+            // Floating LIVE pill + "film another" entry — the camera IS the
+            // primary way into the app now, so the button is always visible
+            // (no longer behind FeatureFlags.sellerMode).
             HStack(spacing: 8) {
                 liveTag
                 Spacer()
-                if FeatureFlags.sellerMode {
-                    captureButton
-                }
+                captureButton
             }
             .padding(12)
         }
@@ -139,7 +138,7 @@ struct StreamView: View {
 
     private var captureButton: some View {
         Button {
-            showingCapture = true
+            onRefilm?()
         } label: {
             Image(systemName: "video.fill")
                 .font(.system(size: 12, weight: .semibold))

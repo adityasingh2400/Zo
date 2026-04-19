@@ -40,6 +40,7 @@ from agents.creator import build_all as creator_build_all
 from agents.creator import generate_3d_model, remove_background
 from agents.eyes import (
     analyze_and_script_claude,
+    analyze_and_script_gemma,
     analyze_with_claude,
     classify_comment_gemma,
     transcribe_voice,
@@ -464,16 +465,45 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
     logger.info("=" * 60)
     pipeline_start = time.time()
 
-    # PHASE 1: Single Claude call (vision + script) + background removal in parallel
-    log_event("EYES", "Analyzing product + writing script (single Claude call + bg removal)...")
-    await _emit_pipeline_step(request_id, "claude", "active")
+    # PHASE 1: Product analysis + pitch script + background removal in parallel.
+    #
+    # PRODUCT_ANALYSIS_MODEL env var (defaults to "auto") picks the vision/
+    # script engine:
+    #   "gemma"  — Cactus Gemma 4 on-device only, raise if unavailable
+    #   "claude" — Claude Haiku on Bedrock only (legacy cloud path)
+    #   "auto"   — try Gemma first, fall back to Claude if it fails
+    #
+    # Cody wants the seller flow to stay local: the iPhone films → Mac
+    # runs Gemma on the seller's narration + product frame → pitch script
+    # comes out. No cloud roundtrip for understanding.
+    pam = os.getenv("PRODUCT_ANALYSIS_MODEL", "auto").lower()
+    log_event("EYES", f"Analyzing product + writing script ({pam} path)...")
+    await _emit_pipeline_step(request_id, "claude", "active",
+                               detail=f"model={pam}")
     t0 = time.time()
 
-    async def _claude_combined():
+    async def _analyze_combined():
+        """Try Gemma first (on-device), fall back to Claude if requested
+        or on Gemma failure. Returns the same `{product, script}` shape
+        from either path so downstream code is agnostic."""
+        if pam in ("gemma", "auto"):
+            try:
+                result = await analyze_and_script_gemma(frame_b64, voice_text)
+                src = result.get("source", "")
+                if src == "cactus_on_device":
+                    return result
+                if pam == "gemma":
+                    # Strict mode — return the failure as-is so the caller
+                    # can surface it; don't fall through to Claude.
+                    return result
+                logger.info("[EYES] Gemma path failed (%s), falling back to Claude",
+                            result.get("reason", "unknown"))
+            except Exception as e:
+                logger.warning("[EYES] Gemma call errored, falling back to Claude: %s", e)
         try:
             return await analyze_and_script_claude(frame_b64, voice_text)
         except Exception as e:
-            logger.error("Claude combined error: %s", e)
+            logger.error("[EYES] Claude combined error: %s", e)
             return {"error": str(e), "source": "claude_error"}
 
     async def _bg_removal():
@@ -484,7 +514,7 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
             return None
 
     claude_result, clean_b64 = await asyncio.gather(
-        _claude_combined(), _bg_removal()
+        _analyze_combined(), _bg_removal()
     )
     phase1_ms = int((time.time() - t0) * 1000)
 

@@ -246,6 +246,82 @@ Extract as JSON only: {{"action": "sell|describe|compare", "price": "$X or null"
 
 # ── EYES: Claude Vision (cloud, rich analysis) ──────────────────────────────
 
+async def analyze_and_script_gemma(frame_b64: str, voice_text: str) -> dict:
+    """On-device product analysis + pitch script via Cactus Gemma 4. Matches
+    the return shape of `analyze_and_script_claude` — `{product: {...},
+    script: "..."}` — so run_sell_pipeline can swap backends without
+    touching downstream code.
+
+    Why this exists: Cody wants the seller flow to hit Gemma locally on the
+    Mac (no cloud), with the user's narration as the product-identity
+    hint. Gemma 4 E4B is smaller than Claude Haiku, so we give it a
+    tighter prompt + lower word budget to keep output grounded.
+
+    Fallback behavior: if Cactus is unavailable OR Gemma returns
+    unparseable JSON, returns `{"source": "gemma_failed", ...}` so the
+    caller can fall back to Claude.
+    """
+    logger.info("[GEMMA] analyze_and_script_gemma called (frame: %d chars, cactus: %s)",
+                len(frame_b64), CACTUS_AVAILABLE)
+    prompt = f"""You are writing copy for an AI livestream seller. The seller narrated:
+
+"{voice_text}"
+
+Look at the product image. Return ONLY valid JSON with this exact shape:
+
+{{
+  "product": {{
+    "name": "product name (seller's words + what you see)",
+    "category": "short category",
+    "materials": ["primary material"],
+    "selling_points": ["3-4 short benefit phrases"],
+    "visual_details": ["2-3 specific things you see in the image"],
+    "suggested_price_range": "$X - $Y"
+  }},
+  "script": "Under 80 words. One paragraph. Second-person, conversational, TikTok Live energy. Mention 2 visual details from the image AND 1 specific thing the seller said. End with a CTA. No stage directions. Just what the avatar will speak aloud."
+}}
+
+Do not invent specs, dimensions, or prices not supported by the image or the seller's words."""
+
+    if not CACTUS_AVAILABLE:
+        return {"source": "gemma_failed", "reason": "cactus_unavailable"}
+
+    # Write frame to temp JPEG — Cactus wants an image path on disk.
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(base64.b64decode(frame_b64))
+        img_path = f.name
+    try:
+        import asyncio
+        result = await asyncio.to_thread(
+            _cactus_chat,
+            [{"role": "user", "content": prompt}],
+            512,        # bigger budget than analyze_with_gemma — we want a full script
+            [img_path],
+        )
+        response_text = result.get("response", "")
+        latency = int(result.get("total_time_ms", 0))
+
+        if "error" in result:
+            return {"source": "gemma_failed", "reason": str(result["error"])}
+
+        parsed = _parse_json_from_text(response_text)
+        if not parsed or "product" not in parsed or "script" not in parsed:
+            logger.warning("[GEMMA] script JSON missing required keys; raw: %s",
+                           response_text[:400])
+            return {"source": "gemma_failed",
+                    "reason": "json_missing_product_or_script",
+                    "raw_response": response_text}
+        parsed["source"] = "cactus_on_device"
+        parsed["latency_ms"] = latency
+        parsed["cost"] = "$0.00"
+        return parsed
+    finally:
+        try:
+            os.unlink(img_path)
+        except Exception:
+            pass
+
+
 async def analyze_and_script_claude(frame_b64: str, voice_text: str) -> dict:
     """Single Claude call: product analysis + sales script from image.
     Returns dict with product_data and sales_script.

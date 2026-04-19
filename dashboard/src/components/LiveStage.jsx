@@ -36,12 +36,17 @@ export function LiveStage({
   inOverlay = false,       // /stage: TikTokShopOverlay wraps us — suppress chrome that
                             // duplicates the overlay's chat rail / LIVE badge / BUY card.
                             // Default off keeps the operator dashboard at / pixel-identical.
+  connected,               // re-trigger for useVoiceStage's WS listener attach. Optional
+                            // (defaults undefined) so callers that don't pass it still
+                            // mount, just without the voice pill / routing badge — same
+                            // as before this prop existed. Pass it from useEmpireSocket
+                            // to enable the in-stage voice/routing overlays.
 }) {
   // Voice/routing state listened off the shared WS directly so LiveStage stays
   // self-contained — no prop changes needed in App.jsx (which Cody is also
   // editing to add VoiceMic). When Cody's server starts broadcasting these
   // events, the pills + badge come alive automatically.
-  const { voiceState, routingDecision } = useVoiceStage({ wsRef });
+  const { voiceState, routingDecision } = useVoiceStage({ wsRef, connected });
   // Tier 0 = ping-pong of two looping idle videos with opacity crossfade,
   // matching the Tier 1 design. Eliminates the visible flash that used to
   // happen when a single <video> swapped src between rotating idle clips.
@@ -626,11 +631,16 @@ export function LiveStage({
 //   comment_response_video → null     (response is on stage, hand off to LIVE)
 //
 // Safety auto-clear after 12s so a dropped follow-up never sticks the pill.
-function useVoiceStage({ wsRef }) {
+function useVoiceStage({ wsRef, connected }) {
   const [voiceState, setVoiceState] = useState(null);
   const [routingDecision, setRoutingDecision] = useState(null);
   const clearTimerRef = useRef(null);
 
+  // Dep includes `connected` so the listener re-attaches when the WS opens.
+  // Without it, this effect runs on mount with wsRef.current === null
+  // (useEmpireSocket's connect() runs in a parent useEffect, AFTER child
+  // effects), bails, and never re-triggers — voice pill + routing badge
+  // would silently never appear.
   useEffect(() => {
     const ws = wsRef?.current;
     if (!ws) return;
@@ -664,7 +674,7 @@ function useVoiceStage({ wsRef }) {
       ws.removeEventListener('message', onMessage);
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
     };
-  }, [wsRef]);
+  }, [wsRef, connected]);
 
   return { voiceState, routingDecision };
 }

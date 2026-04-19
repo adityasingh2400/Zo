@@ -38,6 +38,7 @@ export function TikTokShopOverlay({
   pendingComments,
   liveStage,
   wsRef,
+  connected,           // re-trigger for the WS listener attach (see useEffect below)
   audioResponse,
   pitchAudio,
   onAudioEnded,
@@ -108,6 +109,14 @@ export function TikTokShopOverlay({
   // lands rather than after the React render cycle for pendingComments.
   // Bubble rendering itself is owned by the pendingComments effect below
   // so we don't double-add the comment to the chat rail.
+  //
+  // Dep includes `connected`, not just `wsRef`. wsRef is a stable ref
+  // object whose identity never changes and useEmpireSocket assigns
+  // wsRef.current INSIDE its own useEffect (which runs AFTER child
+  // effects), so on first mount wsRef.current is null and the listener
+  // would never attach if we only depped on wsRef. `connected` flips
+  // false→true via ws.onopen, which gives this effect the trigger to
+  // re-run with wsRef.current populated.
   useEffect(() => {
     const ws = wsRef?.current;
     if (!ws) return;
@@ -120,7 +129,7 @@ export function TikTokShopOverlay({
     }
     ws.addEventListener('message', onMessage);
     return () => ws.removeEventListener('message', onMessage);
-  }, [wsRef]);
+  }, [wsRef, connected]);
 
   // Mirror new pendingComments into the rail. Three flavors land here:
   //   - source: 'audience'  → @<username from QR form>, pink accent
@@ -170,6 +179,7 @@ export function TikTokShopOverlay({
             pendingComments={pendingComments}
             liveStage={liveStage}
             wsRef={wsRef}
+            connected={connected}
             audioResponse={audioResponse}
             pitchAudio={pitchAudio}
             onAudioEnded={onAudioEnded}

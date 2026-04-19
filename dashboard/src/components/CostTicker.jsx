@@ -34,7 +34,7 @@ const COST_PER_CLOUD = 0.00035;
 // Kill-shot animation — short enough to feel sharp, long enough to be visible.
 const COUNT_UP_MS = 320;
 
-export function CostTicker({ wsRef, comparison = '$9,628/mo human team' }) {
+export function CostTicker({ wsRef, connected, comparison = '$9,628/mo human team' }) {
   const [actual, setActual] = useState(0);   // truth: total cost incurred
   const [shown, setShown]   = useState(0);   // animated value the eye sees
   const [flash, setFlash]   = useState(false);
@@ -42,6 +42,18 @@ export function CostTicker({ wsRef, comparison = '$9,628/mo human team' }) {
 
   // Subscribe to routing_decision events directly — same pattern LiveStage
   // uses (addEventListener, never replace the existing onmessage handler).
+  //
+  // Dep MUST include `connected` (not just `wsRef`). wsRef is a stable
+  // React ref object whose identity never changes, and useEmpireSocket
+  // creates the WebSocket inside its OWN useEffect — which fires AFTER
+  // child useEffects (effects run bottom-up in React). So at the moment
+  // this effect runs on mount, wsRef.current is still null, the listener
+  // isn't attached, and the dep `[wsRef]` never re-triggers — the
+  // ticker silently stays at $0 forever even on cloud escalates. Keying
+  // off `connected` gives the re-trigger we need: ws.onopen flips it
+  // true → effect re-runs → wsRef.current is now the live socket →
+  // listener attaches. Same fix applies to TikTokShopOverlay's heart
+  // listener and LiveStage's useVoiceStage subscription.
   useEffect(() => {
     const ws = wsRef?.current;
     if (!ws) return;
@@ -58,7 +70,7 @@ export function CostTicker({ wsRef, comparison = '$9,628/mo human team' }) {
     }
     ws.addEventListener('message', onMessage);
     return () => ws.removeEventListener('message', onMessage);
-  }, [wsRef]);
+  }, [wsRef, connected]);
 
   // Count-up animation: lerp from `shown` → `actual` over COUNT_UP_MS.
   // Cancels any in-flight animation if a new tick lands mid-flight so the

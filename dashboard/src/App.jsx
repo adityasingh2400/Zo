@@ -133,6 +133,7 @@ export default function App() {
             pendingComments={pendingComments}
             liveStage={liveStage}
             wsRef={wsRef}
+            connected={connected}
             audioResponse={audioResponse}
             pitchAudio={pitchAudio}
             onAudioEnded={handleAudioEnded}

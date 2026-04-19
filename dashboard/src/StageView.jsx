@@ -46,6 +46,10 @@ export default function StageView() {
     liveStage, routingDecisions, routingStats, wsRef, connected,
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
   } = useEmpireSocket();
+  // `connected` flips false→true via ws.onopen — it's the trigger every
+  // child WS-listening effect needs in its dep array (CostTicker,
+  // TikTokShopOverlay, LiveStage's useVoiceStage). See the long comment
+  // inside CostTicker.jsx for the full why.
 
   // Same audio-end handler as the operator dashboard — clear the slot so
   // the same payload won't auto-replay.
@@ -166,6 +170,7 @@ export default function StageView() {
         pendingComments={pendingComments}
         liveStage={liveStage}
         wsRef={wsRef}
+        connected={connected}
         audioResponse={audioResponse}
         pitchAudio={pitchAudio}
         onAudioEnded={handleAudioEnded}
@@ -175,7 +180,7 @@ export default function StageView() {
           at projector widths (≥1280px). At narrower viewports it stacks
           along the top edge so it never overlaps the phone frame. */}
       <div style={wideBezel ? styles.bezelTopRight : styles.stackedTopRight}>
-        <CostTicker wsRef={wsRef} />
+        <CostTicker wsRef={wsRef} connected={connected} />
       </div>
 
       <div style={wideBezel ? styles.bezelBottomRight : styles.stackedRoutingNarrow}>

@@ -111,41 +111,73 @@ struct SellerCaptureView: View {
     // MARK: - Top chrome (REC pill + close)
 
     private var topChrome: some View {
-        HStack {
-            // REC pill — long-press to change backend host (shortcut to the
-            // host-override sheet without needing to close the camera).
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(flowState == .recording ? Color.red : Color.white.opacity(0.3))
-                    .frame(width: 7, height: 7)
-                Text(recLabel)
-                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
-                    .tracking(0.8)
-                    .foregroundColor(.white)
+        VStack(spacing: 6) {
+            HStack {
+                topChromeRecPill
+                Spacer()
+                // Close X — dismiss without saving
+                Button {
+                    onComplete(nil)
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 36, height: 36)
+                        .background(.ultraThinMaterial.opacity(0.4), in: Circle())
+                        .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial.opacity(0.4), in: Capsule())
-            .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
-            .onLongPressGesture(minimumDuration: 0.6) {
+            // Always-visible backend indicator. Tap to edit — no more
+            // guessing whether a save took effect. Source is shown so Cody
+            // sees whether UserDefaults override is winning vs Info.plist.
+            Button {
                 hostInput = GemmaClient.backendHost ?? ""
                 showingHostSheet = true
-            }
-
-            Spacer()
-
-            // Close X — dismiss without saving
-            Button {
-                onComplete(nil)
-                dismiss()
             } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial.opacity(0.4), in: Circle())
-                    .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+                HStack(spacing: 6) {
+                    Image(systemName: "network")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.5))
+                    Text(GemmaClient.backendHost ?? "no host configured")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(GemmaClient.hasUserDefaultsOverride ? "·runtime" : "·plist")
+                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                        .tracking(0.8)
+                        .foregroundColor(Color.blue.opacity(0.8))
+                    Image(systemName: "pencil")
+                        .font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.ultraThinMaterial.opacity(0.4), in: Capsule())
             }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// REC pill (top-left) — long-press opens the same host editor.
+    private var topChromeRecPill: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(flowState == .recording ? Color.red : Color.white.opacity(0.3))
+                .frame(width: 7, height: 7)
+            Text(recLabel)
+                .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                .tracking(0.8)
+                .foregroundColor(.white)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.ultraThinMaterial.opacity(0.4), in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+        .onLongPressGesture(minimumDuration: 0.6) {
+            hostInput = GemmaClient.backendHost ?? ""
+            showingHostSheet = true
         }
     }
 

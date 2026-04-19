@@ -27,10 +27,17 @@
 	     and upload it to the Mac for intake. Gated behind FeatureFlags.sellerMode. -->
 	<key>NSCameraUsageDescription</key>
 	<string>EMPIRE uses the camera so you can film a short product clip. The video uploads to your Mac running EMPIRE for the AI to describe and sell.</string>
-	<!-- Mac LAN IP for the Gemma 4 classify call (GemmaClient.swift). Find via:
-	     ipconfig getifaddr en0    Leave empty to disable the Gemma card. -->
+	<!-- Backend endpoint for all iPhone → Mac calls (classify, sell-video,
+	     WS dashboard, state, etc.). Accepts EITHER:
+	       - a LAN hostname/IP     e.g. 172.20.10.2  → http://host:8000
+	       - a full URL            e.g. https://xxx.trycloudflare.com → used as-is
+	     Long-press the REC pill or the failure banner in the iPhone app to
+	     override at runtime (writes to UserDefaults, wins over this value).
+	     Find LAN IP via:  ipconfig getifaddr en0
+	     Spawn a tunnel via: cloudflared tunnel --url http://localhost:8000
+	     Leave empty to disable backend calls entirely. -->
 	<key>EmpireBackendHost</key>
-	<string>172.17.22.176</string>
+	<string>https://piano-superintendent-coverage-ease.trycloudflare.com</string>
 	<!-- Allow plain HTTP to LAN (the Mac backend serves http://, not https://).
 	     Local-network only by default — no exception for arbitrary domains. -->
 	<key>NSAppTransportSecurity</key>

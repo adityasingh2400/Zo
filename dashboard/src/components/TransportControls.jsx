@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 /**
  * TransportControls — transport cluster + force-phase + On Air pill.
@@ -19,6 +19,32 @@ const PHASES = ['INTRO', 'BRIDGE', 'PITCH', 'LIVE'];
 export function TransportControls({ stage = 'INTRO', onAir: onAirProp = true }) {
   const [onAir, setOnAir] = useState(onAirProp);
   const [busy, setBusy] = useState(false);
+  const [lang, setLang] = useState('en');
+  const [supportedLangs, setSupportedLangs] = useState(null);
+
+  // Hydrate supported languages from /api/live/language on mount. Graceful
+  // degrade if the endpoint 404s (Item 6 not shipped).
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/api/live/language`);
+        if (!r.ok) return;
+        const data = await r.json();
+        setLang(data.active_language || 'en');
+        setSupportedLangs(data.supported || null);
+      } catch { /* silent — picker hidden when supportedLangs stays null */ }
+    })();
+  }, []);
+
+  async function changeLang(e) {
+    const next = e.target.value;
+    setLang(next);
+    try {
+      const fd = new FormData();
+      fd.append('lang', next);
+      await fetch(`${API_BASE}/api/live/language`, { method: 'POST', body: fd });
+    } catch { /* swallow — local state already updated */ }
+  }
 
   async function forcePhase(phase) {
     if (busy) return;
@@ -122,6 +148,22 @@ export function TransportControls({ stage = 'INTRO', onAir: onAirProp = true }) 
 
       <div style={styles.divider} />
 
+      {supportedLangs && Object.keys(supportedLangs).length > 1 && (
+        <>
+          <select
+            value={lang}
+            onChange={changeLang}
+            style={styles.langSelect}
+            title="Translation target — pitch text is Claude-translated before ElevenLabs TTS"
+          >
+            {Object.entries(supportedLangs).map(([code, meta]) => (
+              <option key={code} value={code}>{code.toUpperCase()} · {meta.name}</option>
+            ))}
+          </select>
+          <div style={styles.divider} />
+        </>
+      )}
+
       <button type="button" onClick={toggleOnAir} style={{
         ...styles.onAirButton,
         background: onAir ? '#1d1d1f' : '#fff',
@@ -178,6 +220,14 @@ const styles = {
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontSize: 10, fontWeight: 600, letterSpacing: 0.6,
     color: '#1d1d1f', cursor: 'pointer',
+  },
+  langSelect: {
+    background: '#fff', color: '#1d1d1f',
+    border: '1px solid rgba(0,0,0,0.08)', borderRadius: 7,
+    padding: '5px 8px', fontSize: 11, fontWeight: 500,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    cursor: 'pointer', outline: 'none',
+    letterSpacing: 0.4,
   },
   onAirButton: {
     display: 'inline-flex', alignItems: 'center', gap: 6,

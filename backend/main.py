@@ -32,6 +32,7 @@ logger = logging.getLogger("empire")
 
 from agents import brain
 from agents import router as comment_router
+from agents import translator
 from agents.hands import Hands
 from agents.avatar_director import Director
 from agents.bridge_clips import all_bridges, pick_bridge_clip
@@ -535,11 +536,24 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
     try:
         # 2a. TTS. If the active avatar declares a voice_id, use it;
         # otherwise text_to_speech falls back to ELEVENLABS_VOICE_ID.
-        # Empty string → None so the fallback path engages.
+        # Item 6: if active_language is non-English, translate the script
+        # first + pass language_code to ElevenLabs. Cache hits are cheap;
+        # misses incur one Claude Haiku call per unique pitch per language.
         await _emit_pipeline_step(request_id, "eleven", "active")
         t0 = time.time()
         active_voice = _active_avatar().get("voice_id") or None
-        audio_bytes = await text_to_speech(script, voice=active_voice)
+        active_lang = pipeline_state.get("active_language", "en")
+        tts_script = script
+        if active_lang != "en":
+            tts_script = await translator.translate(script, active_lang)
+            if tts_script != script:
+                log_event("SELLER", f"Script translated to {active_lang} "
+                                    f"({len(script)} → {len(tts_script)} chars)")
+        audio_bytes = await text_to_speech(
+            tts_script,
+            voice=active_voice,
+            language_code=active_lang,
+        )
         tts_ms = int((time.time() - t0) * 1000)
         if not audio_bytes:
             await _emit_pipeline_step(request_id, "eleven", "failed",
@@ -950,6 +964,7 @@ _PHASE_TO_STATUS = {
     "LIVE": "live",
 }
 pipeline_state["on_air"] = True  # default ON so live flow works without toggling
+pipeline_state["active_language"] = "en"  # Item 6 — live-time translation target
 
 
 @app.post("/api/director/force_phase")
@@ -984,6 +999,33 @@ async def api_director_force_phase(phase: str = Form(...)):
 # and POSTs /api/hands/toggle on each toggle. MetricsStrip subscribes to
 # hands_published events (broadcast by Hands.publish_all) to animate the
 # BASKETS counter in real time.
+
+# ── Multi-language (Item 6) ─────────────────────────────────────────────
+
+@app.get("/api/live/language")
+async def api_get_language():
+    return {
+        "active_language": pipeline_state.get("active_language", "en"),
+        "supported": translator.SUPPORTED,
+        "cache_stats": translator.stats(),
+    }
+
+
+@app.post("/api/live/language")
+async def api_set_language(lang: str = Form(...)):
+    lang = lang.strip().lower()
+    if lang not in translator.SUPPORTED:
+        raise HTTPException(400, f"unsupported language {lang!r}, expected one of "
+                                 f"{list(translator.SUPPORTED)}")
+    pipeline_state["active_language"] = lang
+    log_event("SELLER", f"Live language → {translator.SUPPORTED[lang]['name']} ({lang})")
+    await broadcast_to_dashboards({
+        "type": "language_changed",
+        "lang": lang,
+        "name": translator.SUPPORTED[lang]["name"],
+    })
+    return {"active_language": lang}
+
 
 @app.get("/api/hands/state")
 async def api_hands_state():

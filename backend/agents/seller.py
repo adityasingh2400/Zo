@@ -266,24 +266,28 @@ class _BytesCtx:
         self._buf.close()
 
 
-def _eleven_tts_sync(text: str, voice_id: str | None = None) -> bytes:
+def _eleven_tts_sync(text: str, voice_id: str | None = None,
+                     language_code: str = "en") -> bytes:
     """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
     event loop isn't blocked while audio bytes are being generated +
     streamed; the WS broadcast for play_clip events can interleave.
 
-    language_code='en' is locked because eleven_flash_v2_5 is multilingual
-    and will auto-detect from the input text. Edge cases (mostly-numeric
-    scripts, brand names, ASCII art in product descriptions) can flip the
-    detection to a different language and produce phonetically-warped
-    output that reads as gibberish to English listeners. Locking en is
-    the safe default; we only revisit this when we add multi-language
-    sellers."""
+    language_code defaults to 'en' for backwards-compat (and because
+    auto-detection on mostly-numeric / brand-heavy English content can
+    flip to a different language and produce gibberish). Non-English
+    callers (Item 6 multi-language path) pass the target code explicitly
+    AFTER running the text through translator.translate() — ElevenLabs
+    sees already-translated content and speaks it in the target language.
+
+    Model stays flash_v2_5 (multilingual, 29 languages supported). If
+    voice quality suffers in a specific language, swap to
+    eleven_multilingual_v2 per-caller."""
     audio_gen = eleven.text_to_speech.convert(
         text=text,
         voice_id=voice_id or ELEVENLABS_VOICE_ID,
         model_id="eleven_flash_v2_5",
         output_format="mp3_44100_128",
-        language_code="en",
+        language_code=language_code,
     )
     return b"".join(audio_gen)
 
@@ -403,6 +407,7 @@ async def text_to_speech(
     text: str,
     *,
     voice: str | None = None,
+    language_code: str = "en",
     return_word_timings: bool = False,
 ) -> bytes | tuple[bytes, list[dict]]:
     """ElevenLabs TTS. flash_v2_5 model = ~400ms for a 15-word reply.
@@ -421,9 +426,15 @@ async def text_to_speech(
     `voice` overrides ELEVENLABS_VOICE_ID when set — used by
     bridge_clips.render_all to render a per-character voice without mutating
     the env.
+
+    `language_code` (Item 6) specifies the target language for TTS.
+    Callers should pre-translate `text` via translator.translate() before
+    calling with a non-English code — ElevenLabs expects already-translated
+    content and speaks it in the specified language's phonology.
     """
-    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, timings=%s, eleven=%s)",
-                len(text), voice or "default", return_word_timings, "yes" if eleven else "no")
+    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, lang=%s, timings=%s, eleven=%s)",
+                len(text), voice or "default", language_code,
+                return_word_timings, "yes" if eleven else "no")
     if not eleven:
         if return_word_timings:
             return b"", []
@@ -437,7 +448,7 @@ async def text_to_speech(
             return b"", []
         return b""
 
-    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice)
+    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice, language_code)
     _spend.record("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD)
 
     if not return_word_timings:

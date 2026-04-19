@@ -44,6 +44,10 @@ struct StreamView: View {
 
     @State private var showingHostSheet = false
     @State private var hostInput = ""
+    /// Drives the LIVE pill's ~1Hz pulse — Visibility (p202) + Operant
+    /// Conditioning (p144). Flipped once in onAppear; the .animation
+    /// repeatForever handles the oscillation.
+    @State private var livePulse = false
 
     var body: some View {
         GeometryReader { geo in
@@ -53,7 +57,10 @@ struct StreamView: View {
                     headShot
                         .frame(maxHeight: .infinity)
                     commentsCard
-                        .frame(height: geo.size.height * 0.38)
+                        // Hierarchy (p104) + 80/20 Rule (p12) — avatar is
+                        // the pitch; comments are secondary. Give the hero
+                        // more vertical weight.
+                        .frame(height: geo.size.height * 0.28)
                 }
                 .frame(width: geo.size.width * 0.58)
 
@@ -99,6 +106,9 @@ struct StreamView: View {
                     RoundedRectangle(cornerRadius: 22)
                         .stroke(Color.white.opacity(0.08), lineWidth: 1)
                 )
+                // Top-Down Lighting Bias (p196) — shadow-below reads the
+                // avatar card as raised, pulling the eye to the hero.
+                .shadow(color: .black.opacity(0.45), radius: 16, x: 0, y: 8)
                 .onLongPressGesture(minimumDuration: 0.6) {
                     hostInput = GemmaClient.backendHost ?? ""
                     showingHostSheet = true
@@ -121,6 +131,10 @@ struct StreamView: View {
             Circle()
                 .fill(Color.green)
                 .frame(width: 6, height: 6)
+                .scaleEffect(livePulse ? 1.35 : 1.0)
+                .opacity(livePulse ? 0.55 : 1.0)
+                .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                           value: livePulse)
             Text("LIVE")
                 .font(.system(size: 9, weight: .heavy, design: .monospaced))
                 .tracking(1.2)
@@ -129,6 +143,7 @@ struct StreamView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(.ultraThinMaterial.opacity(0.5), in: Capsule())
+        .onAppear { livePulse = true }
     }
 
     private var captureButton: some View {
@@ -174,7 +189,32 @@ struct StreamView: View {
                         .foregroundColor(.black.opacity(0.2))
                 }
             }
+
+            // Product name + price — Proximity (p160) keeps product info
+            // with the product image instead of next to the BUY CTA.
+            // Hidden until there's actually a name, so empty state stays
+            // clean.
+            if let name = socket.productData?.name, !name.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.black.opacity(0.88))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    if let price = socket.productData?.price, !price.isEmpty {
+                        Text(price)
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(.black.opacity(0.55))
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .allowsHitTesting(false)
+            }
         }
+        // Top-Down Lighting Bias (p196) — matches the avatar card's lift.
+        .shadow(color: .black.opacity(0.35), radius: 14, x: 0, y: 6)
     }
 
     // MARK: - Comments card (bottom-left)
@@ -254,29 +294,38 @@ struct StreamView: View {
                 UIApplication.shared.open(url)
             }
         } label: {
-            HStack(spacing: 8) {
+            HStack(spacing: 10) {
                 Image(systemName: "cart.fill")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 16, weight: .bold))
                 Text(buyLabel)
-                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
-                    .tracking(1.2)
+                    .font(.system(size: 15, weight: .heavy, design: .monospaced))
+                    .tracking(1.3)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .minimumScaleFactor(0.75)
             }
-            .foregroundColor(.black)
+            .foregroundColor(.white)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
+            // Fitts' Law (p82) — big primary action, generous vertical
+            // reach at the screen-edge terminal area.
+            .frame(minHeight: 56)
             .background(
+                // Von Restorff (p204) — saturated warm orange, the one
+                // visibly-different element. Stands apart from the
+                // green-on-dark LIVE pill and white 3D backdrop.
                 LinearGradient(
-                    colors: [Color.white, Color(white: 0.92)],
+                    colors: [Color(red: 1.00, green: 0.45, blue: 0.20),
+                             Color(red: 0.95, green: 0.28, blue: 0.10)],
                     startPoint: .top, endPoint: .bottom
                 )
             )
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .shadow(color: .white.opacity(0.2), radius: 16, x: 0, y: 0)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .shadow(color: Color(red: 1.00, green: 0.38, blue: 0.15).opacity(0.45),
+                    radius: 18, x: 0, y: 6)
         }
         .disabled(socket.productData?.buy_url == nil)
-        .opacity(socket.productData?.buy_url == nil ? 0.5 : 1)
+        // Keep the button visually present even when disabled — its
+        // absence creates more confusion than a slightly dimmed present.
+        .opacity(socket.productData?.buy_url == nil ? 0.7 : 1)
     }
 
     private var buyLabel: String {

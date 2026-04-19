@@ -432,6 +432,171 @@ def _probe_audio_duration_ms(audio_bytes: bytes) -> int | None:
         return None
 
 
+# ── Wav2Lip audio + video alignment helpers ──────────────────────────────
+# Two structural problems show up when running v3 (or any) audio through
+# Wav2Lip and need fixing for both pre-rendered bridges and live escalates.
+#
+# 1. Wav2Lip's mel-chunking algorithm computes video frame count as
+#    `int(audio_seconds * fps)` truncated to the last full mel chunk window
+#    (MEL_STEP=16). That always produces a video ~120-180ms shorter than
+#    the audio (a structural artifact, not a bug — same drift on Flash, on
+#    v3, with tags, without tags, every length, every fps). The wav2lip
+#    server then mux's with `-shortest` and silently truncates the audio
+#    tail; the dashboard's duration handshake (LiveStage.jsx, 150ms
+#    threshold) sees the gap and either skips the video entirely (no lip
+#    movement on stage) or accepts it but plays a silent video tail after
+#    the audio cuts.
+#
+# 2. v3 specifically adds ~50-100ms of "intake breath" silence at the head
+#    and ~100-300ms of trailing silence at the end. Wav2Lip generates
+#    mouth shapes for ALL audio frames including silence and produces
+#    semi-random shapes during quiet moments — visible as a mouth-flap on
+#    what should be a still frame at the start/end.
+#
+# pad_wav2lip_video_to_audio() fixes #1 — re-mux the wav2lip output with
+# the FULL original audio + video padded by holding the last frame for the
+# gap. Drift drops from ~140ms to ±20ms; the handshake never fires.
+#
+# trim_audio_silence() fixes #2 — crop head/tail silence from the audio
+# BEFORE sending to wav2lip. Used by the offline bridge render pipeline
+# (scripts/render_generic_clips.py); not used on the live escalate path
+# because trimming changes user-perceived audio character (the broadcast
+# audio_bytes drives KaraokeCaptions and we don't want it to drift from
+# what TTS produced).
+
+def trim_audio_silence(
+    audio_bytes: bytes,
+    *,
+    head_threshold_db: int = -40,
+    head_min_silence: float = 0.03,
+    tail_threshold_db: int = -35,
+    tail_min_silence: float = 0.05,
+) -> bytes:
+    """Trim leading + trailing silence from MP3 bytes via ffmpeg's
+    silenceremove. Internal pauses (commas, ellipses) are preserved —
+    the filter only triggers on a contiguous silent run at the start
+    (and, after a reverse, at the end).
+
+    Thresholds default conservative on the tail (-35dB / 50ms) so faint
+    trailing punctuation (the soft 't' at the end of 'about that') is
+    kept; only pure breath/silence crops."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fi:
+        fi.write(audio_bytes)
+        in_path = fi.name
+    out_path = in_path.replace(".mp3", "_trimmed.mp3")
+    af = (
+        f"silenceremove=start_periods=1:start_silence={head_min_silence}:"
+        f"start_threshold={head_threshold_db}dB:detection=peak,"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_silence={tail_min_silence}:"
+        f"start_threshold={tail_threshold_db}dB:detection=peak,"
+        f"areverse"
+    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-af", af,
+             "-loglevel", "error", out_path],
+            check=True, timeout=15,
+        )
+        result = Path(out_path).read_bytes()
+    finally:
+        Path(in_path).unlink(missing_ok=True)
+        Path(out_path).unlink(missing_ok=True)
+    return result
+
+
+def pad_wav2lip_video_to_audio(
+    video_bytes: bytes,
+    audio_bytes: bytes,
+) -> tuple[bytes, dict]:
+    """Re-mux video so it plays the FULL audio with last frame held for any
+    structural shortfall. Returns (padded_video_bytes, diag_dict).
+
+    diag_dict carries the four numbers callers want for trace logging:
+      - audio_ms          duration of the source audio (the truth)
+      - video_ms_before   duration of the wav2lip output (what we got)
+      - pad_ms            how much we padded (usually ~120-180ms)
+      - video_ms_after    duration of the padded output (≈ audio_ms)
+      - padded            true if pad happened, false if already aligned
+
+    On any ffmpeg / probe failure the function returns the ORIGINAL
+    video_bytes unmodified with diag={"padded": False, "error": "..."}.
+    Padding is a quality bonus, not load-bearing — callers can safely
+    treat it as "best effort": worst case, behavior is identical to
+    the un-patched pipeline (the 150ms drift the user noticed)."""
+    diag: dict = {"padded": False}
+    if not video_bytes or not audio_bytes:
+        diag["error"] = "empty_input"
+        return video_bytes, diag
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        mp4_in = td_path / "in.mp4"
+        mp3_in = td_path / "audio.mp3"
+        mp4_out = td_path / "out.mp4"
+        mp4_in.write_bytes(video_bytes)
+        mp3_in.write_bytes(audio_bytes)
+
+        try:
+            audio_dur = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "default=nw=1:nk=1",
+                 str(mp3_in)], timeout=10,
+            ).strip())
+            video_dur = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v",
+                 "-show_entries", "stream=duration", "-of",
+                 "default=nw=1:nk=1", str(mp4_in)], timeout=10,
+            ).strip())
+        except Exception as e:
+            diag["error"] = f"probe_failed:{type(e).__name__}"
+            return video_bytes, diag
+
+        diag["audio_ms"] = int(audio_dur * 1000)
+        diag["video_ms_before"] = int(video_dur * 1000)
+        pad = max(0.0, audio_dur - video_dur)
+        diag["pad_ms"] = int(pad * 1000)
+
+        if pad < 0.02:
+            # Already within 20ms — handshake won't fire, nothing to do.
+            diag["video_ms_after"] = diag["video_ms_before"]
+            return video_bytes, diag
+
+        # tpad stop_mode=clone freezes the last frame for stop_duration sec.
+        # Re-encoding video here is fine — bridges are 2-5s, live responses
+        # are <8s, and libx264 ultrafast preset chews through it in <500ms
+        # on a modern Mac. The output's audio comes straight from the
+        # ORIGINAL audio_bytes (not the wav2lip-cut version inside mp4_in),
+        # so trailing breath/word-end plays in full.
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(mp4_in), "-i", str(mp3_in),
+                "-filter_complex",
+                f"[0:v]tpad=stop_mode=clone:stop_duration={pad:.3f}[v]",
+                "-map", "[v]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-loglevel", "error", str(mp4_out),
+            ], check=True, timeout=30)
+        except Exception as e:
+            diag["error"] = f"ffmpeg_failed:{type(e).__name__}"
+            return video_bytes, diag
+
+        try:
+            video_dur_after = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v",
+                 "-show_entries", "stream=duration", "-of",
+                 "default=nw=1:nk=1", str(mp4_out)], timeout=10,
+            ).strip())
+            diag["video_ms_after"] = int(video_dur_after * 1000)
+        except Exception:
+            # Non-fatal — pad worked, we just can't measure it.
+            diag["video_ms_after"] = diag["audio_ms"]
+
+        diag["padded"] = True
+        return mp4_out.read_bytes(), diag
+
+
 # ── Synthetic word timings ───────────────────────────────────────────────────
 # Cartesia would give us exact per-word {start, end} for free. We're on
 # ElevenLabs, which doesn't return timings. The synthetic version splits

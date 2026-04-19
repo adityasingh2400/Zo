@@ -245,15 +245,24 @@ export function LiveStage({
 
     ready
       .then(() => {
-        // Duration handshake (REVISIONS §4). When the audio is already
-        // playing through a standalone <audio> element, we want the video
-        // to match the audio length within ~150ms — otherwise we'd see
-        // either a silent video tail or a clipped audio finale. Reject
-        // the late video and let audio finish alone in the mismatch.
+        // Duration handshake (REVISIONS §4 — relaxed to 250ms after
+        // commit 2c98beb's pipeline restructure). Both audio and video
+        // now derive from the SAME audio_bytes (Wav2Lip ingests + muxes
+        // the exact mp3 the standalone <audio> is playing), so genuine
+        // drift is typically 30-80ms. Sources of remaining drift:
+        //   • mp4 container re-encoding rounding (~10ms)
+        //   • 33ms frame-quantization at 30fps
+        //   • silence-trimming variance in the mux step
+        //   • Wav2Lip occasionally padding audio to match exact frame count
+        // 250ms gives ~3x headroom over expected drift while still
+        // catching genuine bugs (e.g. accidentally feeding different audio
+        // bytes to the two paths shows up as 1000ms+ drift). Removing
+        // the handshake entirely is a regression — we silently desync
+        // any time a future code path slips in different audio.
         if (audioFirstMuted && expectedDurationMs && incomingEl.duration) {
           const videoMs = incomingEl.duration * 1000;
           const driftMs = Math.abs(videoMs - expectedDurationMs);
-          if (driftMs > 150) {
+          if (driftMs > 250) {
             console.warn('[LiveStage] audio-first duration drift', {
               videoMs: Math.round(videoMs), expectedDurationMs, driftMs: Math.round(driftMs),
             });

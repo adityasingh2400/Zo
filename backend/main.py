@@ -24,7 +24,7 @@ logger = logging.getLogger("empire")
 from config import (
     BACKEND_HOST, BACKEND_PORT,
     USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO, USE_BACKCHANNEL,
-    USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
+    USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER, USE_LIVE_PAD,
 )
 from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
 from agents.creator import remove_background, generate_3d_model
@@ -47,9 +47,11 @@ from agents.router import _match_product_field  # used by speculative bridge
 
 logger.info(
     "[flags] USE_AUDIO_FIRST=%s USE_KARAOKE=%s USE_PITCH_VEO=%s "
-    "USE_BACKCHANNEL=%s USE_SPECULATIVE_BRIDGE=%s LIPSYNC_PROVIDER=%s",
+    "USE_BACKCHANNEL=%s USE_SPECULATIVE_BRIDGE=%s USE_LIVE_PAD=%s "
+    "LIPSYNC_PROVIDER=%s",
     USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO,
-    USE_BACKCHANNEL, USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
+    USE_BACKCHANNEL, USE_SPECULATIVE_BRIDGE, USE_LIVE_PAD,
+    LIPSYNC_PROVIDER,
 )
 
 # ── State ──────────────────────────────────────────────
@@ -1810,6 +1812,72 @@ async def _render_response_video(
             raise
     lipsync_ms = int((time.time() - t0) * 1000)
     trace.phase("wav2lip_done", ms=lipsync_ms, video_bytes=len(video_bytes))
+
+    # Pad video to match audio duration. Wav2Lip's mel-chunking always
+    # produces video ~120-180ms shorter than audio (MEL_STEP=16 windowing
+    # artifact, structural — same drift on flash, v3, every length, every
+    # fps). The pod's `-shortest` ffmpeg mux truncates the audio tail and
+    # the dashboard's 150ms duration handshake (LiveStage.jsx) sees the
+    # gap → either skips the video (no lip movement on stage) or accepts
+    # it but plays a silent video tail after audio cuts.
+    #
+    # Re-mux locally with the FULL audio + video padded by holding the
+    # last frame for the gap. Drift drops from ~140ms to ±20ms; audio
+    # plays in full; handshake never fires. ~300-500ms cost on top of
+    # the 5-7s warm budget. Falls back to the un-padded video on any
+    # ffmpeg/probe failure (best-effort: worst case = original behavior).
+    #
+    # Disable with USE_LIVE_PAD=0 if a live demo behaves weirdly.
+    if USE_LIVE_PAD and video_bytes:
+        from agents.seller import pad_wav2lip_video_to_audio
+        t_pad = time.time()
+        try:
+            padded_bytes, pad_diag = await asyncio.to_thread(
+                pad_wav2lip_video_to_audio, video_bytes, audio_bytes,
+            )
+            pad_elapsed_ms = int((time.time() - t_pad) * 1000)
+            if pad_diag.get("padded"):
+                trace.phase("video_padded",
+                            ms=pad_elapsed_ms,
+                            audio_ms=pad_diag.get("audio_ms"),
+                            drift_before_ms=(
+                                pad_diag.get("audio_ms", 0)
+                                - pad_diag.get("video_ms_before", 0)
+                            ),
+                            drift_after_ms=(
+                                pad_diag.get("audio_ms", 0)
+                                - pad_diag.get("video_ms_after", 0)
+                            ),
+                            pad_added_ms=pad_diag.get("pad_ms"),
+                            bytes_before=len(video_bytes),
+                            bytes_after=len(padded_bytes))
+                video_bytes = padded_bytes
+            else:
+                # Probe said the video was already aligned within 20ms
+                # (rare on wav2lip — mostly happens if upstream changed
+                # the mux behaviour). Or pad failed; either way, the
+                # original bytes are still serviceable.
+                trace.phase("video_pad_skipped",
+                            ms=pad_elapsed_ms,
+                            reason=pad_diag.get("error", "already_aligned"),
+                            audio_ms=pad_diag.get("audio_ms"),
+                            video_ms=pad_diag.get("video_ms_before"))
+        except Exception as e:
+            # Padding is a quality bonus, not load-bearing. Log + ship the
+            # un-padded video. The dashboard handshake might fire on the
+            # 150ms drift, but that's the pre-USE_LIVE_PAD baseline so
+            # nothing is more broken than it was before this flag existed.
+            pad_elapsed_ms = int((time.time() - t_pad) * 1000)
+            trace.phase("video_pad_failed",
+                        ms=pad_elapsed_ms,
+                        err=type(e).__name__,
+                        msg=str(e)[:80])
+            logger.warning(
+                "[lipsync] pad_wav2lip_video_to_audio raised %s — "
+                "shipping un-padded video (dashboard may skip on drift). "
+                "Set USE_LIVE_PAD=0 to suppress this attempt.", e,
+            )
+
     return video_bytes, headers, lipsync_ms
 
 

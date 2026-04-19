@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from typing import Any
 
 import websockets
@@ -39,18 +40,44 @@ async def _drain_state_sync(ws) -> None:
     await asyncio.wait_for(ws.recv(), timeout=3)
 
 
-async def _collect(ws, *, timeout: float = 8.0) -> list[dict]:
-    """Collect every event for `timeout` seconds, then return."""
+async def _collect(
+    ws,
+    *,
+    timeout: float = 8.0,
+    stop_when: set[str] | None = None,
+) -> list[dict]:
+    """Collect events until `timeout` total seconds elapse OR we see one
+    of `stop_when` event types — whichever comes first. The stop_when
+    early-exit is critical post commit 2c98beb because the Director's
+    idle rotation + motivated-idle observer keep firing events
+    indefinitely, so a "wait for N seconds of silence" termination
+    never trips."""
     out: list[dict] = []
-    try:
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            msg = json.loads(raw)
-            if msg.get("type") == "agent_log":
-                continue
-            out.append(msg)
-    except asyncio.TimeoutError:
-        pass
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+        msg = json.loads(raw)
+        if msg.get("type") == "agent_log":
+            continue
+        out.append(msg)
+        if stop_when and msg.get("type") in stop_when:
+            # Drain a few more events for context (sometimes the duration
+            # handshake info comes on the very next frame).
+            try:
+                while True:
+                    raw2 = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                    m2 = json.loads(raw2)
+                    if m2.get("type") != "agent_log":
+                        out.append(m2)
+            except asyncio.TimeoutError:
+                pass
+            break
     return out
 
 
@@ -71,7 +98,17 @@ async def smoke_audio_first(uri: str) -> bool:
         await ws.send(json.dumps({
             "type": "simulate_comment", "text": "is it real leather",
         }))
-        events = await _collect(ws, timeout=10)
+        # 30s upper bound — post commit 2c98beb the pipeline reorders
+        # Wav2Lip in front of comment_response_audio (audio + video
+        # dispatch together to keep lip-sync working with karaoke). On a
+        # warm pod that's ~5-12s; on a cold/offline pod the
+        # connection-refused fallback can take 5-30s before audio-only
+        # fires. We stop early the moment we see the target event so the
+        # idle-rotation noise doesn't swallow the script.
+        events = await _collect(
+            ws, timeout=30,
+            stop_when={"comment_response_audio", "comment_response_video_failed"},
+        )
 
     audio_evt = _has_event(events, "comment_response_audio")
     if audio_evt:
@@ -94,7 +131,9 @@ async def smoke_pitch(uri: str) -> bool:
             "type": "simulate_comment",
             "text": "sell this for forty dollars to gen z",
         }))
-        events = await _collect(ws, timeout=8)
+        events = await _collect(
+            ws, timeout=10, stop_when={"pitch_audio"},
+        )
 
     decision = _has_event(events, "routing_decision", tool="pitch_product")
     pitch_audio = _has_event(events, "pitch_audio")
@@ -129,7 +168,28 @@ async def smoke_mic_press(uri: str) -> bool:
         await _drain_state_sync(ws)
         await ws.send(json.dumps({"type": "stage_ready"}))
         await ws.send(json.dumps({"type": "mic_pressed", "client_ts": 0}))
-        events = await _collect(ws, timeout=4)
+        # Wait for either the listening_attentive play_clip OR the
+        # voice_state=transcribing — whichever lands first.
+        def _is_target(m):
+            return m.get("type") in {"play_clip", "voice_state"}
+        out = []
+        deadline = time.monotonic() + 5
+        seen_listen = False
+        seen_voice = False
+        while time.monotonic() < deadline and not (seen_listen and seen_voice):
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=deadline - time.monotonic())
+            except asyncio.TimeoutError:
+                break
+            m = json.loads(raw)
+            if m.get("type") == "agent_log":
+                continue
+            out.append(m)
+            if m.get("type") == "play_clip" and m.get("intent") == "listening_attentive":
+                seen_listen = True
+            if m.get("type") == "voice_state" and m.get("state") == "transcribing":
+                seen_voice = True
+        events = out
 
     listen = next(
         (e for e in events

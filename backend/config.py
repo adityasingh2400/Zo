@@ -69,3 +69,19 @@ USE_SPECULATIVE_BRIDGE = _flag("USE_SPECULATIVE_BRIDGE", "1")
 # post-review (REVISIONS §6). Kept as a forward-compat env so post-submission
 # we can wire a second provider without touching call sites.
 LIPSYNC_PROVIDER = os.getenv("LIPSYNC_PROVIDER", "wav2lip").strip().lower()
+
+# Pad live wav2lip output so the video duration matches the audio. Wav2Lip's
+# mel-chunking always produces a video ~120-180ms shorter than the audio
+# (MEL_STEP=16 windowing artifact, structural — same drift on flash, v3,
+# every length, every fps). The pod's `-shortest` ffmpeg mux then truncates
+# the audio tail and the dashboard's 150ms duration handshake (LiveStage.jsx)
+# either skips the video or shows a silent video tail after the audio cuts.
+#
+# When ON (default): re-mux the wav2lip output locally with the FULL audio +
+# video padded by holding the last frame for the gap. Drift drops to ±20ms;
+# audio plays in full; handshake never fires. Cost: +300-500ms ffmpeg re-mux
+# per live escalate (on a 5-7s warm budget).
+#
+# When OFF: original behavior. ~140ms drift, occasional handshake skip on
+# v3 audio. Set USE_LIVE_PAD=0 if pad is interfering with a live demo.
+USE_LIVE_PAD = _flag("USE_LIVE_PAD", "1")

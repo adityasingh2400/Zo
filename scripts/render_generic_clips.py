@@ -49,7 +49,12 @@ sys.path.insert(0, str(BACKEND))
 from dotenv import load_dotenv  # type: ignore
 load_dotenv(ROOT / ".env")
 
-from agents.seller import text_to_speech, render_comment_response_wav2lip  # noqa: E402
+from agents.seller import (  # noqa: E402
+    text_to_speech,
+    render_comment_response_wav2lip,
+    trim_audio_silence,
+    pad_wav2lip_video_to_audio,
+)
 from agents.bridge_clips import BRIDGE_SCRIPTS  # noqa: E402
 from config import POD_SPEAKING_1080P  # noqa: E402
 
@@ -57,125 +62,14 @@ OUT_DIR = BACKEND / "local_answers" / "_generic"
 MANIFEST_PATH = OUT_DIR / "manifest.json"
 
 
-# ── Audio + video alignment helpers ─────────────────────────────────────────
-# Two structural problems showed up when we put v3 audio through Wav2Lip:
-#
-# 1. v3 adds ~50-100ms of "intake breath" silence at the start and ~100-300ms
-#    of trailing silence/breath at the end of every clip. These are real
-#    samples in the audio. Wav2Lip generates mouth shapes for ALL audio
-#    frames, including silence — and on silent frames the mouth predictor
-#    produces semi-random shapes (it wasn't trained for "person not speaking
-#    while making no sound"). The result is a visible mouth-flap on what
-#    should be a still frame at the start/end of every bridge.
-#
-# 2. Wav2Lip's mel-chunking algorithm computes video frame count as
-#    `int(audio_seconds * fps)` truncated to the last full mel chunk window.
-#    That always produces a video ~120-160ms shorter than the audio (a
-#    structural artifact of MEL_STEP=16 windowing). When the wav2lip server
-#    muxes with `-shortest`, that 150ms of audio gets cut at the tail —
-#    which the user perceives as "the audio doesn't match the video"
-#    because the trailing breath/word-end gets clipped.
-#
-# We fix both BEFORE re-rendering by:
-# - trim_audio_silence(): crop head/tail silence from the v3 mp3 so wav2lip
-#   only generates mouth shapes for actual speech frames. Internal pauses
-#   (commas, ellipses) are preserved — only edge silence trims.
-# - pad_video_to_audio(): re-mux the wav2lip output with the FULL trimmed
-#   audio + video padded by holding the last frame for the gap. Output
-#   length matches audio length within ±20ms; nothing gets cut.
-
-def trim_audio_silence(
-    audio_bytes: bytes,
-    *,
-    head_threshold_db: int = -40,
-    head_min_silence: float = 0.03,
-    tail_threshold_db: int = -35,
-    tail_min_silence: float = 0.05,
-) -> bytes:
-    """Trim leading + trailing silence from MP3 bytes via ffmpeg's silenceremove.
-    Internal pauses are preserved — the filter only triggers on a contiguous
-    silent run at the start (and, after a reverse, at the end).
-
-    Thresholds are deliberately conservative on the tail (-35dB, 50ms) so
-    we keep faint trailing punctuation (the soft 't' at the end of 'about
-    that') and only crop pure breath/silence."""
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fi:
-        fi.write(audio_bytes)
-        in_path = fi.name
-    out_path = in_path.replace(".mp3", "_trimmed.mp3")
-    af = (
-        # Trim head silence
-        f"silenceremove=start_periods=1:start_silence={head_min_silence}:"
-        f"start_threshold={head_threshold_db}dB:detection=peak,"
-        # Reverse, trim "head" (which is now the tail), reverse back
-        f"areverse,"
-        f"silenceremove=start_periods=1:start_silence={tail_min_silence}:"
-        f"start_threshold={tail_threshold_db}dB:detection=peak,"
-        f"areverse"
-    )
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", in_path, "-af", af,
-             "-loglevel", "error", out_path],
-            check=True, timeout=15,
-        )
-        result = Path(out_path).read_bytes()
-    finally:
-        Path(in_path).unlink(missing_ok=True)
-        Path(out_path).unlink(missing_ok=True)
-    return result
-
-
+# Local thin wrapper that adapts the new (bytes, diag) return shape from
+# pad_wav2lip_video_to_audio() back to the just-bytes contract render_one
+# expects. The diag dict from seller.py is dropped here because the bridge
+# render loop already prints its own per-clip stats; for the live path in
+# main.py we DO consume the diag dict via trace.phase("video_padded", ...).
 def pad_video_to_audio(mp4_bytes: bytes, audio_bytes: bytes) -> bytes:
-    """Re-mux mp4 with full audio + video padded by holding the last frame
-    so durations match within ±20ms. Without this, wav2lip's `-shortest`
-    mux truncates the audio tail (~150ms structural drift from mel chunking)
-    and the user perceives the audio as "cut off"."""
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        mp4_in = td / "in.mp4"
-        mp3_in = td / "audio.mp3"
-        mp4_out = td / "out.mp4"
-        mp4_in.write_bytes(mp4_bytes)
-        mp3_in.write_bytes(audio_bytes)
-
-        def _probe(p: Path, args: list[str]) -> float:
-            return float(subprocess.check_output(
-                ["ffprobe", "-v", "error", *args, "-show_entries",
-                 "format=duration", "-of", "default=nw=1:nk=1", str(p)],
-                timeout=10,
-            ).strip())
-
-        try:
-            audio_dur = _probe(mp3_in, [])
-            video_dur = float(subprocess.check_output(
-                ["ffprobe", "-v", "error", "-select_streams", "v",
-                 "-show_entries", "stream=duration", "-of",
-                 "default=nw=1:nk=1", str(mp4_in)], timeout=10,
-            ).strip())
-        except Exception:
-            # If probe fails, return the original bytes unmodified rather
-            # than silently producing a broken file.
-            return mp4_bytes
-
-        pad = max(0.0, audio_dur - video_dur)
-        if pad < 0.02:
-            # Already aligned within 20ms; nothing to do.
-            return mp4_bytes
-
-        # tpad stop_mode=clone freezes the last frame for stop_duration sec.
-        # Re-encoding video here is fine — bridges are 2-5s and the pod's
-        # libx264 ultrafast preset chews through it in <300ms.
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(mp4_in), "-i", str(mp3_in),
-            "-filter_complex",
-            f"[0:v]tpad=stop_mode=clone:stop_duration={pad:.3f}[v]",
-            "-map", "[v]", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac",
-            "-loglevel", "error", str(mp4_out),
-        ], check=True, timeout=30)
-        return mp4_out.read_bytes()
+    out, _diag = pad_wav2lip_video_to_audio(mp4_bytes, audio_bytes)
+    return out
 
 
 def _slug(text: str) -> str:

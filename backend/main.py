@@ -1451,6 +1451,14 @@ async def dev_transitions() -> HTMLResponse:
                        width: 100%; height: 100%; object-fit: contain;
                        background: #000; display: block;
                        opacity: 0; }
+  /* Wrapper around ONLY the four <video> elements (siblings of .badges).
+     Carrier for the blur trick — a short CSS filter:blur() pulse during
+     each crossfade destroys the high-frequency facial edges (mouth, eyes,
+     jawline) that betray "two faces overlapping" while the opacity ramp
+     is mid-flight. Filter applied to .stage-videos (not .stage-wrap) so
+     the badges + control overlays stay sharp. will-change keeps the GPU
+     layer ready so the first blur tick doesn't jank. */
+  .stage-videos { position: absolute; inset: 0; will-change: filter; }
   /* In-stage state badges: Tier 0 always shown; Tier 1 only when active.
      Both pulse for 600ms when the state changes so the eye locks onto the
      exact transition frame. Designed to be readable at-a-glance from
@@ -1521,10 +1529,12 @@ async def dev_transitions() -> HTMLResponse:
 </head><body>
 <div class="stage-col">
   <div class="stage-wrap">
-    <video id="t0a" playsinline muted loop></video>
-    <video id="t0b" playsinline muted loop></video>
-    <video id="t1a" playsinline muted></video>
-    <video id="t1b" playsinline muted></video>
+    <div class="stage-videos" id="stage-videos">
+      <video id="t0a" playsinline muted loop></video>
+      <video id="t0b" playsinline muted loop></video>
+      <video id="t1a" playsinline muted></video>
+      <video id="t1b" playsinline muted></video>
+    </div>
     <div class="badges">
       <div class="badge t0" id="badge-t0">
         <span class="tier-tag">TIER 0</span>
@@ -1572,6 +1582,19 @@ async def dev_transitions() -> HTMLResponse:
         –
         <input type="number" id="rot-max" min="1" max="60" step="1" value="18" />
       </span></div>
+    <hr />
+    <div class="row"><span class="k">blur peak (px)</span>
+      <span>
+        <input type="range" id="blur-peak" min="0" max="20" step="0.5" value="8"
+               style="vertical-align: middle; width: 140px;" />
+        <span id="blur-peak-val" class="v" style="display:inline-block; min-width: 30px; text-align: right;">8.0</span>
+      </span></div>
+    <div class="row"><span class="k">blur max (ms)</span>
+      <span>
+        <input type="range" id="blur-max" min="60" max="1000" step="20" value="500"
+               style="vertical-align: middle; width: 140px;" />
+        <span id="blur-max-val" class="v" style="display:inline-block; min-width: 36px; text-align: right;">500</span>
+      </span></div>
   </div>
 
   <div class="panel" style="margin-top:12px">
@@ -1618,6 +1641,20 @@ let interjectionProbability = 0.35;
 let rotMinS = 8, rotMaxS = 18;
 let speed = 2;
 let paused = false;
+// Blur trick — symmetric pulse 0 → peak → 0 of CSS filter:blur() on
+// the .stage-videos wrapper during every crossfade. Destroys high-
+// frequency facial edges (mouth, eyes, jawline) so two faces
+// overlapping at intermediate opacity can't be picked apart by the
+// eye. Curve = sin(t * π) → smooth bell, peak at midpoint.
+//   blurPeakPx = 0   disables the trick (A/B baseline against today's
+//                    pure-opacity behaviour)
+//   blurMaxMs        hard cap so long crossfades (Tier 0 600ms) never
+//                    sit blurred — the pulse ends well before the
+//                    opacity ramp does. Short stab only, just enough
+//                    to hide the seam.
+let blurPeakPx = 8;
+let blurMaxMs  = 500;
+let activeBlurRaf = null;
 
 const els = {
   t0a: document.getElementById('t0a'),
@@ -1673,6 +1710,34 @@ function weightedPick(pool) {
   return pool[pool.length - 1];
 }
 
+// Blur pulse — call at the start of every crossfade. Duration scales
+// with the crossfade itself: Tier 1 in (120ms) → 120ms pulse; Tier 0
+// rotation (600ms) → clipped to blurMaxMs so the blur is OUT well
+// before the opacity ramp finishes. We force a 60ms floor so even
+// the 120ms Tier 1 crossfade gets a perceptible blur arc instead of
+// flickering on/off in two frames. Cancels any in-flight pulse before
+// starting a new one so rapid back-to-back transitions don't stack.
+function blurStage(crossfadeMs) {
+  if (blurPeakPx <= 0) return;
+  const stage = document.getElementById('stage-videos');
+  if (!stage) return;
+  if (activeBlurRaf) cancelAnimationFrame(activeBlurRaf);
+  const dur = Math.max(60, Math.min(crossfadeMs, blurMaxMs));
+  const start = performance.now();
+  function tick(now) {
+    const t = Math.max(0, Math.min(1, (now - start) / dur));
+    const px = blurPeakPx * Math.sin(t * Math.PI);
+    stage.style.filter = px > 0.05 ? `blur(${px.toFixed(2)}px)` : 'none';
+    if (t < 1) {
+      activeBlurRaf = requestAnimationFrame(tick);
+    } else {
+      stage.style.filter = 'none';
+      activeBlurRaf = null;
+    }
+  }
+  activeBlurRaf = requestAnimationFrame(tick);
+}
+
 // Mirror of the LiveStage prepareFirstFrame helper — load the new src,
 // seek to t=0, await the seeked event so the FIRST frame is decoded
 // before the opacity ramp begins. Without this the crossfade can show
@@ -1722,6 +1787,7 @@ async function swapTier0(pick) {
   try {
     await prepareFirstFrame(incoming, pick.url);
     await incoming.play();
+    blurStage(TIER0_CROSSFADE_MS);
     incoming.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
     outgoing.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
     incoming.style.opacity = 1;
@@ -1747,6 +1813,7 @@ async function fireTier1(pick) {
   try {
     await prepareFirstFrame(incoming, pick.url);
     await incoming.play();
+    blurStage(TIER1_CROSSFADE_MS);
     incoming.style.transition = `opacity ${TIER1_CROSSFADE_MS}ms ease`;
     outgoing.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
     incoming.style.opacity = 1;
@@ -1760,6 +1827,7 @@ async function fireTier1(pick) {
     flashBadge(els.badgeT1);
     logEvt('tier1', `tier 1 → ${pick.intent} (crossfade ${TIER1_CROSSFADE_MS}ms; auto fade-out on natural end)`);
     incoming.addEventListener('ended', () => {
+      blurStage(TIER1_FADEOUT_MS);
       incoming.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
       incoming.style.opacity = 0;
       const ended = pick;
@@ -1883,6 +1951,21 @@ document.getElementById('rot-min').addEventListener('change', (e) => {
 });
 document.getElementById('rot-max').addEventListener('change', (e) => {
   rotMaxS = parseInt(e.target.value, 10);
+});
+// Live blur tuning. `input` (not `change`) so dragging the slider
+// updates instantly — pair with btn-skip to fire a transition with
+// each new peak value and dial in the right "tiny" amount visually.
+const blurPeakInput = document.getElementById('blur-peak');
+const blurPeakLabel = document.getElementById('blur-peak-val');
+blurPeakInput.addEventListener('input', (e) => {
+  blurPeakPx = parseFloat(e.target.value);
+  blurPeakLabel.textContent = blurPeakPx.toFixed(1);
+});
+const blurMaxInput = document.getElementById('blur-max');
+const blurMaxLabel = document.getElementById('blur-max-val');
+blurMaxInput.addEventListener('input', (e) => {
+  blurMaxMs = parseInt(e.target.value, 10);
+  blurMaxLabel.textContent = `${blurMaxMs}`;
 });
 
 // Render the editable weight tables

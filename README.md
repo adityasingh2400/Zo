@@ -62,73 +62,167 @@ EMPIRE does **not** generate video in real time. We are not running a diffusion 
 
 The audience perceives liveness. The compute is constant-time clip selection + a lightweight lip-sync overlay. **Gemma is the choreographer.**
 
-### The two-tier stage
+### The three-tier stage — pre-rendered everything, Gemma stitches it live
 
-The dashboard runs two crossfading video layers. Both are always playing pre-rendered MP4s. Nothing on screen is ever generated frame-by-frame at runtime.
-
-```
-TIER 0  ──  always-on looping idle pose          (pre-rendered, muted, never stops)
-            └─ idle_calm / idle_thinking / hair_touch / reading_comments — Veo-rendered library
-
-TIER 1  ──  reactive overlay, crossfaded in       (pre-rendered, with audio)
-            └─ pitch clip (LatentSync, 50s render, played once per product)
-            └─ Q&A response clip (pre-rendered MP4 from the local answer cache)
-            └─ Intent bridge clip (pre-rendered "compliment / question / objection" pose,
-               with fresh TTS audio lip-synced over it)
-            └─ Sip / glance / walk-off interjections (pre-rendered, muted, ambient)
-```
-
-**The "live avatar" is Gemma 4 deciding which pre-rendered clip to crossfade onto Tier 1, and what audio (if any) to lip-sync on top of it.** That's it.
-
-### Where Gemma applies to the stitching — explicitly
-
-This is the apparent loop the judges should see:
+The dashboard composites **three tiers of pre-rendered MP4** onto the screen at all times. None of them are generated frame-by-frame at runtime. Each tier is a different *kind* of pre-rendered content, and **Gemma 4 is the router that decides which tier fires, when, and what audio rides on top of it.**
 
 ```
-VIEWER COMMENT
-  │
-  ▼
-Gemma.classify_comment ──►  type: "compliment"        ──┐
-                            draft_response: "Aww thank │
-                            you, I love that you said  │
-                            that — it took me forever  │  Gemma's classification IS the
-                            to find this leather"       │  routing signal. The router is
-                                                        │  rule-based on TOP of Gemma's
-                                                        │  output (0 ms decision, 100%
-                                                        │  accurate on the test suite).
-Router.decide(...)  ──────────────────────────────────►─┘
-  │
-  ▼
-DIRECTOR.choreograph
-  │
-  ├─ Gemma said "compliment" → pick a clip from the COMPLIMENT bucket of pre-rendered substrates
-  │  (warm-smile + nod gesture, 8s, already on the GPU pod)
-  │
-  ├─ Gemma's draft_response → ElevenLabs TTS (or one of 6 supported languages,
-  │  cached) → ~5s of new audio bytes
-  │
-  ├─ Wav2Lip lip-syncs the new audio ONTO the pre-rendered compliment substrate
-  │  (warm cache: ~1.5–2s on the 5090). The substrate's body language is preserved;
-  │  only the mouth region is regenerated to match the new words.
-  │
-  └─ Director crossfades the lip-synced clip onto Tier 1 over the always-playing
-     Tier 0 idle. After the audio ends, fade Tier 1 back out and the idle returns.
+                ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+                ┃        G E M M A   4   E 4 B           ┃
+                ┃        ─────────────────────           ┃
+                ┃        on-device · ~150 ms / call      ┃
+                ┗━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┛
+                                     │
+                                     │  routes EVERY state
+                                     │  transition on stage
+                                     ▼
+                            ┌─────────────────┐
+                            │    DIRECTOR     │   choreographer FSM
+                            │  (per-process)  │   (backend/agents/
+                            └────────┬────────┘    avatar_director.py)
+                                     │
+        ┌────────────────────────────┼────────────────────────────┐
+        │                            │                            │
+        ▼                            ▼                            ▼
+  ┌───────────┐                ┌───────────┐                ┌───────────┐
+  │  TIER 0   │                │  TIER 1   │                │  TIER 2   │
+  │  ───────  │                │  ───────  │                │  ───────  │
+  │   IDLE    │  ◀── Gemma ──  │  BRIDGE   │  ◀── Gemma ──  │ RESPONSE  │
+  │           │   swaps pose   │           │   picks bucket │           │
+  │ always on │                │ comment-  │                │ the actual│
+  │ silent    │                │ intent    │                │   answer  │
+  │ Veo loop  │                │ substrate │                │           │
+  └─────┬─────┘                └─────┬─────┘                └─────┬─────┘
+        │                            │                            │
+        │ ◀──── crossfade IN ─────── │                            │
+        │                            │                            │
+        │                            │ ◀──── crossfade IN ─────── │
+        │                            │                            │
+        ▼                            ▼                            ▼
+  always painting          plays for ~8 s while         plays once TTS +
+  underneath every-        Gemma's drafted              Wav2Lip finishes;
+  thing else; never        response renders             body language inherits
+  goes black               in the background            from the Tier 1 pose
 ```
 
-If Gemma classifies as `question` AND the comment matches a key in the seller's pre-authored `qa_index`, the router skips the lip-sync round trip entirely and plays a **fully pre-rendered MP4 answer** in **<1 second total**. That MP4 was rendered once, at product onboarding time, and lives on disk forever. **Gemma's job there is to recognize the question well enough to fire the right clip.**
+| Tier | Content | When it fires | Gemma's role |
+|---|---|---|---|
+| **0 — Idle** | Looping muted Veo render of the avatar's resting pose. The safety net — never goes black. | Continuously. Every other tier crossfades on top of this. | Gemma's `voice_state` signal swaps the active idle pose (calm ↔ thinking) when the operator pauses to think. |
+| **1 — Bridge** | 8-second pre-rendered intent substrate matching the comment's emotional register (warm-smile, thoughtful-nod, or "actually here's the deal"). | The moment a comment lands. Crossfades onto Tier 0. | **Gemma's `classify_comment` returns `type` — that field IS the bucket selector.** The Director picks a random clip from the matching bucket. |
+| **2 — Response** | Either a fully pre-rendered Q&A MP4 (when Gemma's intent matches a known question) or a fresh Wav2Lip lip-sync onto the Tier 1 substrate (when Gemma drafts a novel response). | Once TTS + Wav2Lip finishes. Crossfades onto Tier 1. | Gemma's `draft_response` is the audio source. Gemma's `qa_index` match decides whether a fresh render is even needed. |
+
+**The "live AI avatar" is Gemma 4 driving three pre-rendered tiers in sequence.** That's it.
+
+### Gemma 4 is the state router
+
+Every state transition on stage is driven by Gemma 4 output. The crucial point: **a single Gemma forward pass produces multiple outputs that fan out and drive multiple tiers in parallel.** No second LLM call, no stacked inference, no extra latency.
+
+```
+   ┌─────────────────────────────────────────────────────────────────┐
+   │   GEMMA.classify_comment("is it real leather")                  │
+   │   ────────────────────────────────────────────                  │
+   │                                                                 │
+   │   returns ONE JSON object:                                      │
+   │     {                                                           │
+   │       type:           "question",                               │
+   │       draft_response: "Yes, full-grain vegetable-tanned         │
+   │                        leather. See the natural grain?",        │
+   │       latency_ms:     147                                       │
+   │     }                                                           │
+   └─────────────────────────────────┬───────────────────────────────┘
+                                     │
+              ┌──────────────────────┴──────────────────────┐
+              │                                             │
+              ▼                                             ▼
+    TIER 1 BUCKET PICK                            TIER 2 AUDIO + RENDER
+    ──────────────────                            ─────────────────────
+    uses Gemma's `type` field                     uses Gemma's `draft_response`
+    → indexes the matching                        → ElevenLabs TTS streams the
+      intent bucket (compliment /                   text (translated to one of
+      question / objection)                         6 supported languages on
+    → Director picks 1 random                       cache miss)
+      pre-rendered substrate                      → Wav2Lip overlays mouth
+                                                    pixels onto the Tier 1
+                                                    substrate the Director
+                                                    just chose. Body language
+                                                    is inherited; only the
+                                                    mouth region is generated
+                                                    live.
+
+   ┌─────────────────────────────────────────────────────────────────┐
+   │  (concurrent third channel — same Gemma model, different prompt)│
+   │                                                                 │
+   │  GEMMA.parse_voice_intent(seller_audio) ──►  drives TIER 0 pose │
+   │     voice_state = "thinking" for >2 s  →  Tier 0 crossfades to  │
+   │     idle_thinking pose; reverts on next state change.           │
+   └─────────────────────────────────────────────────────────────────┘
+```
+
+### How the bridge state (Tier 1) is routed
+
+This is the part that does the heavy lifting on every comment: **Gemma's `type` field is the entire routing signal.** No rule engine on top, no heuristic, no second classifier. Whatever Gemma says is the bucket the Director draws from.
+
+```
+              ┌─────────────────────────────────────────────────┐
+              │   GEMMA.classify_comment("...")                 │
+              │   ─────────────────────────────                 │
+              │                                                 │
+              │   returns:                                      │
+              │     type           →  "compliment"              │
+              │                    |  "question"                │
+              │                    |  "objection"               │
+              │                    |  "spam"   (block silently) │
+              │     draft_response →  "Yes, full-grain ..."     │
+              │                                                 │
+              └───────────────┬─────────────────────────────────┘
+                              │
+                              │  type IS the bucket key
+                              ▼
+                ┏━━━━━━━━━━━━━╋━━━━━━━━━━━━━┓
+                ┃             ┃             ┃
+                ▼             ▼             ▼
+          ┌───────────┐ ┌───────────┐ ┌───────────┐
+          │COMPLIMENT │ │ QUESTION  │ │ OBJECTION │
+          │───────────│ │───────────│ │───────────│
+          │warm smile │ │thoughtful │ │"actually, │
+          │+ slow nod │ │nod, chin- │ │here's the │
+          │           │ │hold       │ │deal…"     │
+          │           │ │           │ │           │
+          │ 5 clips   │ │ 5 clips   │ │ 5 clips   │
+          └─────┬─────┘ └─────┬─────┘ └─────┬─────┘
+                │             │             │
+                └─────────────┼─────────────┘
+                              │
+                              ▼
+        Director picks 1 random clip from the chosen bucket
+        and crossfades it onto TIER 1 (above the always-
+        painting TIER 0 idle layer).
+
+        Empty bucket / Gemma timeout → default speaking-pose
+        substrate; the Director never goes silent.
+```
+
+The chosen bridge clip plays for ~8 seconds — comfortably long enough for ElevenLabs to TTS Gemma's `draft_response` and for Wav2Lip to lip-sync that audio onto the **same substrate clip the Director just picked**. So when Tier 2 crossfades over Tier 1, the body language is preserved and only the mouth pixels change. The audience reads it as one continuous gesture: thoughtful nod → start speaking → finish speaking → ease back to idle.
+
+### The fast path — Gemma matches the seller's pre-authored Q&A index
+
+If Gemma's `type` is `question` AND the comment matches a key in the seller's `qa_index`, the router **skips Tier 1 entirely and fires Tier 2 directly with a fully pre-rendered MP4** — sub-600 ms total, zero cloud spend, zero render. The MP4 was rendered once at product onboarding by the same Wav2Lip + ElevenLabs pipeline used live; it lives on disk forever. **Gemma's only job here is to recognize the question well enough to fire the right clip.**
+
+This is the path ~90% of comments take in the demo.
 
 ### What's pre-rendered, where, and what it costs
 
-| Asset | Quantity | When rendered | Where it lives | Cost |
+| Tier | Asset | Quantity | Source | Cost |
 |---|---|---|---|---|
-| Idle pose loops (Tier 0) | 5–8 per avatar | Once, via Vertex AI Veo | `/states/idle/*.mp4` | Generated offline |
-| Speaking-pose substrates | 1 per idle pose | Once, paired with each idle | Pod `/workspace/idle_speaking/` | Generated offline |
-| Intent bridge clips (compliment/question/objection) | 3–5 per intent | Once, via Veo | Pod `/workspace/bridges/<intent>/` | Generated offline |
-| Local Q&A answer MP4s | 10–20 per product | Once, at onboarding | `backend/local_answers/<slug>.mp4` | ~4.6 s/clip warm. 10 clips in ~46 s wall-time. ~50 MB on disk per product. |
-| Pitch clip (per product) | 1 per product | Once, via LatentSync 1.6 | Pod render | ~50 s render, played once per stream |
-| Walk-off / sip / glance interjections | A few each | Once, via Veo | `/states/idle/misc_*.mp4` | Generated offline |
+| **0** | Idle pose loops | 5–8 per avatar | Vertex AI Veo (offline) | Generated offline |
+| **0** | Speaking-pose substrates (paired with each idle) | 1 per idle pose | Veo (offline) | Generated offline |
+| **0** | Sip / glance / walk-off ambient interjections | A few each | Veo (offline) | Generated offline |
+| **1** | Intent bridge substrates (compliment / question / objection) | 3–5 per bucket | Veo (offline), uploaded to pod `/workspace/bridges/<intent>/` | Generated offline |
+| **2** | Local Q&A answer MP4s | 10–20 per product | Wav2Lip + ElevenLabs at onboarding | ~4.6 s/clip warm. 10 clips in ~46 s. ~50 MB per product. |
+| **2** | Pitch clip (per product) | 1 per product | LatentSync 1.6 (~50 s render) | Played once per stream |
+| **2** | Live response stitching | On-demand, ~10% of comments | Wav2Lip lip-sync onto Tier 1 substrate (~1.5–2 s warm on the 5090) | Per Gemma-drafted comment that doesn't match `qa_index` |
 
-**At runtime there is no video synthesis.** Wav2Lip is a *lip-region overlay* — it takes a pre-existing video and modifies the mouth pixels to match new audio. It is not generating a face. It is not generating a body. The pose, the lighting, the eyes, the hands — all pre-rendered. Mouth pixels only.
+**At runtime, the only thing being generated is the mouth region of Tier 2 — and only when Gemma can't reuse an existing clip.** Pose, lighting, eyes, hands, hair, body — every other pixel on screen was rendered before the stream started. Wav2Lip is a *lip-region overlay*, not a face generator.
 
 ### Why this matters for what Gemma can do
 
@@ -138,43 +232,85 @@ Live generative video on-device is currently impossible at acceptable quality an
 
 ---
 
-## How a single comment flows — end to end
+## How a single comment flows — three tiers in motion
+
+This is what the audience sees end-to-end. Watch which tier is "live" at each moment — that's the choreography.
+
+### Path A — Gemma matches the seller's pre-authored Q&A index (~90% of comments)
 
 ```
-t=0       Viewer types: "is it real leather"
-t=0.05    FastAPI /api/comment receives it
-t=0.20    Gemma.classify_comment_gemma → {type: "question"}      [on-device, ~150 ms]
-t=0.20    Router checks product.qa_index → MATCH on "is_it_real_leather"
-t=0.20    Router emits {tool: "respond_locally", answer_id: "is_it_real_leather"}
-t=0.20    Director.play_response("/local_answers/wallet_real_leather.mp4")
-t=0.55    Avatar is ON SCREEN speaking the answer.
+   TIME →     0 ms       150 ms      200 ms              600 ms
 
-  Total: < 600 ms. Zero cloud spend. Zero render. The clip was rendered once,
-  at product onboarding, when the seller authored that Q&A entry.
+   TIER 0  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+            idle_calm loop (always painting underneath)
+
+   TIER 1                                  (skipped — fast path)
+
+   TIER 2                          [████████ pre-rendered Q&A MP4 ████████]
+
+              ▲           ▲            ▲                   ▲
+              │           │            │                   │
+              │           │            │                   └─ Avatar speaks
+              │           │            │                      the answer.
+              │           │            │                      Tier 2 plays.
+              │           │            │
+              │           │            └─ Director.play_response()
+              │           │               fires Tier 2 directly.
+              │           │
+              │           └─ Gemma.classify_comment → {type: "question"}.
+              │              Router matches qa_index → respond_locally.
+              │
+              └─ Viewer types "is it real leather"
+
+   Total: < 600 ms.  Zero cloud spend.  Zero render.
+   The MP4 was rendered once, at product onboarding, by the same
+   Wav2Lip + ElevenLabs pipeline used live.
 ```
 
-Compare a comment that doesn't match the local index — Gemma still drives every step, it just stitches a fresh lip-sync onto a pre-rendered intent substrate:
+### Path B — Gemma drafts a novel response, Wav2Lip stitches it onto a Tier 1 substrate (~10% of comments)
 
 ```
-t=0       Viewer: "how does this compare to the Apple Watch"
-t=0.20    Gemma.classify_comment_gemma → {type: "question",
-                                          draft_response: "Different category — this is..."}
-          (Note: ONE Gemma call returns both the routing intent AND the words to speak.)
-t=0.20    Router → escalate_to_cloud (no local Q&A match)
-t=0.20    Director.emit_reading_chat() — Tier 1 swaps to "reading comments" pose, looped
-t=0.50    ElevenLabs TTS on Gemma's draft_response → audio bytes
-t=0.50    Wav2Lip /lipsync_fast: takes a pre-rendered "question" intent substrate
-          (8 s clip, thoughtful-nod pose) + the new audio → returns lip-synced MP4
-t=2.0     Director.play_response(lipsynced_url) — crossfade onto Tier 1
-t=2.0     Audience sees the avatar visibly nodding + speaking the response in
-          intent-coherent body language. Mouth alignment is Wav2Lip-soft, body
-          is Veo-quality.
+   TIME →   0 s     0.2 s     0.5 s              2.0 s              7.0 s
+
+   TIER 0  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+            idle_calm loop (always painting underneath the whole time)
+
+   TIER 1                  [▓▓▓ thoughtful-nod bridge substrate ▓▓▓]
+                             ▲                                    ▲
+                             │                                    │
+                             │                                    fades out as
+                             Gemma's type="question" → Director   Tier 2 fades in
+                             picks bucket, crossfades the
+                             chosen bridge clip onto Tier 0.
+
+   TIER 2                                              [████ Wav2Lip lip-sync ████]
+                                                        ▲
+                                                        │
+                                                        Wav2Lip done (~2 s warm).
+                                                        Audio = Gemma's draft_response
+                                                          via ElevenLabs TTS.
+                                                        Body language = the Tier 1
+                                                          pose, preserved.
+                                                        Mouth pixels = the only
+                                                          thing rendered live.
+
+      ▲       ▲           ▲                          ▲                  ▲
+      │       │           │                          │                  │
+   viewer   Gemma       TTS streams                audience          Tier 2 ends,
+   types    classify    starts; bridge             hears answer      Tier 0 alone
+            returns     visible immediately        speaking +
+            type +                                 gesturing in
+            draft +                                coherent body
+            latency                                language
 ```
 
-The "live AI" effect comes from three things stitched together:
-1. **Gemma's classification picks the right substrate** (warm smile vs. thoughtful nod vs. "actually..." beat).
-2. **Gemma's draft_response is the audio**, with no second LLM call — the same forward pass that classifies *also drafts*.
-3. **Director's two-tier crossfade hides the seam** between idle, reading, and response.
+**The "live AI avatar" the audience perceives is three pre-rendered tiers crossfading in sequence under Gemma's command.**
+
+1. **Tier 0** keeps painting the resting pose, no matter what.
+2. **Tier 1** crossfades in the intent body language Gemma chose, the instant Gemma classifies the comment.
+3. **Tier 2** crossfades over Tier 1 once Gemma's drafted words have been TTS'd and lip-synced.
+
+Three crossfades. One Gemma forward pass. Zero generative video. That's the whole trick.
 
 ---
 

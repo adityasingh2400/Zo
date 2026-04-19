@@ -136,6 +136,11 @@ class Director:
         self._substrate_available: dict[str, bool] = {
             self.DEFAULT_SUBSTRATE_POD_PATH: True,
         }
+        # Motivated idle rotation state (REVISIONS §12). Event-driven
+        # triggers fed by observe(); the random idle_loop is the fallback.
+        self._voice_state: str | None = None
+        self._thinking_task: asyncio.Task | None = None
+        self._last_sip_at: float = 0.0
 
     def current_substrate_pod_path(self) -> str:
         """The Wav2Lip server-side path that matches the visible Tier 0 clip,
@@ -558,6 +563,128 @@ class Director:
             if r <= acc:
                 return c
         return candidates[-1]
+
+    # ── Motivated idle observer (REVISIONS §12) ────────────────────────────
+    # The doc downscoped to two triggers:
+    #   1. comment_complete (>3s audio) → schedule a sip_drink interjection
+    #      AFTER the response finishes (debounced; once per 30s max).
+    #   2. voice_state="thinking" >2s → swap Tier 0 to idle_thinking pose.
+    # Event-listener pattern: broadcast_to_dashboards() calls observe(msg)
+    # so we don't sprinkle notify() calls through main.py.
+    _SIP_INTERJECTION_URL = "/states/idle/misc_sip_drink.mp4"
+    _IDLE_THINKING_URL = "/states/idle/idle_thinking.mp4"
+    _IDLE_THINKING_SUBSTRATE = "/workspace/idle_speaking/idle_thinking_speaking.mp4"
+    _SIP_DEBOUNCE_SEC = 30.0
+    _SIP_AUDIO_FLOOR_MS = 3000   # only fire on responses ≥3s
+    _THINKING_DELAY_SEC = 2.0    # wait this long before flipping to idle_thinking
+
+    async def observe(self, msg: dict) -> None:
+        """Inspect outgoing broadcasts and drive event-triggered idle
+        behaviour. Hooked into broadcast_to_dashboards() so every dashboard
+        message also informs the Director's choreography state machine."""
+        try:
+            mtype = msg.get("type")
+            if mtype == "voice_state":
+                await self._handle_voice_state(msg.get("state"))
+            elif mtype == "comment_response_audio":
+                # Schedule a sip-drink interjection after the response audio
+                # finishes IF it's long enough to "earn" the gesture (a 1s
+                # one-liner doesn't motivate sipping; a 4-5s answer does).
+                dur_ms = int(msg.get("expected_duration_ms") or 0)
+                if dur_ms >= self._SIP_AUDIO_FLOOR_MS:
+                    self._schedule_sip_after(dur_ms + 600)
+            elif mtype == "comment_response_video" and not msg.get("audio_already_playing"):
+                # Legacy serial path — schedule sip after video duration since
+                # there's no audio_already_playing flag carrying duration info.
+                # We use a coarse estimate from total_ms (TTS+render+lipsync).
+                # Conservative floor since total_ms includes render time.
+                resp_text = msg.get("response", "")
+                est_audio_ms = int(max(2500, len(resp_text.split()) * 350))
+                if est_audio_ms >= self._SIP_AUDIO_FLOOR_MS:
+                    self._schedule_sip_after(est_audio_ms + 600)
+            elif mtype == "pitch_audio_end":
+                # Pitch ended — schedule sip 1.5s after fade-to-idle settles
+                # so the avatar reads as "phew, that was a lot, taking a sip".
+                self._schedule_sip_after(2000)
+        except Exception:
+            logger.exception("[director] observe failed (non-fatal)")
+
+    async def _handle_voice_state(self, state: str | None) -> None:
+        """Cancel any pending thinking timer; start a fresh one if entering
+        thinking. If still thinking after _THINKING_DELAY_SEC, swap Tier 0."""
+        prev = self._voice_state
+        self._voice_state = state
+        if state == "thinking" and prev != "thinking":
+            if self._thinking_task and not self._thinking_task.done():
+                self._thinking_task.cancel()
+            self._thinking_task = asyncio.create_task(self._fire_thinking_after_delay())
+        elif state != "thinking" and self._thinking_task:
+            # Left the thinking state before the timer expired — cancel it
+            # so we don't end up swapping idle clips unnecessarily.
+            self._thinking_task.cancel()
+            self._thinking_task = None
+
+    async def _fire_thinking_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(self._THINKING_DELAY_SEC)
+        except asyncio.CancelledError:
+            return
+        if self._voice_state != "thinking":
+            return
+        # Only swap if Tier 0 isn't already on the thinking pose; we don't
+        # want to retrigger the crossfade for no visual change.
+        if self._last_intent.get("tier0") == "idle_thinking":
+            return
+        logger.info("[director] motivated idle: voice_state=thinking >2s → idle_thinking")
+        self._current_substrate_pod_path = self._IDLE_THINKING_SUBSTRATE
+        try:
+            await self.emit(
+                "tier0",
+                "idle_thinking",
+                self._IDLE_THINKING_URL,
+                loop=True,
+                mode="crossfade",
+                emitted_by="motivated_idle.thinking",
+            )
+        except Exception:
+            logger.exception("[director] motivated thinking emit failed")
+
+    def _schedule_sip_after(self, delay_ms: int) -> None:
+        """Schedule a sip-drink Tier 1 interjection delay_ms from now,
+        debounced so we don't queue multiple sips on rapid-fire responses."""
+        now = time.time()
+        if now - self._last_sip_at < self._SIP_DEBOUNCE_SEC:
+            return
+        self._last_sip_at = now  # claim the slot pre-fire to prevent double-schedule
+
+        async def _fire():
+            try:
+                await asyncio.sleep(delay_ms / 1000)
+                # Only sip if Tier 1 is currently idle (Tier 0 painting).
+                # If a new response is in flight we don't want to interrupt.
+                if self._last_intent.get("tier1") not in (
+                    "", "idle_release", "idle_init", "reading_chat",
+                    "judge_object_engage", "listening_attentive", None,
+                ):
+                    # Keep the timestamp but skip the sip; another response
+                    # is on stage.
+                    logger.debug("[director] motivated sip skipped — tier1 active")
+                    return
+                logger.info("[director] motivated idle: sip_drink after %dms", delay_ms)
+                await self.emit(
+                    "tier1",
+                    "misc_sip_drink",
+                    self._SIP_INTERJECTION_URL,
+                    loop=False,
+                    mode="crossfade",
+                    emitted_by="motivated_idle.sip",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[director] motivated sip fire failed")
+
+        asyncio.create_task(_fire())
 
     # ── Replay state for newly connected dashboards ───────────────────────
     def replay_state(self) -> dict[str, dict[str, str]]:

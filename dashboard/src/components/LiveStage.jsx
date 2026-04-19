@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAvatarStream, TIER1_FADEOUT_MS } from '../hooks/useAvatarStream';
+import { KaraokeCaptions } from './KaraokeCaptions';
+import { TranslationChip } from './TranslationChip';
 
 const API_BASE = `http://${window.location.hostname}:8000`;
 
@@ -432,6 +434,21 @@ export function LiveStage({
           ref={audioRef}
           playsInline
           style={{ display: 'none' }}
+        />
+
+        {/* Karaoke captions + translation chip — both driven by audioPlaying.
+            Captions sync to currentTime via rAF; chip primes the audience
+            for "live, captioned" so any audio/visual micro-asynchrony reads
+            as caption-layer behaviour rather than bad lip-sync. */}
+        <KaraokeCaptions
+          audioRef={audioRef}
+          wordTimings={audioPlaying?.payload?.word_timings || null}
+          windowSize={audioPlaying?.kind === 'pitch' ? 9 : 7}
+          visible={!!audioPlaying}
+        />
+        <TranslationChip
+          visible={!!audioPlaying}
+          variant={audioPlaying?.kind === 'pitch' ? 'pitch' : 'live'}
         />
 
         {/* Empty placeholder only shown if Tier 0 has nothing to play */}

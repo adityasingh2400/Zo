@@ -179,6 +179,15 @@ async def broadcast_to_dashboards(msg: dict):
             dashboard_clients.remove(ws)
         except ValueError:
             pass
+    # Director observer (REVISIONS §12) — every outgoing message also feeds
+    # the motivated-idle state machine. Clean event-listener pattern: the
+    # rest of the codebase doesn't need to call director.notify() at every
+    # lifecycle moment, the broadcast wrapper does it for them.
+    if director is not None:
+        try:
+            await director.observe(msg)
+        except Exception:
+            logger.exception("director.observe failed (non-fatal)")
 
 
 # ── App ────────────────────────────────────────────────

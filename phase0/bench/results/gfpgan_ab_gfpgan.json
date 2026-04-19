@@ -1,0 +1,68 @@
+[
+  {
+    "label": "gfpgan_run0",
+    "source": "pitching_silent",
+    "wall_sec": 123.39,
+    "total_sec": 38.716,
+    "predict_sec": 25.021,
+    "enhance_sec": 20.694,
+    "enhancer": "gfpgan",
+    "size_kb": 2476,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/pitching_silent__gfpgan_run0.mp4"
+  },
+  {
+    "label": "gfpgan_run1",
+    "source": "pitching_silent",
+    "wall_sec": 46.47,
+    "total_sec": 29.299,
+    "predict_sec": 26.678,
+    "enhance_sec": 20.825,
+    "enhancer": "gfpgan",
+    "size_kb": 2475,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/pitching_silent__gfpgan_run1.mp4"
+  },
+  {
+    "label": "gfpgan_run0",
+    "source": "pitching_speaking",
+    "wall_sec": 38.42,
+    "total_sec": 30.809,
+    "predict_sec": 28.21,
+    "enhance_sec": 21.904,
+    "enhancer": "gfpgan",
+    "size_kb": 3054,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/pitching_speaking__gfpgan_run0.mp4"
+  },
+  {
+    "label": "gfpgan_run1",
+    "source": "pitching_speaking",
+    "wall_sec": 37.32,
+    "total_sec": 32.119,
+    "predict_sec": 29.454,
+    "enhance_sec": 23.402,
+    "enhancer": "gfpgan",
+    "size_kb": 3042,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/pitching_speaking__gfpgan_run1.mp4"
+  },
+  {
+    "label": "gfpgan_run0",
+    "source": "explaining",
+    "wall_sec": 40.65,
+    "total_sec": 29.181,
+    "predict_sec": 26.516,
+    "enhance_sec": 21.1,
+    "enhancer": "gfpgan",
+    "size_kb": 4232,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/explaining__gfpgan_run0.mp4"
+  },
+  {
+    "label": "gfpgan_run1",
+    "source": "explaining",
+    "wall_sec": 36.71,
+    "total_sec": 28.016,
+    "predict_sec": 25.224,
+    "enhance_sec": 19.046,
+    "enhancer": "gfpgan",
+    "size_kb": 4255,
+    "out": "/Users/aditya/Desktop/ychackathon/phase0/bench/videos/ab/explaining__gfpgan_run1.mp4"
+  }
+]

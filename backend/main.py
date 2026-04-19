@@ -466,23 +466,12 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
     logger.info("=" * 60)
     pipeline_start = time.time()
 
-    # Tier 1 ambient cover for the entire upload→pitch processing window.
-    # 14s of avatar-picks-up-spec-sheet-and-reads-it footage that maps
-    # believably to "AI is reviewing your product" while Gemma + Wav2Lip
-    # do their work. Without this clip the avatar sits in mute Tier 0
-    # idle for 5-15s between upload and pitch start — reads as a frozen
-    # broadcast. dispatch_audio_first_pitch crossfades the pitch over
-    # this clip when ready (auto-cancels the natural-end fade); if the
-    # pipeline runs longer than 14s, the clip ends naturally and Tier 0
-    # resumes underneath until pitch lands. Voice state flips to
-    # `thinking` so the Spin3D rim light + voice pill both reflect the
-    # "AI is processing" moment in lockstep with the visual.
-    if director:
-        try:
-            await director.play_processing()
-            await director.set_voice_state("thinking")
-        except Exception:
-            logger.exception("[pipeline] play_processing emit failed (non-fatal)")
+    # NOTE: upload-bridge (walk_off → processing.mp4 chain) + voice_state
+    # are now fired by the route handler via _play_upload_bridge(), not
+    # here. Calling once at the route layer means the chain fires exactly
+    # once per upload regardless of which pipeline runs (run_sell_pipeline
+    # is also called from run_video_sell_pipeline and we previously got
+    # double walk-offs). See Option A in the avatar-director refactor.
 
     # PHASE 1: Product analysis + pitch script + background removal in parallel.
     #
@@ -839,10 +828,28 @@ async def api_analyze(file: UploadFile = File(...), voice_text: str = Form("sell
     return result
 
 
+async def _play_upload_bridge() -> None:
+    """Fire the upload-bridge cover (walk_off → processing chain) and flip
+    voice-state to 'thinking' so Spin3D rim-light + voice pill move in
+    lockstep with the visual. Bridge ownership lives at the route layer
+    (Option A) — the pipelines no longer emit it, which means the chain
+    fires exactly once per upload regardless of which pipeline runs.
+    Wrapped non-fatal: a Director-broadcast failure should never block
+    the pipeline kickoff."""
+    if not director:
+        return
+    try:
+        await director.play_processing()
+        await director.set_voice_state("thinking")
+    except Exception:
+        logger.exception("[route] play_processing emit failed (non-fatal)")
+
+
 @app.post("/api/sell")
 async def api_sell(file: UploadFile = File(...), voice_text: str = Form("sell this")):
     contents = await file.read()
     frame_b64 = base64.b64encode(contents).decode()
+    await _play_upload_bridge()
     asyncio.ensure_future(run_sell_pipeline(frame_b64, voice_text))
     return {"status": "pipeline_started"}
 
@@ -888,6 +895,12 @@ async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("s
     # first checkmark light up without waiting for intake to start.
     asyncio.ensure_future(_emit_pipeline_step(request_id, "uploaded", "done",
                                                ms=0, detail=f"{len(contents)}B"))
+    # Bridge BEFORE pipeline kickoff so the avatar starts walking off
+    # within ~50 ms of the POST landing — closes the pre-intake dead-air
+    # gap (~3-5 s of Deepgram + frame extract) on top of the existing
+    # in-pipeline coverage. Awaited (not background-scheduled) so the
+    # broadcast actually flushes before the heavy work starts.
+    await _play_upload_bridge()
     asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text,
                                                    request_id=request_id))
     return {"status": "video_pipeline_started", "bytes": len(contents),
@@ -905,25 +918,10 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str,
     logger.info("  voice_text: %s", voice_text[:100])
     logger.info("=" * 60)
 
-    # Fire the "she picks up a spec sheet and reads it" Tier 1 cover IMMEDIATELY
-    # — before intake (Deepgram + frame extraction + carousel build, ~3-5 s)
-    # even starts. Without this the avatar sits in dead idle for 3-5 s after
-    # the operator drops a video, then ANOTHER 5-15 s during Phase 1 Gemma
-    # before the pitch lands. Total dead-air budget was 8-20 s; firing here
-    # closes the 3-5 s pre-intake gap and keeps the audience visually
-    # engaged the entire way to the pitch crossfade.
-    #
-    # Also fires from run_sell_pipeline for the photo upload path
-    # (/api/sell). Calling here twice for video uploads is fine — the
-    # second emit is a no-op crossfade to the same URL (Director.emit
-    # logs it but the dashboard sees identical url + intent and doesn't
-    # re-prepare the video element).
-    if director:
-        try:
-            await director.play_processing()
-            await director.set_voice_state("thinking")
-        except Exception:
-            logger.exception("[video-pipeline] play_processing emit failed (non-fatal)")
+    # NOTE: upload-bridge (walk_off → processing.mp4) is fired by the
+    # /api/sell-video route handler via _play_upload_bridge(), not here.
+    # Single call site = no chain restart on the run_video → run_sell
+    # cascade. See Option A in the avatar-director refactor.
 
     log_event("SYSTEM", "Video received. Starting intake pipeline...")
     await _emit_pipeline_step(request_id, "deepgram", "active")
@@ -1832,8 +1830,28 @@ async def api_respond_to_comment(
     if director:
         bridge_task = asyncio.create_task(director.play_bridge(comment_type))
 
+    # Item 6 — match the pitch path: if active_language is non-English,
+    # translate the response_text first and pass language_code to
+    # ElevenLabs flash_v2_5 (multilingual). The translator caches every
+    # (text_hash, lang) tuple in sqlite so repeat answers are free; only
+    # the first time we ever speak a particular response in a new
+    # language costs one Claude Haiku call. Failure modes (Bedrock error,
+    # unknown lang) fall through to the original English text — see
+    # translator.translate() for the fallback contract.
+    active_lang = pipeline_state.get("active_language", "en")
+    tts_text = response_text
+    if active_lang != "en":
+        try:
+            tts_text = await translator.translate(response_text, active_lang)
+            if tts_text != response_text:
+                log_event("SELLER", f"Response translated to {active_lang} "
+                                    f"({len(response_text)} → {len(tts_text)} chars)")
+        except Exception as e:
+            logger.warning("[lang] response translate failed (%s) — falling back to English", e)
+            tts_text = response_text
+
     t0 = time.time()
-    audio_bytes = await text_to_speech(response_text)
+    audio_bytes = await text_to_speech(tts_text, language_code=active_lang)
     tts_ms = int((time.time() - t0) * 1000)
 
     # Best-effort: collect bridge result without blocking. If the manifest
@@ -2514,7 +2532,7 @@ const T0 = [
 const T1 = [
   { intent: 'misc_sip_drink',       url: '/states/idle/misc_sip_drink.mp4',            weight: 0.40 },
   { intent: 'misc_walk_off_return', url: '/states/idle/misc_walk_off_return.mp4',      weight: 0.20 },
-  { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_speaking.mp4',weight: 0.25 },
+  { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_silent.mp4', weight: 0.25 },
   { intent: 'welcome',              url: '/bridges/welcome/welcome.mp4',               weight: 0.15 },
 ];
 

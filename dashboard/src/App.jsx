@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { TikTokShopOverlay } from './components/TikTokShopOverlay';
 import { StartDemoOverlay } from './components/StartDemoOverlay';
+import { LanguagePicker } from './components/LanguagePicker';
 
 /**
  * App — operator stage at /
@@ -35,6 +36,8 @@ export default function App() {
     liveStage, wsRef, connected,
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     view3d,
+    activeClips,
+    activeLanguage, setActiveLanguage,
   } = useEmpireSocket();
 
   const [dragging, setDragging] = useState(false);
@@ -114,6 +117,15 @@ export default function App() {
           Hint disappears the moment hasUploaded flips. */}
       {!hasUploaded && (
         <div style={styles.emptyHint}>
+          {/* Step 1: pick language. Big tappable tiles so the operator
+              knows ahead of the drop which language the avatar will
+              speak. Backend reads pipeline_state["active_language"] at
+              pitch-time, so picking AFTER drop is fine too — but we
+              surface it first so the demo flow is "pick → drop → speak". */}
+          <LanguagePicker
+            activeLanguage={activeLanguage}
+            onChange={setActiveLanguage}
+          />
           <span style={styles.emptyHintIcon}>📦</span>
           <p style={styles.emptyHintLabel}>Drop a product video to start</p>
           <p style={styles.emptyHintSub}>
@@ -168,6 +180,34 @@ export default function App() {
         </div>
       )}
 
+      {/* Post-upload language chip — stays reachable so the operator can
+          flip languages mid-stream (e.g. switch from English pitch to a
+          Spanish Q&A response if a viewer comments in Spanish). Mounted
+          outside the 9:16 phone silhouette so it doesn't clutter the
+          audience-facing surface. Hidden pre-upload because the full
+          picker is already centered in the empty-state hint. */}
+      {hasUploaded && (
+        <div style={styles.langChipSlot}>
+          <LanguagePicker
+            activeLanguage={activeLanguage}
+            onChange={setActiveLanguage}
+            compact
+          />
+        </div>
+      )}
+
+      {/* Debug HUD — top-left fixed pill showing the active Director clip
+          per layer. Always mounted (even pre-upload) so we can identify
+          idle-rotation clips in real time and catch any bad pool entries
+          (e.g., the misc_glance_aside_speaking.mp4 silent-mouthing bug
+          we just fixed). Tier 0 = always-on idle background, Tier 1 =
+          one-shot interjections / pitch / processing bridge. The intent
+          name lines up with the avatar_director.py library entries. */}
+      <div style={styles.clipHud}>
+        <ClipHudRow label="T0" clip={activeClips?.tier0} />
+        <ClipHudRow label="T1" clip={activeClips?.tier1} />
+      </div>
+
       {/* Tiny connection indicator — bottom-right corner. Only loud when
           DISCONNECTED so the operator knows when to refresh. CONNECTED
           state stays whisper-quiet (no green spam during a stable run). */}
@@ -190,6 +230,31 @@ export default function App() {
   );
 }
 
+// Single row of the debug clip HUD. Renders the layer label (T0/T1),
+// the intent name, and the mp4 basename so we can immediately identify
+// which idle/interjection/bridge clip the Director just emitted. Empty
+// (dimmed) when no clip has played on that layer yet this session.
+function ClipHudRow({ label, clip }) {
+  const isActive = !!clip;
+  const filename = clip?.url ? clip.url.split('/').pop() : null;
+  // Color-code the row when the muted flag and intent semantically
+  // disagree — speaking-named clips ("_speaking") that are emitted
+  // muted are the exact bug class we're hunting. Loud red when caught.
+  const isSilentSpeak = isActive && filename?.includes('_speaking') && clip.muted;
+  return (
+    <div style={{
+      ...styles.clipHudRow,
+      ...(isSilentSpeak ? styles.clipHudRowAlert : null),
+      opacity: isActive ? 1 : 0.35,
+    }}>
+      <span style={styles.clipHudTier}>{label}</span>
+      <span style={styles.clipHudIntent}>{clip?.intent || '—'}</span>
+      <span style={styles.clipHudFile}>{filename || 'idle'}</span>
+      {clip?.muted && <span style={styles.clipHudMuted}>MUTED</span>}
+    </div>
+  );
+}
+
 const styles = {
   root: {
     position: 'fixed', inset: 0,
@@ -197,6 +262,45 @@ const styles = {
     overflow: 'hidden',
     color: '#fafafa',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  },
+  // Debug HUD — top-left, low chrome, monospace so filenames stay
+  // readable. Always visible regardless of hasUploaded.
+  clipHud: {
+    position: 'fixed', top: 14, left: 14, zIndex: 80,
+    display: 'flex', flexDirection: 'column', gap: 4,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    pointerEvents: 'none',
+  },
+  clipHudRow: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    background: 'rgba(15,15,18,0.8)',
+    backdropFilter: 'blur(10px)',
+    border: '1px solid #27272a',
+    borderRadius: 6, padding: '4px 8px',
+    fontSize: 10, lineHeight: 1.2,
+    minWidth: 280,
+  },
+  clipHudRowAlert: {
+    border: '1px solid #ef4444',
+    background: 'rgba(127,29,29,0.65)',
+    boxShadow: '0 0 12px rgba(239,68,68,0.5)',
+  },
+  clipHudTier: {
+    fontWeight: 800, color: '#a1a1aa', letterSpacing: 1,
+    minWidth: 18,
+  },
+  clipHudIntent: {
+    fontWeight: 700, color: '#fafafa',
+    minWidth: 130,
+  },
+  clipHudFile: {
+    color: '#71717a', flex: 1,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  clipHudMuted: {
+    fontWeight: 800, color: '#fbbf24', fontSize: 9,
+    background: 'rgba(146,64,14,0.4)',
+    padding: '1px 4px', borderRadius: 3, letterSpacing: 1,
   },
   // Pre-upload state — centered drop affordance over a black canvas.
   // Intentionally minimal: one icon, one prompt line, one tiny tech-stack
@@ -251,6 +355,13 @@ const styles = {
     display: 'flex', alignItems: 'center', gap: 10,
     boxShadow: '0 4px 20px rgba(22,163,74,0.4)',
     backdropFilter: 'blur(8px)',
+  },
+  // Top-right corner slot for the compact LanguagePicker chip. zIndex
+  // sits above the avatar's TikTok overlay (which uses zIndex up to 60
+  // for the LIVE pill / chat rail) so the popout grid isn't clipped by
+  // any 9:16-internal layer when the operator clicks to expand mid-stream.
+  langChipSlot: {
+    position: 'fixed', top: 14, right: 14, zIndex: 110,
   },
   uploadPingDot: {
     width: 8, height: 8, borderRadius: 4, background: '#fff',

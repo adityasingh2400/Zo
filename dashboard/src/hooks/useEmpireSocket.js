@@ -59,6 +59,20 @@ export function useEmpireSocket() {
   });
   const voiceStateTimerRef = useRef(null);
   const wsRef = useRef(null);
+  // Debug HUD state — last play_clip event observed per layer.
+  // {tier0?: {intent, url, mode, fade_ms, muted, ts}, tier1?: same}.
+  // Mirrors what useAvatarStream consumes for video playback, but kept
+  // separate so a hook-level subscriber can render an overlay without
+  // tapping the player's internal refs. Safe to subscribe twice — both
+  // useEmpireSocket and useAvatarStream listen to the same wsRef and
+  // each handler is a pure read.
+  const [activeClips, setActiveClips] = useState({ tier0: null, tier1: null });
+  // Live target language (ISO code, mirrors backend pipeline_state["active_language"]).
+  // Source of truth is the backend — we seed from GET /api/live/language on
+  // mount and keep it in sync via the `language_changed` WS event broadcast
+  // by POST /api/live/language. The LanguagePicker writes via POST; the
+  // resulting broadcast lands here so multiple open tabs stay coherent.
+  const [activeLanguage, setActiveLanguage] = useState('en');
 
   // Helper: set voice state with a safety auto-clear so a dropped follow-up
   // event can never leave the pill stuck on stage.
@@ -115,6 +129,27 @@ export function useEmpireSocket() {
           break;
         case 'status':
           setStatus(msg.status);
+          break;
+        case 'play_clip':
+          // Director crossfade event. Stash per-layer for the debug HUD.
+          // useAvatarStream is the actual consumer that drives the
+          // <video> elements; this is a parallel read so we can show
+          // which clip is on screen at any moment without poking into
+          // the player's internals.
+          if (msg.layer === 'tier0' || msg.layer === 'tier1') {
+            setActiveClips(prev => ({
+              ...prev,
+              [msg.layer]: {
+                intent: msg.intent,
+                url: msg.url,
+                mode: msg.mode,
+                fade_ms: msg.fade_ms,
+                muted: msg.muted,
+                emitted_by: msg.emitted_by,
+                ts: msg.ts || Date.now(),
+              },
+            }));
+          }
           break;
         case 'tts_audio':
           setLatestAudio({ audio: msg.audio, format: msg.format });
@@ -309,6 +344,12 @@ export function useEmpireSocket() {
             setStatus(msg.on ? 'live' : 'idle');
           }
           break;
+        case 'language_changed':
+          // Server flipped pipeline_state["active_language"] (typically
+          // because some other tab clicked the LanguagePicker). Mirror it
+          // locally so the picker on this tab updates in lockstep.
+          if (msg.lang) setActiveLanguage(msg.lang);
+          break;
         case 'voice_transcript':
           // Fires within ~200ms of push-to-talk release. Drop empty
           // transcripts (no_speech / transcription_failed) — the endpoint
@@ -339,6 +380,32 @@ export function useEmpireSocket() {
     connect();
     return () => wsRef.current?.close();
   }, [connect]);
+
+  // Seed the active language from the backend once on mount. The WS event
+  // (language_changed) handles every subsequent update, so this fetch only
+  // matters for the initial paint — without it the picker would render
+  // 'en' even if the operator had picked a different language in a prior
+  // session that's still cached in pipeline_state.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(
+          `http://${window.location.hostname}:8000/api/live/language`,
+        );
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!cancelled && data?.active_language) {
+          setActiveLanguage(data.active_language);
+        }
+      } catch {
+        // Backend offline / CORS / etc. — keep the default 'en' and let
+        // the user re-pick once the connection comes back; the WS
+        // handler will pick up any later changes.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Derive a coarse live stage from backend status when no explicit stage event
   // has updated us recently.
@@ -380,5 +447,12 @@ export function useEmpireSocket() {
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     sendComment, sendSell,
     wsRef, // exposed so useAvatarStream can attach an extra message listener
+    // Debug HUD surface — last play_clip emit per Director layer.
+    activeClips,
+    // Live-language surface — App reads activeLanguage to drive the
+    // LanguagePicker; setActiveLanguage is the optimistic local writer
+    // (the picker calls it before the WS roundtrip lands so the UI
+    // doesn't stutter).
+    activeLanguage, setActiveLanguage,
   };
 }

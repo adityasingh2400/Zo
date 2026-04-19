@@ -67,6 +67,20 @@ READING_CHAT_HOLD_MS = 3500  # how long the avatar visibly "reads the comment"
 IDLE_ROTATE_MIN_MS = 8_000   # tighter cadence so demo viewer sees variety quickly
 IDLE_ROTATE_MAX_MS = 18_000
 
+# Set of `emitted_by` values that the Director treats as autonomous Tier 1
+# emits — they DO NOT claim the Tier 1 layer (no busy_until update) and are
+# themselves SUPPRESSED while a deliberate Tier 1 owns the layer. Anything
+# not in this set (play_*, dispatch_*, reading_chat, etc.) is considered
+# deliberate and claims Tier 1 for its ttl. Single source of truth so we
+# never miss-categorise an emitter at a call site.
+_IDLE_TIER1_EMITTERS: frozenset[str] = frozenset({
+    "idle_init",            # bootstrap (Tier 0; included for symmetry)
+    "idle_rotate",          # Tier 0 idle rotation
+    "idle_interjection",    # Tier 1 random interjection (sip / glance / walk)
+    "motivated_idle.thinking",  # Tier 0 swap to thinking pose
+    "motivated_idle.sip",   # post-response motivated sip
+})
+
 # Tier 0 = looping idle clips. Each one is symmetric (boomerangable) and
 # meant to play indefinitely under the reactive layer. Director rotates
 # between them every 12-30s.
@@ -116,9 +130,15 @@ TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
 # glance every 12s reads as "she keeps getting distracted by the same
 # thing." One-shot per rotation is the right cadence.
 TIER1_INTERJECTIONS: list[tuple[str, str, float, str]] = [
-    ("misc_sip_drink",       "/states/idle/misc_sip_drink.mp4",            0.45, ""),
-    ("misc_walk_off_return", "/states/idle/misc_walk_off_return.mp4",      0.25, ""),
-    ("misc_glance_aside",    "/states/idle/misc_glance_aside_speaking.mp4",0.30, ""),
+    ("misc_sip_drink",       "/states/idle/misc_sip_drink.mp4",          0.45, ""),
+    ("misc_walk_off_return", "/states/idle/misc_walk_off_return.mp4",    0.25, ""),
+    # Use the EXPLICIT _silent.mp4 variant. The previous URL pointed at
+    # the *_speaking.mp4 file (rendered for Wav2Lip overlay) which has
+    # visible mouth movement; played muted as an idle interjection it
+    # reads as the avatar silently mouthing words — uncanny. The silent
+    # render at veo_silent_idle_renders.py was made specifically for
+    # this idle-rotation context; mouth stays closed.
+    ("misc_glance_aside",    "/states/idle/misc_glance_aside_silent.mp4",0.30, ""),
 ]
 
 # Probability per idle-rotation tick that we play a Tier 1 interjection
@@ -163,6 +183,22 @@ class Director:
         self._voice_state: str | None = None
         self._thinking_task: asyncio.Task | None = None
         self._last_sip_at: float = 0.0
+        # Processing-chain bookkeeping for play_processing's two-clip
+        # narrative (walk_off_return → processing.mp4). Each call increments
+        # the id; the queued processing.mp4 emit checks the id at fire time
+        # to detect supersession (back-to-back upload, pitch arriving early,
+        # etc.) and skip cleanly. dispatch_audio_first_pitch bumps this so
+        # an early pitch cancels the queued bridge tail.
+        self._processing_chain_id: int = 0
+        # Tier 1 busy horizon (monotonic seconds). Set automatically by
+        # emit() whenever a deliberate Tier 1 fires (bridge / pitch /
+        # response / reading_chat / listening_attentive / processing /
+        # fetching), using ttl_ms (or a 60s default for looped clips).
+        # _idle_loop's interjection branch checks this every tick and
+        # skips the random misc_* emit while a deliberate clip owns the
+        # layer — kills the "she glances aside silently DURING the
+        # processing.mp4 readback" overlap class. Cleared by fade_to_idle.
+        self._tier1_busy_until: float = 0.0
 
     def current_substrate_pod_path(self) -> str:
         """The Wav2Lip server-side path that matches the visible Tier 0 clip,
@@ -238,6 +274,29 @@ class Director:
         }
         self._last_intent[layer] = intent
         self._last_url[layer] = url
+        # Tier 1 busy-tracking. Any deliberate Tier 1 emit (anything not
+        # produced by the autonomous idle rotation or the explicit
+        # fade-to-idle release) extends the busy horizon to ttl_ms in the
+        # future (or 60 s for looped pitches that have no natural end and
+        # rely on dispatch_audio_first_pitch's _release task to call
+        # fade_to_idle when audio ends). _idle_loop checks this every
+        # tick and skips the random Tier 1 interjection branch while a
+        # deliberate clip owns the layer — prevents the silent-glance /
+        # sip / walk-off rotation from overlaying pitch / processing /
+        # response renders.
+        if layer == "tier1":
+            if emitted_by in _IDLE_TIER1_EMITTERS:
+                pass  # autonomous emit — don't claim the layer
+            elif emitted_by == "fade_to_idle":
+                # The release sentinel — explicitly clear the horizon so
+                # idle rotation can resume at the very next tick.
+                self._tier1_busy_until = 0.0
+            else:
+                if loop:
+                    busy_for_s = 60.0  # cleared by fade_to_idle
+                else:
+                    busy_for_s = (ttl_ms or expected_duration_ms or 8_000) / 1000
+                self._tier1_busy_until = time.monotonic() + busy_for_s
         logger.info("[director] emit %s/%s -> %s (mode=%s fade=%dms muted=%s dur=%s)",
                     layer, intent, url, mode, fade_ms, muted, expected_duration_ms)
         try:
@@ -287,37 +346,84 @@ class Director:
     async def play_processing(self) -> None:
         """Tier 1 ambient cover for the upload→pitch processing window.
 
-        Plays the ~14 s "she picks up a printed spec sheet, reads it, then
-        sets it down + settles into anchor pose" Veo clip. Maps believably
-        to "the AI is reviewing your product" for the audience while Gemma
-        + rembg + TTS + Wav2Lip churn in the background — bridges the
-        otherwise-dead 5-15 s gap between upload landing and pitch starting.
+        Two-clip narrative chain:
+          1. walk_off_return (8.0 s) — emitted as intent="fetching" so the
+             HUD reads "she went to grab the item the operator just sent."
+             The audience reads the off-screen beat as "AI is fetching the
+             product the operator just dropped." She walks back into frame
+             at the tail.
+          2. processing.mp4 (14.13 s) — chained ~7.7 s after step 1 (300 ms
+             tail overlap so the dashboard crossfade hides the cut). She's
+             back in frame and now picks up a printed spec sheet, reads it,
+             sets it down. Maps to "AI is now reviewing what was just
+             handed to it."
 
-        Crossfade behaviour:
-        - If the pipeline finishes BEFORE the clip ends (~5-13 s typical
-          for cache-warm runs), `dispatch_audio_first_pitch` emits a new
-          Tier 1 (`pitch_veo`) which crossfades over this clip mid-readback
-          — feels like "she finished thinking and started speaking."
-        - If the pipeline finishes AFTER the clip ends (cold Wav2Lip,
-          large product video, etc.), the clip ends naturally and Tier 0
-          idle resumes underneath until the pitch crossfades in. Slight
-          "she put the paper down then thought for a sec" beat — still
-          reads as natural human pacing rather than a frozen avatar.
+        Total bridge ≈ 22 s. Pipeline target is 10-15 s, so the pitch
+        usually crossfades over processing.mp4 mid-readback — feels like
+        "she finished reading and started speaking." If the pipeline
+        outruns the bridge entirely (cold Wav2Lip + large video), the
+        clip ends naturally and Tier 0 idle resumes until the pitch
+        crossfades in.
 
-        End frame is the canonical anchor pose (hands at waist, soft
-        smile, eye contact) so the pitch crossfade lands clean either
-        way — same target pose as the welcome clip + the Wav2Lip
+        Race handling — the queued processing.mp4 emit is gated on
+        `_processing_chain_id`. Bumped by:
+          - back-to-back call to play_processing (second upload before
+            the first finishes) — the older queued tail no-ops out.
+          - dispatch_audio_first_pitch — an early pitch cancels the
+            queued processing tail so the pitch isn't overlaid mid-read.
+
+        End frame of processing.mp4 is the canonical anchor pose (hands
+        at waist, soft smile, eye contact) so the pitch crossfade lands
+        clean — same target pose as the welcome clip + the Wav2Lip
         substrates. No special handoff logic needed.
         """
+        # No debounce needed — the route handler is the sole call site
+        # post-Option-A, so this fires exactly once per upload. Back-to-
+        # back uploads bump the chain_id and the queued processing.mp4
+        # tail of the older chain no-ops out at the supersession check.
+        self._processing_chain_id += 1
+        chain_id = self._processing_chain_id
+
+        # Step 1: walk-off-and-return. Intent label "fetching" surfaces in
+        # the dashboard HUD so it's obvious which narrative beat is on
+        # screen. ttl_ms = 8000 (probed) so the player knows when to
+        # expect the natural end if no follow-up arrives.
         await self.emit(
             "tier1",
-            "processing",
-            "/bridges/processing/processing.mp4",
+            "fetching",
+            "/states/idle/misc_walk_off_return.mp4",
             loop=False,
             mode="crossfade",
-            ttl_ms=14_130,
-            emitted_by="play_processing",
+            ttl_ms=8_000,
+            emitted_by="play_processing_fetch",
         )
+
+        # Step 2: schedule processing.mp4 as the second link. 7.7 s wait
+        # = walk_off duration (8.0) - 300 ms overlap. The 300 ms tail
+        # gives the Tier 1 crossfade enough room to hide the seam between
+        # her stepping back into frame and her picking up the paper.
+        async def _chain_processing(my_id: int) -> None:
+            try:
+                await asyncio.sleep(7.7)
+            except asyncio.CancelledError:
+                return
+            if self._processing_chain_id != my_id:
+                # Superseded by another play_processing call or by a pitch
+                # dispatch. Don't overlay stale content.
+                logger.info("[director] processing chain superseded (id %d → %d), skip",
+                            my_id, self._processing_chain_id)
+                return
+            await self.emit(
+                "tier1",
+                "processing",
+                "/bridges/processing/processing.mp4",
+                loop=False,
+                mode="crossfade",
+                ttl_ms=14_130,
+                emitted_by="play_processing",
+            )
+
+        asyncio.create_task(_chain_processing(chain_id))
 
     async def play_bridge(self, label: str) -> dict[str, Any] | None:
         """Pick a bridge from the runtime LatentSync manifest and emit it.
@@ -393,6 +499,13 @@ class Director:
         event) — useful for telemetry / dashboard chip variants.
         """
         url = video_url or _DEFAULT_PITCH_VIDEO_URL
+
+        # Cancel any pending play_processing tail. Bumping the chain id
+        # makes the queued processing.mp4 emit (still asyncio.sleep'ing in
+        # _chain_processing) no-op when it wakes — prevents the bridge
+        # from overlaying the pitch mid-speech if the pipeline finishes
+        # before the walk_off → processing handoff has happened.
+        self._processing_chain_id += 1
 
         # Tier 1 muted looping pose. Dashboard mutes the video element
         # (audio is owned by the standalone <audio>) and skips the
@@ -542,7 +655,16 @@ class Director:
                 # Tier 1 interjections (sip, walk-off) don't change the
                 # underlying Tier 0 substrate; the Director keeps the active
                 # idle pose paired with the next response.
-                if random.random() < INTERJECTION_PROBABILITY and TIER1_INTERJECTIONS:
+                #
+                # SUPPRESS while a deliberate Tier 1 (bridge / pitch /
+                # response / reading_chat / fetching / processing) is
+                # active — checked via _tier1_busy_until set in emit().
+                # When the deliberate horizon expires, we naturally fall
+                # through to either another Tier 1 interjection on the
+                # next tick or rotate Tier 0 below.
+                if (random.random() < INTERJECTION_PROBABILITY
+                        and TIER1_INTERJECTIONS
+                        and time.monotonic() >= self._tier1_busy_until):
                     pick = self._weighted_pick(TIER1_INTERJECTIONS)
                     if pick:
                         intent, url, _w, _pod = pick
@@ -685,15 +807,15 @@ class Director:
         async def _fire():
             try:
                 await asyncio.sleep(delay_ms / 1000)
-                # Only sip if Tier 1 is currently idle (Tier 0 painting).
-                # If a new response is in flight we don't want to interrupt.
-                if self._last_intent.get("tier1") not in (
-                    "", "idle_release", "idle_init", "reading_chat",
-                    "listening_attentive", None,
-                ):
-                    # Keep the timestamp but skip the sip; another response
-                    # is on stage.
-                    logger.debug("[director] motivated sip skipped — tier1 active")
+                # Skip the sip if a deliberate Tier 1 currently owns the
+                # layer (pitch / response / processing / fetching /
+                # reading_chat / listening). Uses the same busy_until
+                # horizon as _idle_loop's interjection branch — single
+                # mechanism, consistent behaviour. Replaces the older
+                # explicit-intent skip-list which missed the new chain
+                # intents (fetching / processing).
+                if time.monotonic() < self._tier1_busy_until:
+                    logger.debug("[director] motivated sip skipped — tier1 busy")
                     return
                 logger.info("[director] motivated idle: sip_drink after %dms", delay_ms)
                 await self.emit(

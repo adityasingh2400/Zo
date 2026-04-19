@@ -63,25 +63,32 @@ GENERIC_MANIFEST_PATH = GENERIC_DIR / "manifest.json"
 # Tagging rationale (Apr 2026):
 #   These are the ONE bridge tier that's pre-rendered before any demo and
 #   never re-rendered per-product, so they get the eleven_v3 model with
-#   inline audio tags ([curious], [warmly], [pauses], etc.). Tags shape
+#   inline audio tags ([curious], [warmly], [excited], etc.). Tags shape
 #   the prosody of the words that follow them and unlock the gap between
 #   "AI voice reading filler" and "person genuinely reacting in real time."
 #
 #   Conservative tag density on purpose: every tag adds a small risk of
 #   the model mis-interpreting a directive as something to read aloud.
-#   We pick one emotional-shape tag at the front of each line and at most
-#   one delivery beat ([pauses]) inside. Non-verbal sound effects like
-#   [laughs] and [sighs] are deliberately avoided here — they read as a
-#   distinct beat the lipsync substrate can't match because the substrate
-#   video is one continuous "speaking pose" with no laugh / sigh frames.
-#   Save those tags for content where the substrate matches.
+#   We pick one emotional-shape tag at the front of each line.
+#
+#   Tags we deliberately AVOID:
+#   - [pauses] — inserts ~1s of silence in the audio. Wav2Lip generates
+#     ~25 frames of mouth shapes for that silence and they look random
+#     because the model wasn't trained on extended silent gaps. Use "..."
+#     in the text instead — the model interprets it as natural elongation
+#     of the preceding syllable, no actual silent frames.
+#   - [laughs] / [sighs] / [clears throat] — render as discrete non-verbal
+#     beats the substrate video (continuous "speaking pose") can't match.
+#     The mouth forms a laugh shape while the substrate's mouth keeps the
+#     speaking pose, reads as glitch. Save these for content with matching
+#     substrate footage.
 #
 #   Pair this with `model_id="eleven_v3"` when calling text_to_speech in
 #   the render pipeline below. v3 honors the brackets; flash will read
 #   them aloud.
 BRIDGE_SCRIPTS: list[tuple[str, str]] = [
     # questions — show genuine engagement, not a chatbot ack
-    ("question", "[curious] Ooh, great question. [pauses] Let me think about that."),
+    ("question", "[curious] Ooh, great question... let me think about that."),
     ("question", "[warmly] Yeah, that's a good one. Hold on a sec."),
     ("question", "[curious] Mmm, totally fair to ask. One sec..."),
     ("question", "[happily] I love that you asked that — okay, so..."),

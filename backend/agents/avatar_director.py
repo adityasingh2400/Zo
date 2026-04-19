@@ -104,10 +104,15 @@ IDLE_ROTATE_MAX_MS = 18_000
 # the eyes-down or hand-on-hair pose mid-response. Fewer assets to render +
 # upload, identical product behaviour.
 TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
-    ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
-    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
-    ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
-    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.10, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
+    # idle_reading_comments deliberately REMOVED from rotation. It's the
+    # exclusive reading_chat clip on Tier 1 — having it also rotate on Tier 0
+    # made the avatar look like she was reading another comment 5-15s after
+    # a real response, even when no comment had arrived. Keep the
+    # eyes-down-scanning pose semantically reserved for "I am reading the
+    # incoming chat right now" and nothing else.
+    ("idle_calm",       "/states/idle/idle_calm.mp4",       0.75, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
+    ("idle_thinking",   "/states/idle/idle_thinking.mp4",   0.10, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
+    ("misc_hair_touch", "/states/idle/misc_hair_touch.mp4", 0.15, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
 ]
 
 # Tier 1 one-shot interjections. Director picks one occasionally and plays
@@ -248,6 +253,27 @@ class Director:
             logger.exception("[director] broadcast failed")
 
     # ── Convenience ───────────────────────────────────────────────────────
+    async def emit_reading_chat(self) -> None:
+        """Emit the reading_chat Tier 1 clip with NO internal hold. Caller
+        owns the timing — used by run_routed_comment to fire reading visuals
+        within ~50ms of comment arrival, then keep them visible for the
+        natural duration of classify+LLM+TTS+Wav2Lip rendering. The clip
+        loops, so it stays visible until the caller fades it out via
+        fade_to_idle().
+
+        Use this when you want responsive visual feedback without a fixed
+        timer. Use reading_chat() (below) when you want the legacy fixed
+        hold for backwards compatibility (e.g. direct REST hits)."""
+        await self.emit(
+            "tier1",
+            "reading_chat",
+            READING_CHAT_FALLBACK_URL,
+            loop=True,
+            mode="crossfade",
+            ttl_ms=None,
+            emitted_by="emit_reading_chat",
+        )
+
     async def reading_chat(self) -> None:
         """Show the avatar reading the incoming comment. Held briefly before
         the bridge crossfades over it. Uses the polished

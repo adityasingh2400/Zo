@@ -38,25 +38,37 @@ def get_livetalking_url():
 
 
 async def generate_sales_script(product_data: dict, voice_text: str) -> str:
-    """Generate a 30-second sales pitch from product data via Claude on Bedrock."""
+    """Generate a 30-second sales pitch from product data via Claude on Bedrock.
+
+    Tuned for the judge-item demo: the avatar may be handed a wallet, a
+    coffee mug, a Tamagotchi, a backpack, anything. product_data may be
+    sparse (just {name, category} from Gemma vision, no rich materials/
+    pricing/etc.). Pitch must still feel confident + native to a TikTok
+    Shop livestream regardless of what arrived.
+    """
     logger.info("[SCRIPT] Generating sales pitch from product data...")
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 256,
+        "max_tokens": 280,
         "messages": [{
             "role": "user",
-            "content": f"""Write a compelling 30-second sales pitch for this product.
+            "content": f"""You are a top-tier TikTok Shop livestream seller — high-energy, confident, the kind people add to cart from. Write your 25-second pitch for this product.
 
 Product data: {json.dumps(product_data)}
 Seller's instruction: "{voice_text}"
 
-Rules:
-- Reference specific visual details from the product analysis
-- Be enthusiastic but genuine
-- Include 2-3 selling points
-- End with a call to action
-- Keep it under 100 words (for 30 seconds of speech)
-- Write it as spoken dialogue, not a script with stage directions""",
+Voice + structure:
+- Open with a hook in the first sentence (don't start with "Hi" or "Welcome")
+- Reference 2-3 SPECIFIC details from the product data (color, material, size, vibe — whatever Gemma extracted)
+- Include ONE moment of casual personal endorsement ("I literally use this every day", "the second I saw this I needed it", etc.) — sounds human, not scripted
+- End with a soft CTA ("tap the link", "limited stock today", "DM me if you want one")
+- 70-90 words total (~25 seconds spoken)
+- Spoken dialogue ONLY — no stage directions, no "[pause]", no "**bold**", no quote marks around the pitch
+
+If product_data is sparse or generic (e.g. just "{{name: backpack, category: bag}}"):
+- DON'T fabricate specific facts (no fake prices, fake material specs, fake brands)
+- DO lean on universal appeal — design feel, vibe, who'd love it, when you'd use it
+- Ground it in what the user can SEE in the photo (you can describe color, shape, condition)""",
         }],
     })
 
@@ -75,18 +87,49 @@ Rules:
 async def generate_comment_response(
     comment: str, product_data: dict, comment_type: str = "question"
 ) -> str:
-    """Generate a natural response to a viewer comment via Claude on Bedrock."""
+    """Generate a natural response to a viewer comment via Claude on Bedrock.
+
+    Tuned for the judge-item demo: comments arrive about whatever the
+    judge handed up (or about the seller, the stream, anything). product_
+    data may be missing entire fields. Reply must:
+      • Sound spoken, not written (we TTS this immediately)
+      • Hit ≤12 words so it lands in <4 seconds of audio
+      • Never invent specific facts (price, material, dimensions) that
+        aren't in product_data — those become wrong-on-stage moments
+      • Sound confident, not hedgy ("I think", "maybe", "not sure" all banned)
+    """
+    # Render a compact context line so Claude sees what we DO know without
+    # being misled by junk fields. {} => empty product context => seller
+    # answers from a generic livestream-host POV.
+    pd = product_data or {}
+    known_fields = []
+    for k in ("name", "price", "category", "materials", "sizing", "color",
+              "shipping", "returns", "warranty", "target_audience"):
+        v = pd.get(k)
+        if v:
+            known_fields.append(f"  {k}: {v}")
+    known_block = "\n".join(known_fields) if known_fields else "  (no product details — answer in-character as a livestream seller; if the comment asks for a specific spec we don't know, say something honest like 'great question, ping me after the stream and I'll send you the deck')"
+
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 60,
         "messages": [{
             "role": "user",
-            "content": f"""You are an AI sales avatar on a livestream.
-Viewer comment: "{comment}"
-Product: {json.dumps(product_data)[:400]}
+            "content": f"""You are a TikTok Shop livestream seller answering a viewer comment in real time. Reply in ONE short spoken sentence (≤12 words, ≤4 seconds out loud).
 
-Reply in ONE short sentence (max 15 words). Spoken dialogue only.
-No preamble, no stage directions, no hedging like "Great question". Start with the answer.""",
+Viewer comment: "{comment}"
+Comment type: {comment_type}
+
+What you know about the product:
+{known_block}
+
+Rules — non-negotiable:
+- ONE sentence. Spoken dialogue only. No preamble.
+- Do NOT start with "Great question", "Thanks for asking", or any hedge.
+- Do NOT invent specifics (prices, materials, weight, country-of-origin, anything) that aren't in the product context above.
+- Sound confident and warm. Match seller energy — playful is fine, robotic is not.
+- If the comment is a compliment: respond like a seller, not a chatbot ("aww you're so sweet", "literally my favorite too", etc.)
+- If the question genuinely can't be answered from the context: pivot honestly to what you DO know about the item, OR direct them to DM you. Never bluff.""",
         }],
     })
 

@@ -1357,6 +1357,679 @@ async def api_go_live():
     return {"status": "playing", "url": url, "script": script}
 
 
+# ── Dev tooling: bridge-clip preview ──────────────────────────────────────
+# Visit /dev/clips in a browser to scroll through every pre-rendered bridge /
+# compliment / objection / question / intro / neutral clip side-by-side. Used
+# to judge the existing library against the new "bridge = body language
+# substrate underneath the response audio" mental model — current clips are
+# verbal stallers ("hold on a sec"), the new model wants silent body language
+# (gestures + posture) that audio + lip-sync overlays on top.
+#
+# Reads both source dirs at request time so freshly-rendered clips appear on
+# next refresh — no restart needed.
+# ── Dev tooling: Tier 0 + Tier 1 transition simulator ────────────────────
+# Visit /dev/transitions in a browser to watch the same idle-rotation +
+# ambient-interjection loop the live Director runs on stage, but with
+# adjustable speed and a live transition log so visual issues
+# (crossfade artefacts, pose-mismatch pops, audio glitches at swap
+# boundaries, etc.) are easy to spot and reproduce.
+#
+# Implements the same machinery LiveStage uses: 4 stacked <video>
+# elements (Tier 0 A/B ping-pong, Tier 1 A/B ping-pong), prepareFirstFrame
+# seek-to-t=0 before the opacity ramp, weighted random clip selection
+# from the Director's TIER0_LIBRARY + TIER1_INTERJECTIONS tables,
+# 35% chance per rotation tick that a Tier 1 interjection fires instead
+# of a Tier 0 swap.
+@app.get("/dev/transitions", response_class=HTMLResponse)
+async def dev_transitions() -> HTMLResponse:
+    body = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<title>Zo · transition simulator</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #050507; color: #fafafa;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "Segoe UI", Roboto, Inter, Arial, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 360px;
+         gap: 18px; padding: 18px; min-height: 100vh; }
+  .stage-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .stage-wrap { background: #000; border-radius: 14px; overflow: hidden;
+                position: relative; aspect-ratio: 9/16;
+                max-height: calc(100vh - 36px);
+                margin: 0 auto; }
+  .stage-wrap video { position: absolute; inset: 0;
+                       width: 100%; height: 100%; object-fit: contain;
+                       background: #000; display: block;
+                       opacity: 0; }
+  /* In-stage state badges: Tier 0 always shown; Tier 1 only when active.
+     Both pulse for 600ms when the state changes so the eye locks onto the
+     exact transition frame. Designed to be readable at-a-glance from
+     several feet away — same readability target as the live stage. */
+  .badges { position: absolute; top: 14px; left: 14px; right: 14px;
+            display: flex; flex-direction: column; gap: 8px;
+            pointer-events: none; z-index: 100; }
+  .badge { display: inline-flex; align-items: center; gap: 10px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           padding: 8px 14px; border-radius: 8px;
+           background: rgba(9,9,11,0.85); backdrop-filter: blur(8px);
+           border: 1px solid #27272a;
+           transition: border-color 220ms ease, box-shadow 220ms ease,
+                       transform 220ms ease;
+           align-self: flex-start; max-width: 100%; }
+  .badge .tier-tag { font-size: 10px; font-weight: 900;
+                     letter-spacing: 2px; padding: 3px 8px;
+                     border-radius: 4px; color: #09090b; }
+  .badge.t0 .tier-tag { background: #38bdf8; }
+  .badge.t1 .tier-tag { background: #fbbf24; }
+  .badge .state-name { font-size: 16px; font-weight: 800;
+                       letter-spacing: 0.5px; color: #fafafa; }
+  .badge .elapsed { font-size: 10px; color: #71717a; font-weight: 600;
+                    letter-spacing: 1px; }
+  .badge.flash { transform: scale(1.04); }
+  .badge.t0.flash { border-color: #38bdf8;
+                    box-shadow: 0 0 24px rgba(56,189,248,0.55); }
+  .badge.t1.flash { border-color: #fbbf24;
+                    box-shadow: 0 0 24px rgba(251,191,36,0.55); }
+  .badge.hidden { display: none; }
+  .panel { background: #0f0f12; border: 1px solid #27272a;
+           border-radius: 10px; padding: 16px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .panel h2 { font-size: 11px; letter-spacing: 1.5px; margin: 0 0 12px;
+              color: #a78bfa; text-transform: uppercase; font-weight: 800; }
+  .row { display: flex; justify-content: space-between; align-items: baseline;
+         padding: 4px 0; font-size: 12px; gap: 10px; }
+  .row .k { color: #71717a; text-transform: uppercase; letter-spacing: 1px;
+            font-size: 10px; }
+  .row .v { color: #fafafa; font-weight: 700; }
+  .row .v.big { font-size: 16px; color: #22c55e; }
+  .row .v.muted { color: #52525b; }
+  button { background: #27272a; color: #fafafa; border: 1px solid #3f3f46;
+           border-radius: 6px; padding: 6px 12px; font-size: 11px;
+           font-weight: 700; cursor: pointer;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           letter-spacing: 1px; text-transform: uppercase; }
+  button:hover { border-color: #7c3aed; }
+  button.on { background: linear-gradient(135deg,#ec4899,#7c3aed);
+              border-color: transparent; color: #fff; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; }
+  .log { font-size: 11px; color: #d4d4d8; max-height: 280px;
+         overflow-y: auto; line-height: 1.5; }
+  .log .ts { color: #52525b; margin-right: 6px; }
+  .log .lvl-tier0 { color: #38bdf8; }
+  .log .lvl-tier1 { color: #fbbf24; }
+  .log .lvl-skip { color: #52525b; font-style: italic; }
+  .weights { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 12px;
+             font-size: 11px; align-items: center; }
+  .weights label { color: #d4d4d8; }
+  .weights input[type=number] { width: 56px; background: #050507;
+                                  color: #fafafa; border: 1px solid #27272a;
+                                  border-radius: 4px; padding: 3px 6px;
+                                  font-family: inherit; font-size: 11px; }
+  .weights .pct { color: #52525b; min-width: 36px; text-align: right; }
+  hr { border: 0; border-top: 1px solid #18181b; margin: 14px 0; }
+</style>
+</head><body>
+<div class="stage-col">
+  <div class="stage-wrap">
+    <video id="t0a" playsinline muted loop></video>
+    <video id="t0b" playsinline muted loop></video>
+    <video id="t1a" playsinline muted></video>
+    <video id="t1b" playsinline muted></video>
+    <div class="badges">
+      <div class="badge t0" id="badge-t0">
+        <span class="tier-tag">TIER 0</span>
+        <span class="state-name" id="badge-t0-name">—</span>
+        <span class="elapsed" id="badge-t0-elapsed">0.0s</span>
+      </div>
+      <div class="badge t1 hidden" id="badge-t1">
+        <span class="tier-tag">TIER 1</span>
+        <span class="state-name" id="badge-t1-name">—</span>
+        <span class="elapsed" id="badge-t1-elapsed">0.0s</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div>
+  <div class="panel">
+    <h2>now playing</h2>
+    <div class="row"><span class="k">tier 0</span>
+      <span class="v big" id="now-t0">—</span></div>
+    <div class="row"><span class="k">tier 1</span>
+      <span class="v" id="now-t1">(idle)</span></div>
+    <div class="row"><span class="k">next rotation</span>
+      <span class="v" id="next-rot">—</span></div>
+    <hr />
+    <div class="controls">
+      <button id="btn-pause">pause</button>
+      <button id="btn-skip">skip to next rotation</button>
+      <button id="btn-force-t1">force interjection now</button>
+    </div>
+    <hr />
+    <div class="row"><span class="k">speed</span>
+      <span class="controls">
+        <button class="speed" data-mult="1">1×</button>
+        <button class="speed on" data-mult="2">2×</button>
+        <button class="speed" data-mult="5">5×</button>
+        <button class="speed" data-mult="10">10×</button>
+      </span></div>
+    <div class="row"><span class="k">interjection p</span>
+      <span><input type="number" id="prob-input"
+        min="0" max="1" step="0.05" value="0.35" /></span></div>
+    <div class="row"><span class="k">rotation min/max (s)</span>
+      <span>
+        <input type="number" id="rot-min" min="1" max="60" step="1" value="8" />
+        –
+        <input type="number" id="rot-max" min="1" max="60" step="1" value="18" />
+      </span></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>tier 0 weights</h2>
+    <div class="weights" id="t0-weights"></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>tier 1 weights</h2>
+    <div class="weights" id="t1-weights"></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>transition log</h2>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+// Mirrors backend/agents/avatar_director.py constants. Edit there + here
+// in lockstep when the live Director numbers change.
+const TIER0_CROSSFADE_MS = 600;
+const TIER1_CROSSFADE_MS = 120;
+const TIER1_FADEOUT_MS = 500;
+const PREPARE_TIMEOUT_MS = 4000;
+
+// Mirror of TIER0_LIBRARY in avatar_director.py
+const T0 = [
+  { intent: 'idle_calm',       url: '/states/idle/idle_calm.mp4',       weight: 0.75 },
+  { intent: 'idle_thinking',   url: '/states/idle/idle_thinking.mp4',   weight: 0.10 },
+  { intent: 'misc_hair_touch', url: '/states/idle/misc_hair_touch.mp4', weight: 0.15 },
+];
+
+// Mirror of TIER1_INTERJECTIONS + the new welcome (low probability per
+// the new spec). Editable from the right-side controls.
+const T1 = [
+  { intent: 'misc_sip_drink',       url: '/states/idle/misc_sip_drink.mp4',            weight: 0.40 },
+  { intent: 'misc_walk_off_return', url: '/states/idle/misc_walk_off_return.mp4',      weight: 0.20 },
+  { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_speaking.mp4',weight: 0.25 },
+  { intent: 'welcome',              url: '/bridges/welcome/welcome_B.mp4',             weight: 0.15 },
+];
+
+let interjectionProbability = 0.35;
+let rotMinS = 8, rotMaxS = 18;
+let speed = 2;
+let paused = false;
+
+const els = {
+  t0a: document.getElementById('t0a'),
+  t0b: document.getElementById('t0b'),
+  t1a: document.getElementById('t1a'),
+  t1b: document.getElementById('t1b'),
+  nowT0: document.getElementById('now-t0'),
+  nowT1: document.getElementById('now-t1'),
+  nextRot: document.getElementById('next-rot'),
+  badgeT0: document.getElementById('badge-t0'),
+  badgeT0Name: document.getElementById('badge-t0-name'),
+  badgeT0Elapsed: document.getElementById('badge-t0-elapsed'),
+  badgeT1: document.getElementById('badge-t1'),
+  badgeT1Name: document.getElementById('badge-t1-name'),
+  badgeT1Elapsed: document.getElementById('badge-t1-elapsed'),
+  log: document.getElementById('log'),
+};
+
+// Track when each tier last changed so we can show "elapsed on this state"
+// counters and trigger the flash animation right at the swap moment.
+let t0StartedAt = 0;
+let t1StartedAt = 0;
+
+function flashBadge(badgeEl) {
+  badgeEl.classList.add('flash');
+  setTimeout(() => badgeEl.classList.remove('flash'), 600);
+}
+
+let t0ActiveIsA = true;
+let t1ActiveIsA = true;
+let currentT0 = null;
+let currentT1 = null;
+let nextRotationAt = 0;
+let rotationTimer = null;
+
+function logEvt(level, msg) {
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const div = document.createElement('div');
+  div.innerHTML = `<span class="ts">${ts}</span><span class="lvl-${level}">${msg}</span>`;
+  els.log.prepend(div);
+  while (els.log.children.length > 80) {
+    els.log.removeChild(els.log.lastChild);
+  }
+}
+
+function weightedPick(pool) {
+  const total = pool.reduce((s, p) => s + p.weight, 0);
+  let r = Math.random() * total;
+  for (const p of pool) {
+    r -= p.weight;
+    if (r <= 0) return p;
+  }
+  return pool[pool.length - 1];
+}
+
+// Mirror of the LiveStage prepareFirstFrame helper — load the new src,
+// seek to t=0, await the seeked event so the FIRST frame is decoded
+// before the opacity ramp begins. Without this the crossfade can show
+// frames 2-5 of the new clip mid-fade (visible head jump).
+function prepareFirstFrame(el, src) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      el.removeEventListener('seeked', onSeeked);
+      el.removeEventListener('error', onError);
+      clearTimeout(timer);
+    };
+    function onError() { cleanup(); reject(el.error || 'video_error'); }
+    function trySeek() {
+      if (el.currentTime > 0.001) el.currentTime = 0;
+      else Promise.resolve().then(onSeeked);
+    }
+    function onLoadedMeta() {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      trySeek();
+    }
+    function onSeeked() {
+      if (el.readyState >= 2) { cleanup(); resolve(); }
+      else el.addEventListener('canplay', () => { cleanup(); resolve(); }, { once: true });
+    }
+    el.addEventListener('error', onError, { once: true });
+    el.addEventListener('seeked', onSeeked);
+    const timer = setTimeout(() => { cleanup(); reject(new Error('prepare_timeout')); }, PREPARE_TIMEOUT_MS);
+    if (el.src === src && el.readyState >= 2 && el.currentTime <= 0.01) {
+      cleanup(); resolve(); return;
+    }
+    if (el.src !== src) {
+      el.src = src;
+      el.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
+      try { el.load(); } catch {}
+    } else {
+      trySeek();
+    }
+  });
+}
+
+async function swapTier0(pick) {
+  const incoming = t0ActiveIsA ? els.t0b : els.t0a;
+  const outgoing = t0ActiveIsA ? els.t0a : els.t0b;
+  incoming.muted = true;
+  incoming.loop = true;
+  try {
+    await prepareFirstFrame(incoming, pick.url);
+    await incoming.play();
+    incoming.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
+    outgoing.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
+    incoming.style.opacity = 1;
+    outgoing.style.opacity = 0;
+    t0ActiveIsA = !t0ActiveIsA;
+    currentT0 = pick;
+    t0StartedAt = Date.now();
+    els.nowT0.textContent = pick.intent;
+    els.badgeT0Name.textContent = pick.intent;
+    flashBadge(els.badgeT0);
+    setTimeout(() => { try { outgoing.pause(); } catch {} }, TIER0_CROSSFADE_MS + 50);
+    logEvt('tier0', `tier 0 → ${pick.intent} (crossfade ${TIER0_CROSSFADE_MS}ms)`);
+  } catch (e) {
+    logEvt('skip', `tier 0 → ${pick.intent} FAILED: ${e?.message || e}`);
+  }
+}
+
+async function fireTier1(pick) {
+  const incoming = t1ActiveIsA ? els.t1b : els.t1a;
+  const outgoing = t1ActiveIsA ? els.t1a : els.t1b;
+  incoming.muted = true;
+  incoming.loop = false;
+  try {
+    await prepareFirstFrame(incoming, pick.url);
+    await incoming.play();
+    incoming.style.transition = `opacity ${TIER1_CROSSFADE_MS}ms ease`;
+    outgoing.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
+    incoming.style.opacity = 1;
+    if (currentT1) outgoing.style.opacity = 0;
+    t1ActiveIsA = !t1ActiveIsA;
+    currentT1 = pick;
+    t1StartedAt = Date.now();
+    els.nowT1.textContent = pick.intent;
+    els.badgeT1Name.textContent = pick.intent;
+    els.badgeT1.classList.remove('hidden');
+    flashBadge(els.badgeT1);
+    logEvt('tier1', `tier 1 → ${pick.intent} (crossfade ${TIER1_CROSSFADE_MS}ms; auto fade-out on natural end)`);
+    incoming.addEventListener('ended', () => {
+      incoming.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
+      incoming.style.opacity = 0;
+      const ended = pick;
+      currentT1 = null;
+      els.nowT1.textContent = '(idle)';
+      // Hide the Tier 1 badge after the fade-out settles so it disappears
+      // in lockstep with the visual fade — flash Tier 0 to redirect the
+      // eye back to "what's underneath."
+      setTimeout(() => {
+        els.badgeT1.classList.add('hidden');
+        flashBadge(els.badgeT0);
+      }, TIER1_FADEOUT_MS);
+      logEvt('tier1', `tier 1 ← ${ended.intent} ended (fade-out ${TIER1_FADEOUT_MS}ms)`);
+    }, { once: true });
+  } catch (e) {
+    logEvt('skip', `tier 1 → ${pick.intent} FAILED: ${e?.message || e}`);
+  }
+}
+
+function rotationDelay() {
+  const min = rotMinS * 1000, max = rotMaxS * 1000;
+  return Math.round((min + Math.random() * (max - min)) / Math.max(speed, 0.1));
+}
+
+async function rotationTick() {
+  if (paused) { scheduleNext(); return; }
+  // 35% (configurable) chance to fire a tier 1 interjection instead of
+  // swapping tier 0. Mirrors the live Director.
+  if (Math.random() < interjectionProbability && !currentT1) {
+    const pick = weightedPick(T1);
+    await fireTier1(pick);
+  } else {
+    let pick;
+    do { pick = weightedPick(T0); } while (currentT0 && pick.intent === currentT0.intent && T0.length > 1);
+    await swapTier0(pick);
+  }
+  scheduleNext();
+}
+
+function scheduleNext() {
+  if (rotationTimer) clearTimeout(rotationTimer);
+  const ms = rotationDelay();
+  nextRotationAt = Date.now() + ms;
+  rotationTimer = setTimeout(rotationTick, ms);
+}
+
+setInterval(() => {
+  if (!paused) {
+    const remain = Math.max(0, nextRotationAt - Date.now());
+    els.nextRot.textContent = `${(remain / 1000).toFixed(1)}s`;
+  } else {
+    els.nextRot.textContent = '(paused)';
+  }
+  if (currentT0) {
+    els.badgeT0Elapsed.textContent =
+      `${((Date.now() - t0StartedAt) / 1000).toFixed(1)}s`;
+  }
+  if (currentT1) {
+    els.badgeT1Elapsed.textContent =
+      `${((Date.now() - t1StartedAt) / 1000).toFixed(1)}s`;
+  }
+}, 100);
+
+// Controls
+document.querySelectorAll('button.speed').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('button.speed').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    speed = parseFloat(b.dataset.mult);
+    logEvt('skip', `speed → ${speed}×`);
+  });
+});
+document.getElementById('btn-pause').addEventListener('click', (e) => {
+  paused = !paused;
+  e.target.textContent = paused ? 'resume' : 'pause';
+  e.target.classList.toggle('on', paused);
+  logEvt('skip', paused ? 'paused' : 'resumed');
+});
+document.getElementById('btn-skip').addEventListener('click', () => {
+  if (rotationTimer) clearTimeout(rotationTimer);
+  rotationTick();
+});
+document.getElementById('btn-force-t1').addEventListener('click', async () => {
+  if (currentT1) { logEvt('skip', 'force-t1 skipped (already on)'); return; }
+  await fireTier1(weightedPick(T1));
+});
+document.getElementById('prob-input').addEventListener('change', (e) => {
+  interjectionProbability = parseFloat(e.target.value);
+  logEvt('skip', `interjection p → ${interjectionProbability}`);
+});
+document.getElementById('rot-min').addEventListener('change', (e) => {
+  rotMinS = parseInt(e.target.value, 10);
+});
+document.getElementById('rot-max').addEventListener('change', (e) => {
+  rotMaxS = parseInt(e.target.value, 10);
+});
+
+// Render the editable weight tables
+function renderWeights(pool, target) {
+  const total = pool.reduce((s, p) => s + p.weight, 0);
+  target.innerHTML = '';
+  pool.forEach((p, i) => {
+    const lab = document.createElement('label'); lab.textContent = p.intent;
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = 0; inp.max = 1; inp.step = 0.05;
+    inp.value = p.weight.toFixed(2);
+    inp.addEventListener('change', () => {
+      p.weight = parseFloat(inp.value);
+      renderWeights(pool, target);
+    });
+    const pct = document.createElement('span'); pct.className = 'pct';
+    pct.textContent = total > 0 ? `${Math.round(100 * p.weight / total)}%` : '—';
+    target.append(lab, inp, pct);
+  });
+}
+renderWeights(T0, document.getElementById('t0-weights'));
+renderWeights(T1, document.getElementById('t1-weights'));
+
+// Boot — pick a starting tier 0 then start rotating
+(async () => {
+  await swapTier0(weightedPick(T0));
+  scheduleNext();
+})();
+</script>
+</body></html>"""
+    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/dev/clips", response_class=HTMLResponse)
+@app.get("/dev/clips/{intent_filter}", response_class=HTMLResponse)
+async def dev_clips(intent_filter: str | None = None) -> HTMLResponse:
+    """Bridge clip preview gallery.
+
+      /dev/clips                  → all sources, all intents
+      /dev/clips/<intent>         → just the NEW bridges for one intent
+                                     (question | objection | compliment |
+                                      neutral | intro), big tiles, focused
+
+    Used to pick favorites per intent before re-tiering the Director.
+    """
+    import re
+    bridges_root = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
+    bridges_silent_v1 = bridges_root.parent / "bridges_silent_v1"
+    if intent_filter:
+        # Focused per-intent view — only the NEW bridges section, only this
+        # intent. Big tiles for picking favorites.
+        sources = [
+            (f"phase0/bridges · {intent_filter} (Vertex Veo 3.1, talking substrate)",
+             bridges_root, "/bridges", True),
+        ]
+    else:
+        sources = [
+            ("NEW · phase0/bridges (Vertex Veo 3.1, talking substrate — pick favorites per intent)",
+             bridges_root, "/bridges", True),
+            ("phase0 / LatentSync (verbal stallers — to be retired)",
+             CLIPS_DIR, "/clips", False),
+            ("local_answers / _generic (Wav2Lip verbal — to be retired)",
+             LOCAL_ANSWERS_DIR / "_generic", "/local_answers/_generic", False),
+            ("phase0/bridges_silent_v1 (closed-mouth attempt — kept as backup, do not use)",
+             bridges_silent_v1, "/bridges_silent_v1", True),
+        ]
+    # Strip trailing _<hash> from generic filenames so the visible label
+    # reads like "objection_1" instead of "objection_d8528419d0".
+    label_strip = re.compile(r"_[0-9a-f]{6,}$")
+
+    def _categorize(stem: str) -> str:
+        for prefix in ("bridge", "compliment", "objection", "question",
+                       "intro", "neutral", "pitch", "welcome"):
+            if stem.startswith(prefix):
+                return prefix
+        return "other"
+
+    sections_html = []
+    total_clips = 0
+    for src_label, dirpath, url_prefix, recurse in sources:
+        if not dirpath.exists():
+            sections_html.append(
+                f"<section><h2>{src_label}</h2>"
+                f"<p class='empty'>No directory at {dirpath}</p></section>"
+            )
+            continue
+        groups: dict[str, list[tuple[str, str]]] = {}
+        # `recurse=True` for the new bridges dir which is intent-subfoldered;
+        # the legacy dirs have all clips at the top level.
+        files = sorted(dirpath.rglob("*.mp4")) if recurse else sorted(dirpath.glob("*.mp4"))
+        for f in files:
+            stem = f.stem
+            label = label_strip.sub("", stem)
+            cat = _categorize(stem)
+            if intent_filter and cat != intent_filter:
+                continue
+            # Build a URL that mirrors the on-disk relative path so the
+            # /bridges static mount serves the right intent subfolder.
+            rel = f.relative_to(dirpath)
+            url = f"{url_prefix}/{rel.as_posix()}"
+            groups.setdefault(cat, []).append((label, url))
+            total_clips += 1
+        if not groups:
+            sections_html.append(
+                f"<section><h2>{src_label}</h2>"
+                f"<p class='empty'>No .mp4 files found yet — render in progress.</p></section>"
+            )
+            continue
+        cat_html = []
+        for cat in ("question", "objection", "compliment", "bridge",
+                    "neutral", "intro", "pitch", "welcome", "other"):
+            entries = groups.get(cat) or []
+            if not entries:
+                continue
+            tiles = []
+            for label, url in entries:
+                tiles.append(
+                    f'<div class="tile">'
+                    f'<video src="{url}" autoplay loop muted playsinline></video>'
+                    f'<div class="cap">{label}</div>'
+                    f'</div>'
+                )
+            cat_html.append(
+                f'<div class="cat"><h3>{cat} <span class="n">({len(entries)})</span></h3>'
+                f'<div class="grid">{"".join(tiles)}</div></div>'
+            )
+        sections_html.append(
+            f'<section><h2>{src_label}</h2>{"".join(cat_html)}</section>'
+        )
+
+    # Per-intent focused view uses bigger tiles + more spacing so each
+    # clip stands on its own; the all-sources view stays dense.
+    if intent_filter:
+        tile_min, grid_gap = 320, 16
+    else:
+        tile_min, grid_gap = 180, 12
+
+    # `neutral` collapsed into `question` per option-B taxonomy decision;
+    # see phase0/assets/bridges/PICKS.md. The 6 neutral renders were
+    # merged into the question pool as variants G..L.
+    nav_intents = ["question", "objection", "compliment", "intro",
+                   "pitch", "welcome"]
+    nav_html = '<nav class="tabs">'
+    nav_html += (
+        f'<a href="/dev/clips" class="{"active" if not intent_filter else ""}">'
+        f'all</a>'
+    )
+    for it in nav_intents:
+        cls = "active" if intent_filter == it else ""
+        nav_html += f'<a href="/dev/clips/{it}" class="{cls}">{it}</a>'
+    nav_html += '</nav>'
+
+    title_suffix = f" · {intent_filter}" if intent_filter else ""
+
+    body = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<title>Zo · clip preview{title_suffix}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; background: #050507; color: #fafafa;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "Segoe UI", Roboto, Inter, Arial, sans-serif; }}
+  body {{ padding: 24px 32px 64px; }}
+  header {{ display: flex; align-items: baseline; gap: 16px;
+           border-bottom: 1px solid #27272a; padding-bottom: 12px; }}
+  h1 {{ font-size: 22px; font-weight: 800; letter-spacing: 1.5px; margin: 0;
+        background: linear-gradient(135deg,#ec4899,#7c3aed,#3b82f6);
+        -webkit-background-clip: text; background-clip: text;
+        -webkit-text-fill-color: transparent; }}
+  header .count {{ color: #a1a1aa; font-size: 13px;
+                   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  header .hint {{ margin-left: auto; color: #71717a; font-size: 12px;
+                 font-style: italic; }}
+  section {{ margin-top: 32px; }}
+  section > h2 {{ font-size: 13px; font-weight: 800; letter-spacing: 1.5px;
+                 text-transform: uppercase; color: #a78bfa; margin: 0 0 12px;
+                 padding-bottom: 6px; border-bottom: 1px solid #18181b; }}
+  .cat {{ margin: 18px 0 28px; }}
+  .cat h3 {{ font-size: 12px; font-weight: 700; letter-spacing: 1.5px;
+            text-transform: uppercase; color: #fafafa; margin: 0 0 10px; }}
+  .cat h3 .n {{ color: #52525b; font-weight: 500; margin-left: 4px; }}
+  .grid {{ display: grid; gap: {grid_gap}px;
+          grid-template-columns: repeat(auto-fill, minmax({tile_min}px, 1fr)); }}
+  .tile {{ background: #0f0f12; border: 1px solid #18181b;
+           border-radius: 10px; overflow: hidden;
+           transition: border-color 200ms ease, transform 200ms ease; }}
+  .tile:hover {{ border-color: #7c3aed; transform: translateY(-2px); }}
+  .tile video {{ width: 100%; aspect-ratio: 9/16; object-fit: cover;
+                 background: #000; display: block;
+                 max-height: 80vh; }}
+  nav.tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px;
+             padding-bottom: 12px; border-bottom: 1px solid #18181b;
+             position: sticky; top: 0; background: #050507; z-index: 10; }}
+  nav.tabs a {{ display: inline-block; padding: 6px 14px;
+              background: #0f0f12; border: 1px solid #27272a;
+              color: #d4d4d8; text-decoration: none;
+              border-radius: 999px; font-size: 12px; font-weight: 700;
+              letter-spacing: 1px; text-transform: uppercase;
+              transition: border-color 180ms ease, color 180ms ease; }}
+  nav.tabs a:hover {{ border-color: #7c3aed; color: #fafafa; }}
+  nav.tabs a.active {{ background: linear-gradient(135deg,#ec4899,#7c3aed);
+                       color: #fff; border-color: transparent; }}
+  .cap {{ padding: 7px 10px 9px; font-size: 11px; color: #d4d4d8;
+          font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          letter-spacing: 0.2px; word-break: break-all;
+          border-top: 1px solid #18181b; }}
+  .empty {{ color: #52525b; font-style: italic; margin: 8px 0; }}
+</style>
+</head><body>
+<header>
+  <h1>ZO · CLIPS</h1>
+  <span class="count">{total_clips} clips</span>
+  <span class="hint">all autoplay+loop+muted · use the tabs to focus on one
+    intent · pick favorites + tell the agent</span>
+</header>
+{nav_html}
+{"".join(sections_html)}
+</body></html>"""
+    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
+
+
 # ── Lip-sync endpoints (Phase 1 pipeline) ──────────────
 
 from fastapi.staticfiles import StaticFiles
@@ -1369,9 +2042,22 @@ app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
 # All under one /clips URL so the Director and dashboard see one namespace.
 CLIPS_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "clips"
 STATES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "states"
+BRIDGES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+BRIDGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 app.mount("/states", StaticFiles(directory=str(STATES_DIR)), name="states")
+# /bridges serves the new silent body-language Veo library generated by
+# phase0/scripts/veo_bridges_batch.py. Subfoldered by intent so the URL
+# is /bridges/<intent>/<intent>_<variant>.mp4.
+app.mount("/bridges", StaticFiles(directory=str(BRIDGES_DIR)), name="bridges")
+# bridges_silent_v1 — the closed-mouth first attempt (sub-optimal Wav2Lip
+# substrate). Mounted so /dev/clips can show it as a comparison set.
+_BRIDGES_SILENT_V1 = BRIDGES_DIR.parent / "bridges_silent_v1"
+if _BRIDGES_SILENT_V1.exists():
+    app.mount("/bridges_silent_v1",
+              StaticFiles(directory=str(_BRIDGES_SILENT_V1)),
+              name="bridges_silent_v1")
 
 # Pre-rendered local answers — the sub-300ms respond_locally path. Generated
 # offline by scripts/render_local_answers.py; missing files fall back to

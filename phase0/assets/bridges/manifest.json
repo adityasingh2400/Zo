@@ -1,0 +1,16 @@
+{
+  "welcome": [
+    {
+      "variant": "A",
+      "file": "phase0/assets/bridges/welcome/welcome_A.mp4",
+      "url": "/bridges/welcome/welcome_A.mp4",
+      "size_kb": 6999
+    },
+    {
+      "variant": "B",
+      "file": "phase0/assets/bridges/welcome/welcome_B.mp4",
+      "url": "/bridges/welcome/welcome_B.mp4",
+      "size_kb": 8638
+    }
+  ]
+}

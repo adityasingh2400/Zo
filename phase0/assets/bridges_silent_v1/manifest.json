@@ -1,0 +1,16 @@
+{
+  "question": [
+    {
+      "variant": "C",
+      "file": "phase0/assets/bridges/question/question_C.mp4",
+      "url": "/bridges/question/question_C.mp4",
+      "size_kb": 5109
+    },
+    {
+      "variant": "A",
+      "file": "phase0/assets/bridges/question/question_A.mp4",
+      "url": "/bridges/question/question_A.mp4",
+      "size_kb": 4495
+    }
+  ]
+}

@@ -254,43 +254,67 @@ async def analyze_and_script_claude(frame_b64: str, voice_text: str) -> dict:
     details from the image AND 1 specific phrase from the seller's voice.
     """
     logger.info("[CLAUDE] analyze_and_script called (frame: %d chars)", len(frame_b64))
+
+    # Decide structure based on whether the seller actually said anything
+    # meaningful. The judge-item demo will often have voice_text="sell this"
+    # (the default when an item is uploaded with no spoken context). In that
+    # case PROOF can't legitimately quote the seller — we drop that beat
+    # rather than force Claude to fabricate one.
+    voice_clean = (voice_text or "").strip()
+    voice_meaningful = len(voice_clean) > 12 and voice_clean.lower() not in {
+        "sell this", "sell this thing", "sell this product", "sell it"
+    }
+
+    if voice_meaningful:
+        voice_block = f"""SELLER'S VOICE (CONTEXT — trust this for product identity, anything the seller
+explicitly said is true; do NOT contradict them):
+\"\"\"
+{voice_clean}
+\"\"\""""
+        script_beats = """A 25-30 second spoken pitch with FOUR beats: HOOK (1 sentence — get
+attention with a specific visual detail), DEMO (1-2 sentences — name 2 more visual
+details so the audience knows you're really looking at it), PROOF (1-2
+sentences — quote or paraphrase 1 specific phrase from the seller's voice
+above), CTA (1 sentence — call to action with urgency)."""
+    else:
+        # Judge-item / no-voice path: lean entirely on what's visible.
+        voice_block = """SELLER'S VOICE: (none — the seller dropped this in without commentary.
+Do NOT pretend they said anything. Carry the pitch on your own as a
+livestream host who just saw the item for the first time.)"""
+        script_beats = """A 25-30 second spoken pitch with FOUR beats: HOOK (1 sentence — react to a
+specific visual detail like you just saw it: "okay no wait"…, "guys, look at
+this"…), DEMO (1-2 sentences — name 2-3 more visual details: color, material,
+form factor, vibe), VIBE (1-2 sentences — who'd love this and when they'd
+use it, drawn from what you can see), CTA (1 sentence — playful call to
+action with urgency)."""
+
     prompt = f"""You are writing copy for a live e-commerce stream where an AI avatar
 will read the script aloud in real time. Treat this like TikTok Live, not Amazon
 copy — punchy, conversational, second-person.
 
-SELLER'S VOICE (CONTEXT — trust this for product identity, anything the seller
-explicitly said is true; do NOT contradict them):
-\"\"\"
-{voice_text}
-\"\"\"
+{voice_block}
 
-VISUAL: study the product image for color, materials, condition, accessories,
-notable details visible in frame.
+VISUAL: study the product image carefully for color, materials, condition,
+accessories, finish, scale, and any notable details visible in frame.
 
 Return ONLY valid JSON:
 {{
     "product": {{
-        "name": "exact product name (from seller's words + visual confirmation)",
-        "category": "broad category — e.g. watches, sneakers, headphones",
+        "name": "exact product name (use seller's words if given, otherwise infer from visual)",
+        "category": "broad category — e.g. watches, sneakers, headphones, drinkware",
         "materials": ["primary material", "secondary material"],
         "selling_points": ["5 short benefit phrases the script will draw from"],
         "target_audience": "one-line buyer persona",
         "suggested_price_range": "$X - $Y"
     }},
-    "script": "A 30-second spoken pitch with FOUR beats: HOOK (1 sentence — get
-attention), DEMO (1-2 sentences — name 2 specific visual details from the image
-so the audience knows you're really looking at the product), PROOF (1-2
-sentences — quote or paraphrase 1 specific phrase from the seller's voice
-above), CTA (1 sentence — call to action with urgency). No stage directions,
-no '[pause]', no headings — just the spoken words run together as one paragraph.
-Under 90 words total. Conversational, second person ('you'), genuine
-enthusiasm."
+    "script": "{script_beats} No stage directions, no '[pause]', no headings — just the spoken words run together as one paragraph. Under 90 words total. Conversational, second person ('you'), genuine enthusiasm. Do NOT start with 'Hi everyone' or 'Welcome back' — open with the hook."
 }}
 
 HALLUCINATION GUARD: every sentence in the script must be supported by either
 a visual detail YOU CAN SEE in the image or a specific phrase YOU CAN QUOTE
-from the seller's voice. Do not invent features, dimensions, prices, or
-specs that aren't in either source."""
+from the seller's voice. Do not invent features, dimensions, prices, materials,
+specs, or brand names that aren't in either source. If you don't know a detail,
+omit it — don't bluff."""
 
     media_type = "image/jpeg"
     if frame_b64[:4] == "iVBO":

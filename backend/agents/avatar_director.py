@@ -323,16 +323,6 @@ class Director:
             expected_duration_ms=expected_duration_ms,
         )
 
-    async def play_pitch(self, url: str) -> None:
-        await self.emit(
-            "tier1",
-            "pitch",
-            url,
-            loop=True,
-            mode="crossfade",
-            emitted_by="play_pitch",
-        )
-
     # ── Pitch dispatch (audio-first, ephemeral) ────────────────────────────
     # The opening 30s of the demo. Driven exclusively by the video-upload
     # pipeline (run_sell_pipeline → _run_audio_first_pitch in main.py).
@@ -486,51 +476,6 @@ class Director:
             await self._broadcast(msg)
         except Exception:
             logger.exception("[director] voice_state broadcast failed")
-
-    # ── Judge-object opener ───────────────────────────────────────────────
-    # Demo script beat 0:30-1:15: judge holds up an object, user says "sell
-    # this for $X targeting Y." We want the avatar to react INSTANTLY (before
-    # the LLM/TTS/render finishes) so the audience feels the responsiveness.
-    #
-    # This pre-warms the visual pipeline: snap to the most engaged idle
-    # (idle_reading_comments_speaking substrate), play a "I'm thinking"
-    # bridge clip, and broadcast the voice_state so the carousel rim light
-    # flares. Total cost: one bridge clip render time (already pre-rendered)
-    # plus the WS roundtrip. Subjectively feels like 0ms.
-    async def play_judge_object_opener(self, label: str | None = None) -> None:
-        """Snap to a thinking-attentive idle, play a generic acknowledgement
-        bridge clip, and signal voice 'thinking' state. Use this at the
-        moment the demo mic is pressed."""
-        # 1. Force the substrate to the engaged-attentive variant so the next
-        #    Wav2Lip render inherits the right body language.
-        engaged_substrate = "/workspace/idle_speaking/idle_reading_comments_speaking.mp4"
-        self._current_substrate_pod_path = engaged_substrate
-
-        # 2. Show the "reading" idle on tier 1 so the audience sees the
-        #    avatar visibly engage with the held-up object.
-        await self.emit(
-            "tier1",
-            "judge_object_engage",
-            READING_CHAT_FALLBACK_URL,
-            loop=True,
-            mode="crossfade",
-            ttl_ms=2200,
-            emitted_by="judge_object_opener",
-        )
-
-        # 3. Light the carousel rim — the spin reacts in 350ms.
-        await self.set_voice_state("thinking")
-
-        # 4. Optional bridge clip — "let me check that out" — fills audio
-        #    while the real pitch renders. Picks from the "neutral" or
-        #    "question" pool depending on what's available.
-        try:
-            await self.play_bridge("neutral")
-        except Exception:
-            logger.debug("[director] judge_object_opener: no bridge available, skipping")
-
-        if label:
-            logger.info("[director] judge_object_opener fired for label=%s", label)
 
     # ── Tier 0 idle rotation ──────────────────────────────────────────────
     def start_idle_rotation(self) -> None:
@@ -708,7 +653,7 @@ class Director:
                 # If a new response is in flight we don't want to interrupt.
                 if self._last_intent.get("tier1") not in (
                     "", "idle_release", "idle_init", "reading_chat",
-                    "judge_object_engage", "listening_attentive", None,
+                    "listening_attentive", None,
                 ):
                     # Keep the timestamp but skip the sip; another response
                     # is on stage.

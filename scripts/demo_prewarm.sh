@@ -10,9 +10,18 @@
 # Usage:
 #   ./scripts/demo_prewarm.sh                # local-only checks (~3s)
 #   ./scripts/demo_prewarm.sh --with-cloud   # also fire a synthetic novel
-#                                            # comment to warm Wav2Lip
+#                                            # comment via the SYNCHRONOUS
+#                                            # cloud-escalate endpoint —
+#                                            # exercises Bedrock + ElevenLabs
+#                                            # + the synthetic
+#                                            # comment_response_video
+#                                            # contract end-to-end
 #                                            # (costs ~$0.00035, takes
 #                                            # ~5-10s warm, ~30s cold)
+#   ./scripts/demo_prewarm.sh --clean        # prune stale renders +
+#                                            # response_audio files (no
+#                                            # backend calls). Idempotent;
+#                                            # safe to run anytime.
 #
 # Env overrides:
 #   BACKEND_URL  default http://localhost:8000
@@ -22,7 +31,14 @@ cd "$(dirname "$0")/.."
 
 BACKEND_URL="${BACKEND_URL:-http://localhost:8000}"
 WITH_CLOUD=""
-[ "${1:-}" = "--with-cloud" ] && WITH_CLOUD=1
+CLEAN_ONLY=""
+for arg in "$@"; do
+  case "$arg" in
+    --with-cloud) WITH_CLOUD=1 ;;
+    --clean)      CLEAN_ONLY=1 ;;
+    *) printf '\033[31mUnknown flag: %s\033[0m\n' "$arg"; exit 1 ;;
+  esac
+done
 
 PASS=0
 FAIL=0
@@ -42,6 +58,40 @@ warn() { results+=("${YELLOW}!${RESET} $1"); WARN=$((WARN+1)); }
 
 t0=$(date +%s)
 
+# ── --clean fast path: prune stale state, then exit. No backend needed. ─────
+# Mirrors what the operator should do post-rehearsal: drop the build-up
+# of resp_*.mp4 + response_audio/*.mp3 from prior runs (gitignored, but
+# eats disk and clutters log/render dirs). Safe to run anytime.
+if [ -n "$CLEAN_ONLY" ]; then
+  printf "${BOLD}Pruning stale demo artifacts...${RESET}\n"
+  pruned=0
+
+  if [ -d backend/renders ]; then
+    n=$(find backend/renders -maxdepth 1 -name 'resp_*.mp4' -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${n:-0}" -gt 0 ]; then
+      find backend/renders -maxdepth 1 -name 'resp_*.mp4' -type f -delete
+      printf "  ${GREEN}✓${RESET} pruned %d resp_*.mp4 from backend/renders/\n" "$n"
+      pruned=$((pruned+n))
+    else
+      printf "  ${GREEN}✓${RESET} backend/renders/ already clean (no resp_*.mp4)\n"
+    fi
+  fi
+
+  if [ -d backend/response_audio ]; then
+    n=$(find backend/response_audio -maxdepth 1 -name 'resp_*.mp3' -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${n:-0}" -gt 0 ]; then
+      find backend/response_audio -maxdepth 1 -name 'resp_*.mp3' -type f -delete
+      printf "  ${GREEN}✓${RESET} pruned %d resp_*.mp3 from backend/response_audio/\n" "$n"
+      pruned=$((pruned+n))
+    else
+      printf "  ${GREEN}✓${RESET} backend/response_audio/ already clean (no resp_*.mp3)\n"
+    fi
+  fi
+
+  printf "\n${BOLD}Total pruned: %d files${RESET}\n" "$pruned"
+  exit 0
+fi
+
 # 1. Backend reachable + responsive.
 if state=$(curl -fsS "$BACKEND_URL/api/state" --max-time 3 2>/dev/null); then
   ok "backend reachable at $BACKEND_URL"
@@ -50,7 +100,25 @@ else
   state=""
 fi
 
-# 2. Active product loaded — router needs product.qa_index for respond_locally.
+# 2a. products.json is empty — judge-item demo invariant. A pre-loaded
+#     product would (a) show its name in the BUY card BEFORE the judge's
+#     item gets analyzed and (b) make respond_locally fire wrong
+#     pre-rendered answers for any comment that keyword-matches the old
+#     product. Both are demo-killers.
+products_json="backend/data/products.json"
+if [ -f "$products_json" ]; then
+  if python3 -c "import json,sys; d=json.load(open('$products_json')); sys.exit(0 if d=={} else 1)" 2>/dev/null; then
+    ok "products.json is empty (judge-item demo invariant)"
+  else
+    pcount=$(python3 -c "import json; print(len(json.load(open('$products_json'))))" 2>/dev/null)
+    fail "products.json has $pcount product(s) — empty it for judge-item demo: echo '{}' > $products_json"
+  fi
+else
+  warn "products.json missing — create with: echo '{}' > $products_json"
+fi
+
+# 2b. Active product loaded — only matters if we INTENDED to ship with a
+#     product (e.g. wallet demo). For judge-item, this MUST be empty.
 if [ -n "$state" ]; then
   pname=$(printf '%s' "$state" \
     | python3 -c 'import sys,json
@@ -59,9 +127,9 @@ try:
     print(pd.get("name") or "")
 except Exception: pass' 2>/dev/null)
   if [ -n "$pname" ]; then
-    ok "active product loaded: \"$pname\""
+    warn "pipeline_state.product_data is populated: \"$pname\" — fine if intentional, but BUY card will show this name pre-analysis"
   else
-    warn "no active product_data — set ACTIVE_PRODUCT_ID or POST /api/sell first (router will cloud-escalate everything)"
+    ok "pipeline_state.product_data is empty (judge-item ready — populates dynamically when judge's item arrives)"
   fi
 fi
 
@@ -80,7 +148,9 @@ except Exception: print(0)' 2>/dev/null)
   fi
 fi
 
-# 4. Pre-rendered local answers + warm the file cache by HEAD'ing 3.
+# 4a. Pre-rendered local answers (per-product qa_index responses).
+#     For judge-item demos these will be 0 by design — every comment
+#     cloud-escalates because we don't pre-know the product.
 local_count=$(ls backend/local_answers/*.mp4 2>/dev/null | wc -l | tr -d ' ')
 if [ "${local_count:-0}" -gt 0 ]; then
   ok "local_answers: $local_count MP4(s)"
@@ -93,7 +163,49 @@ if [ "${local_count:-0}" -gt 0 ]; then
     fi
   done
 else
-  warn "no pre-rendered local answers — router will cloud-escalate every product question (run: python scripts/render_local_answers.py)"
+  ok "no per-product local_answers (expected for judge-item demo — every comment routes to cloud)"
+fi
+
+# 4b. Generic Wav2Lip clips (intro_arbitrary, bridge_arbitrary).
+#     These are the FALLBACK clips that fire when the bridge_clips
+#     manifest's primary LatentSync clips aren't rendered yet. Without
+#     these AND without LatentSync clips, POST /api/go_live returns 503
+#     and the avatar can't acknowledge audience comments with a bridge.
+generic_dir="backend/local_answers/_generic"
+if [ -d "$generic_dir" ]; then
+  generic_manifest="$generic_dir/manifest.json"
+  if [ -f "$generic_manifest" ]; then
+    gcount=$(python3 -c "
+import json
+try:
+    d = json.load(open('$generic_manifest'))
+    print(sum(len(v) for v in d.values() if isinstance(v, list)))
+except Exception:
+    print(0)
+" 2>/dev/null)
+    if [ "${gcount:-0}" -gt 0 ]; then
+      ok "_generic clips manifest: $gcount entries (Wav2Lip tertiary fallback ready)"
+    else
+      warn "_generic clips manifest empty — run: python scripts/render_generic_clips.py (needed if no LatentSync intro clips exist)"
+    fi
+  else
+    warn "_generic/manifest.json missing — run: python scripts/render_generic_clips.py"
+  fi
+else
+  warn "_generic clips directory missing — run: python scripts/render_generic_clips.py (Wav2Lip fallback for intro/bridge)"
+fi
+
+# 4c. Speaking-idle clip the cloud-escalate path emits as the Tier 1
+#     loop. If this 404s, the dashboard's <video> element fails to
+#     load and the avatar appears frozen during cloud responses (the
+#     audio still plays — captions still render — but the visual is
+#     dead).
+speaking_idle="/states/idle/idle_calm_speaking.mp4"
+si_status=$(curl -sS -o /dev/null -w '%{http_code}' "$BACKEND_URL$speaking_idle" --max-time 3 2>/dev/null)
+if [ "$si_status" = "200" ]; then
+  ok "speaking-idle clip serves: $speaking_idle (cloud-escalate Tier 1 loop)"
+else
+  fail "speaking-idle clip $speaking_idle returns $si_status — cloud-escalate avatar will be frozen-but-talking"
 fi
 
 # 5. Audience comment intake routes are wired. Use GET (not HEAD) — FastAPI
@@ -127,16 +239,55 @@ else
   warn "qrencode missing — brew install qrencode (QR PNG won't generate; manual fallback works)"
 fi
 
-# 8. Optional: synthetic novel comment to warm cloud path end-to-end.
+# 8. Optional: synthetic novel comment, hit the SYNCHRONOUS endpoint so
+#    we can assert the response shape (not just that the route exists).
+#    Calls /api/respond_to_comment which runs the full Bedrock + ElevenLabs
+#    + synthetic comment_response_video pipeline and returns the result
+#    body — same shape the dashboard contract tests pin.
 if [ -n "$WITH_CLOUD" ]; then
   echo ""
-  echo "Firing synthetic novel comment ('quick prewarm test, ignore') to warm Wav2Lip + Bedrock + ElevenLabs..."
+  echo "Firing synthetic novel comment via /api/respond_to_comment (SYNC)..."
+  echo "  This warms Bedrock Claude + ElevenLabs TTS + the audio dispatch path"
+  echo "  end-to-end. ~5-10s warm, ~30s cold. Costs ~\$0.00035."
   ct0=$(date +%s)
-  if curl -fsS -X POST "$BACKEND_URL/api/comment" \
-       -F 'text=quick prewarm test ignore me' --max-time 60 >/dev/null 2>&1; then
-    ok "cloud escalate end-to-end: $(($(date +%s)-ct0))s warm path"
+  resp_body=$(curl -fsS -X POST "$BACKEND_URL/api/respond_to_comment" \
+       -F 'text=quick prewarm test ignore me' --max-time 60 2>/dev/null)
+  cstatus=$?
+  cms=$(($(date +%s)-ct0))
+
+  if [ $cstatus -ne 0 ] || [ -z "$resp_body" ]; then
+    fail "cloud escalate failed (${cms}s) — check RunPod tunnel + ELEVENLABS_* + AWS_* in backend/.env"
   else
-    fail "cloud escalate failed (check RunPod tunnel + ELEVENLABS_* + AWS_* in backend/.env)"
+    # Parse the JSON response. Validates the full audio-first cloud path:
+    # audio_url present, audio_duration_ms > 0, audio_first=true, lip_synced=false
+    # (the no-Wav2Lip judge-item-friendly shape).
+    parsed=$(printf '%s' "$resp_body" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    audio_url = d.get('audio_url')
+    audio_first = d.get('audio_first')
+    lip_synced = d.get('lip_synced')
+    dur_ms = d.get('audio_duration_ms') or 0
+    if audio_first is not True:
+        print('FAIL audio_first not True'); sys.exit(2)
+    if lip_synced is not False:
+        print('FAIL lip_synced not False'); sys.exit(2)
+    if not audio_url or '/response_audio/' not in audio_url:
+        print('FAIL missing/bad audio_url:', audio_url); sys.exit(2)
+    if dur_ms < 500:
+        print('FAIL audio_duration_ms too short:', dur_ms); sys.exit(2)
+    print(f'audio_url={audio_url} dur={dur_ms}ms')
+    sys.exit(0)
+except Exception as e:
+    print('FAIL parse:', e); sys.exit(2)
+" 2>&1)
+    pstatus=$?
+    if [ $pstatus -eq 0 ]; then
+      ok "cloud escalate end-to-end: ${cms}s, $parsed"
+    else
+      fail "cloud escalate response shape WRONG (${cms}s): $parsed"
+    fi
   fi
 fi
 
@@ -196,4 +347,7 @@ echo "  1. Audience tunnel + QR:    ./scripts/start_audience_tunnel.sh"
 echo "  2. Open stage view:         http://localhost:5173/stage   (then press F for fullscreen)"
 echo "  3. Reset cost ticker:       press R inside /stage"
 echo "  4. Fire intro clip:         press G inside /stage"
+echo ""
+echo "Post-rehearsal cleanup:        ./scripts/demo_prewarm.sh --clean"
+echo "Full demo runbook:             cat STAGE_RUNBOOK.md"
 exit 0

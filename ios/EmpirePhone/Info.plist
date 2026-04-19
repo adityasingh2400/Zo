@@ -22,6 +22,22 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>EMPIRE uses the microphone so you can push-to-talk. Everything is processed on this device by Gemma 4 on Cactus — no audio leaves the phone.</string>
+	<!-- Mac LAN IP for the Gemma 4 classify call (GemmaClient.swift). Find via:
+	     ipconfig getifaddr en0    Leave empty to disable the Gemma card. -->
+	<key>EmpireBackendHost</key>
+	<string>172.17.22.176</string>
+	<!-- Allow plain HTTP to LAN (the Mac backend serves http://, not https://).
+	     Local-network only by default — no exception for arbitrary domains. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- Bonjour service is needed for iOS 14+ local-network permission prompt
+	     even when we use a static IP. The system asks the user to allow local
+	     network access on first request. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>EMPIRE talks to the Mac running the EMPIRE backend over your local network so Gemma 4 can classify comments. No data leaves your network.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

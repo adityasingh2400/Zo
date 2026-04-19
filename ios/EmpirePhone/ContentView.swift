@@ -1,19 +1,23 @@
 // ContentView.swift — single-screen demo surface.
 //
 // Flow:
-//   press+hold → record → release → Cactus whisper transcribe →
-//   Swift rule-based Router.decide() → VideoDirector plays pre-rendered MP4
+//   press+hold → record → release → Cactus whisper transcribe (on phone) →
+//   Swift rule-based Router.decide() (on phone) → VideoDirector plays MP4 →
+//   in parallel: GemmaClient classify on Mac → "GEMMA 4 (Mac)" card lights up
 //
-// No on-device LLM classify. The Swift rule-based router in Router.swift
-// handles everything from the transcript text (URL spam cues, compliment
-// words+emoji, objection words, product qa_index keyword match). Matches
-// the 19 parametrized tests in backend/tests/test_router.py bit-for-bit.
+// On-phone LLM classify: not done. Cactus probes (CactusRunner.swift header)
+// found no Gemma family that fits both iPhone RAM (~3 GB app ceiling on A15)
+// and demo latency (<1s). The phone's router runs the deterministic Swift
+// keyword path; Gemma 4 runs on the Mac and fires AFTER the MP4 dispatch
+// so the on-phone demo stays sub-1s. The Gemma card is the visible "the
+// laptop's on-device LLM verified this" beat.
 //
 // Colors match the dashboard's RoutingPanel:
-//   respond_locally    → green  (#22c55e)
-//   play_canned_clip   → purple (#7c3aed)
-//   block_comment      → gray   (#a1a1aa)
-//   escalate_to_cloud  → amber  (#f59e0b)
+//   respond_locally    → green   (#22c55e)
+//   play_canned_clip   → purple  (#7c3aed)
+//   block_comment      → gray    (#a1a1aa)
+//   escalate_to_cloud  → amber   (#f59e0b)
+//   GEMMA 4 (Mac)      → magenta (#d946ef)
 
 import SwiftUI
 import AVKit
@@ -25,7 +29,14 @@ struct ContentView: View {
     @State private var state: UIState = .ready
     @State private var transcript: TranscriptCardData? = nil
     @State private var decision:   DecisionCardData?   = nil
+    @State private var gemma:      GemmaCardData?      = nil
     @State private var currentProduct: Product? = nil
+
+    // Runtime backend-host override. Long-press the GEMMA card or the status
+    // pill to open the sheet; saves to UserDefaults via GemmaClient. Lets us
+    // chase a new WiFi IP without a 90s Swift rebuild at venue.
+    @State private var showingHostSheet = false
+    @State private var hostInput: String = ""
 
     enum UIState: Equatable {
         case loading
@@ -52,6 +63,7 @@ struct ContentView: View {
                 ScrollView {
                     VStack(spacing: 10) {
                         if let t = transcript { transcriptCard(t) }
+                        if let g = gemma      { gemmaCard(g) }
                         if let d = decision   { decisionCard(d) }
                     }
                     .padding(.horizontal, 16)
@@ -65,7 +77,32 @@ struct ContentView: View {
 
             if state == .loading { splash }
         }
+        .alert("Backend host", isPresented: $showingHostSheet) {
+            TextField("e.g. 192.168.1.42", text: $hostInput)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Button("Save") {
+                GemmaClient.setBackendHost(hostInput)
+            }
+            Button("Reset to default", role: .destructive) {
+                GemmaClient.setBackendHost(nil)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let resolved = GemmaClient.backendHost ?? "(none)"
+            let source = GemmaClient.hasUserDefaultsOverride ? "runtime override"
+                       : "Info.plist / default"
+            Text("Current: \(resolved)  ·  \(source)\nFind your Mac IP: ipconfig getifaddr en0")
+        }
         .task { await bootstrap() }
+    }
+
+    /// Opens the host-override alert. Seeds the text field with the currently
+    /// resolved host so edits are a small delta, not a from-scratch type-in.
+    private func openHostSheet() {
+        hostInput = GemmaClient.backendHost ?? ""
+        showingHostSheet = true
     }
 
     // MARK: - Sections
@@ -139,12 +176,21 @@ struct ContentView: View {
         .background(color.opacity(0.15))
         .overlay(RoundedRectangle(cornerRadius: 999).stroke(color.opacity(0.4), lineWidth: 1))
         .clipShape(RoundedRectangle(cornerRadius: 999))
+        // Long-press the pill to change the Mac backend host at runtime —
+        // fallback affordance for before the first transcript, when the GEMMA
+        // card isn't visible yet.
+        .onLongPressGesture(minimumDuration: 0.6) { openHostSheet() }
     }
 
     // MARK: - Cards
 
     struct TranscriptCardData { let text: String; let ms: Int }
     struct DecisionCardData   { let tool: Tool; let reason: String; let ms: Int; let costSaved: Double }
+    enum   GemmaCardData {
+        case pending                                 // request in flight
+        case ok(label: String, ms: Int, source: String)
+        case offline(reason: String)                 // host unset, network down, etc.
+    }
 
     private func transcriptCard(_ d: TranscriptCardData) -> some View {
         HStack(alignment: .top, spacing: 10) {
@@ -154,6 +200,46 @@ struct ContentView: View {
             Text("\(d.ms)ms").font(.system(size: 10, design: .monospaced)).foregroundColor(.white.opacity(0.6))
         }
         .padding(12).background(Color.white.opacity(0.04)).cornerRadius(8)
+    }
+
+    private func gemmaCard(_ d: GemmaCardData) -> some View {
+        // Magenta to distinguish from WHISPER (gray) and ROUTER (color-coded).
+        let accent = Color(red: 0.851, green: 0.275, blue: 0.937)
+        return HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("GEMMA 4").font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .foregroundColor(accent.opacity(0.85)).tracking(1.2)
+                Text("(Mac)").font(.system(size: 8, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.4))
+            }
+            .frame(width: 60, alignment: .leading)
+            switch d {
+            case .pending:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small).tint(accent)
+                    Text("classifying on Mac…").font(.system(size: 13))
+                        .foregroundColor(.white.opacity(0.65))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            case .ok(let label, let ms, let source):
+                Text(label).font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(accent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("\(source) · \(ms)ms").font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.5))
+            case .offline(let reason):
+                Text(reason).font(.system(size: 12)).italic()
+                    .foregroundColor(.white.opacity(0.4))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(12)
+        .background(accent.opacity(0.10))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent.opacity(0.3), lineWidth: 1))
+        .cornerRadius(8)
+        // Long-press the GEMMA card to change the Mac backend host. Primary
+        // affordance per the pitch runbook; the status pill has the same.
+        .onLongPressGesture(minimumDuration: 0.6) { openHostSheet() }
     }
 
     private func decisionCard(_ d: DecisionCardData) -> some View {
@@ -242,7 +328,7 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 50_000_000)
         do {
             try recorder.start()
-            transcript = nil; decision = nil
+            transcript = nil; decision = nil; gemma = nil
             director.backToIdle()
             state = .recording
         } catch {
@@ -274,6 +360,25 @@ struct ContentView: View {
 
             director.dispatch(d)
             state = .responding
+
+            // Fire Gemma classify on the Mac IN PARALLEL — does not block the
+            // local-first MP4 dispatch above. The Gemma card animates in 2-4s
+            // later as a "Mac just verified this" beat; if the Mac is
+            // unreachable the demo still works, the card just shows offline.
+            let transcriptText = t.text
+            gemma = .pending
+            Task {
+                let result: GemmaCardData
+                do {
+                    let g = try await GemmaClient.classify(comment: transcriptText)
+                    result = .ok(label: g.label, ms: g.latencyMs, source: g.source)
+                } catch GemmaClient.Failure.backendNotConfigured {
+                    result = .offline(reason: "set EmpireBackendHost in Info.plist")
+                } catch {
+                    result = .offline(reason: "Mac unreachable")
+                }
+                await MainActor.run { self.gemma = result }
+            }
 
             Task {
                 try? await Task.sleep(nanoseconds: 6_000_000_000)

@@ -4,25 +4,25 @@
 // iPhone screen. Based on Cody's sketch:
 //
 //   ┌───────────────┬──────┐
-//   │               │ 3D   │   3D revolving video
-//   │   HEAD SHOT   │video │   of the current product
-//   │   (avatar)    ├──────┤
-//   │               │ best │   3D rotating images
-//   │               │ N    │   = best intake frames
-//   ├───────────────┤ frms │
 //   │               │      │
-//   │   COMMENTS    ├──────┤
-//   │   ~~~~~       │ BUY  │   Link to buy
-//   │   ~~~~        │      │
+//   │   HEAD SHOT   │  3D  │   3D revolving video of the product
+//   │   (avatar)    │ spin │   on a white backdrop
+//   │               │      │
+//   ├───────────────┤      │
+//   │   COMMENTS    │      │
+//   │   ~~~~~       ├──────┤
+//   │   ~~~~        │ BUY  │   Link to buy
 //   └───────────────┴──────┘
 //
 // Voice / push-to-talk / whisper / local-router UI removed — Mac owns those
 // paths now. iPhone is the SELLER's viewer + Capture (via FeatureFlags).
 //
+// The static best-frames tile was removed — the rotating 3D spin already
+// shows the product from every angle, so a second image tile was redundant.
+//
 // Data sources (all via EmpireSocket's /ws/dashboard subscription):
 //   - Head shot:       VideoDirector plays avatar state MP4s
 //   - 3D spin:         view_3d WS event (kind=frames|glb, url|frames)
-//   - Best frames:     GET /api/best_frames on mount + product_data events
 //   - Comments:        audience_comment + comment_response_video events
 //   - Buy URL:         product_data.buy_url (added to products.json)
 //
@@ -44,8 +44,6 @@ struct StreamView: View {
 
     @State private var showingHostSheet = false
     @State private var hostInput = ""
-    @State private var bestFrames: [String] = []  // base64-encoded JPEGs
-    @State private var bestFramesIndex: Int = 0
 
     var body: some View {
         GeometryReader { geo in
@@ -59,11 +57,9 @@ struct StreamView: View {
                 }
                 .frame(width: geo.size.width * 0.58)
 
-                // RIGHT COLUMN — 3D spin / best frames / buy
+                // RIGHT COLUMN — 3D spin (grows) + buy
                 VStack(spacing: 10) {
                     threeDSpinCard
-                        .frame(height: geo.size.height * 0.30)
-                    bestFramesCard
                         .frame(maxHeight: .infinity)
                     buyButton
                 }
@@ -74,7 +70,6 @@ struct StreamView: View {
         .background(Color.black.ignoresSafeArea())
         .task {
             socket.start()
-            await refreshBestFrames()
         }
         .alert("Backend host", isPresented: $showingHostSheet) {
             TextField("e.g. 192.168.1.42", text: $hostInput)
@@ -152,11 +147,13 @@ struct StreamView: View {
 
     private var threeDSpinCard: some View {
         ZStack {
+            // White backdrop — product spins against the neutral background
+            // e-commerce shoppers expect, and pops against the dark shell.
             RoundedRectangle(cornerRadius: 18)
-                .fill(Color.white.opacity(0.04))
+                .fill(Color.white)
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
                 )
 
             if let view3d = socket.view3d, let frames = view3d.frames, !frames.isEmpty {
@@ -167,88 +164,16 @@ struct StreamView: View {
                 VStack(spacing: 4) {
                     Image(systemName: "cube.transparent")
                         .font(.system(size: 24))
-                        .foregroundColor(.white.opacity(0.3))
+                        .foregroundColor(.black.opacity(0.25))
                     Text("3D SPIN")
                         .font(.system(size: 9, weight: .heavy, design: .monospaced))
                         .tracking(1.2)
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(.black.opacity(0.35))
                     Text("waiting for intake")
                         .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.25))
+                        .foregroundColor(.black.opacity(0.2))
                 }
             }
-        }
-    }
-
-    // MARK: - Best frames card (middle-right)
-
-    private var bestFramesCard: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 18)
-                .fill(Color.white.opacity(0.04))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                )
-
-            if !bestFrames.isEmpty {
-                frameRotator
-                    .padding(8)
-            } else {
-                VStack(spacing: 4) {
-                    Image(systemName: "square.stack.3d.up")
-                        .font(.system(size: 24))
-                        .foregroundColor(.white.opacity(0.3))
-                    Text("BEST FRAMES")
-                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
-                        .tracking(1.2)
-                        .foregroundColor(.white.opacity(0.4))
-                    Text("film a product to begin")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.25))
-                }
-            }
-        }
-    }
-
-    private var frameRotator: some View {
-        VStack(spacing: 6) {
-            // Active frame
-            Group {
-                if let img = UIImage.fromBase64(bestFrames[safe: bestFramesIndex] ?? "") {
-                    Image(uiImage: img)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                } else {
-                    Color.white.opacity(0.05)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-
-            // Thumbnail strip
-            HStack(spacing: 4) {
-                ForEach(Array(bestFrames.enumerated().prefix(6)), id: \.offset) { idx, b64 in
-                    let active = idx == bestFramesIndex
-                    Group {
-                        if let img = UIImage.fromBase64(b64) {
-                            Image(uiImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                        } else {
-                            Color.white.opacity(0.05)
-                        }
-                    }
-                    .frame(height: 28)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(active ? Color.white : Color.white.opacity(0.15),
-                                    lineWidth: active ? 1.5 : 1)
-                    )
-                    .onTapGesture { bestFramesIndex = idx }
-                }
-            }
-            .frame(maxWidth: .infinity)
         }
     }
 
@@ -363,23 +288,6 @@ struct StreamView: View {
 
     // MARK: - Data
 
-    private func refreshBestFrames() async {
-        guard let base = GemmaClient.backendBaseURL else { return }
-        let url = base.appendingPathComponent("api/best_frames")
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let frames = obj["frames"] as? [String] {
-                await MainActor.run {
-                    bestFrames = frames
-                    bestFramesIndex = 0
-                }
-            }
-        } catch {
-            // silent — card shows the empty state
-        }
-    }
-
     private func relativeURL(_ path: String) -> URL? {
         guard let base = GemmaClient.backendBaseURL else { return nil }
         if path.hasPrefix("http") { return URL(string: path) }
@@ -430,9 +338,3 @@ extension Array {
     }
 }
 
-extension UIImage {
-    static func fromBase64(_ s: String) -> UIImage? {
-        guard !s.isEmpty, let data = Data(base64Encoded: s) else { return nil }
-        return UIImage(data: data)
-    }
-}

@@ -1,19 +1,19 @@
 """BRAIN — persistent telemetry + aggregation for the router.
 
 Every routed comment is logged to SQLite (backend/data/brain.db). Aggregates
-power the BRAIN dashboard panel and (later, Sprint 4) feed conversion-aware
+power the BRAIN dashboard panel and (roadmap) feed conversion-aware
 keyword reranking in the router.
 
-v0 scope (this file):
+Scope (this file):
   - record_event() called once per router decision from main.py.
   - get_stats() returns by-tool counts + cost saved + top answers + top misses.
   - get_top_misses() groups escalate_to_cloud comments by token frequency so
     the operator can see which questions the local Q/A index is missing.
 
-What's NOT here yet (future sprints):
-  - Conversion events (Sprint 4: BRAIN: conversion-aware Q/A ranking).
-  - DM thread persistence (Sprint 4: CLOSER).
-  - Multi-tenant stream isolation (Sprint 5+: today stream_id is hardcoded
+What's NOT here yet (roadmap):
+  - Conversion events (BRAIN: conversion-aware Q/A ranking).
+  - DM thread persistence (CLOSER).
+  - Multi-tenant stream isolation (today stream_id is hardcoded
     "default" because pipeline_state in main.py is process-global).
 
 Connection model: one global sqlite3.Connection opened lazily on first

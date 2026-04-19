@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0a0a0b">
+<title>EMPIRE phone recorder</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #0a0a0b;
+    color: #fafafa;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  body {
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  /* Top status bar — minimal chrome so the camera stays the hero */
+  header {
+    flex-shrink: 0;
+    padding: 14px 18px env(safe-area-inset-top, 14px);
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; letter-spacing: 1px; text-transform: uppercase;
+    color: #a1a1aa;
+    background: #0a0a0b;
+    border-bottom: 1px solid #18181b;
+  }
+  header .session { font-family: ui-monospace, SFMono-Regular, monospace; color: #71717a; }
+  header .status { display: flex; align-items: center; gap: 6px; font-weight: 800; }
+  header .dot {
+    width: 8px; height: 8px; border-radius: 4px;
+    background: #71717a;
+  }
+  header .dot.live  { background: #ef4444; box-shadow: 0 0 12px #ef4444; animation: pulse 1.4s ease-in-out infinite; }
+  header .dot.ok    { background: #22c55e; }
+  header .dot.warn  { background: #fbbf24; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+  }
+  /* Camera preview — fills the available space, mirrors so it
+     reads as a viewfinder not a recording playback */
+  .stage {
+    flex: 1; position: relative;
+    background: #000;
+    overflow: hidden;
+  }
+  video.preview {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    background: #000;
+  }
+  /* Permission / error overlay */
+  .overlay {
+    position: absolute; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+    padding: 32px;
+  }
+  .overlay.hidden { display: none; }
+  .overlay-inner {
+    text-align: center; max-width: 320px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .overlay-inner h1 { font-size: 22px; font-weight: 800; }
+  .overlay-inner p  { font-size: 14px; color: #a1a1aa; line-height: 1.4; }
+  .overlay-inner button {
+    background: #7c3aed; color: #fff; border: none;
+    padding: 14px 22px; border-radius: 999px;
+    font-size: 15px; font-weight: 800; letter-spacing: 0.5px;
+    cursor: pointer;
+  }
+  /* Live progress chip while uploading */
+  .progress {
+    position: absolute; top: 14px; left: 50%;
+    transform: translateX(-50%); z-index: 5;
+    background: rgba(15,15,18,0.85); backdrop-filter: blur(10px);
+    padding: 6px 14px; border-radius: 999px;
+    font-size: 11px; font-weight: 800; letter-spacing: 1px;
+    color: #fafafa;
+    border: 1px solid rgba(124,58,237,0.6);
+    display: none;
+  }
+  .progress.show { display: block; }
+  /* Bottom record button — single big tap target */
+  footer {
+    flex-shrink: 0;
+    padding: 18px 18px calc(28px + env(safe-area-inset-bottom, 18px));
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(to top, rgba(0,0,0,1), rgba(0,0,0,0));
+    position: relative;
+  }
+  .record {
+    width: 78px; height: 78px; border-radius: 50%;
+    border: 4px solid rgba(255,255,255,0.85);
+    background: transparent;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: transform 120ms ease;
+  }
+  .record:active { transform: scale(0.94); }
+  .record .inner {
+    width: 56px; height: 56px; border-radius: 50%;
+    background: #ef4444;
+    transition: all 200ms ease;
+  }
+  .record.recording .inner {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+  }
+  .record:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Done state — replaces the record button when upload completes */
+  .done {
+    text-align: center;
+    color: #22c55e;
+    font-weight: 800; font-size: 13px;
+    letter-spacing: 1px; text-transform: uppercase;
+  }
+  .done span.icon { font-size: 32px; display: block; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="status" id="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">connecting…</span>
+  </span>
+  <span class="session">{{SESSION_ID}}</span>
+</header>
+
+<div class="stage">
+  <video class="preview" id="preview" autoplay muted playsinline></video>
+  <div class="progress" id="progress"></div>
+  <div class="overlay" id="overlay">
+    <div class="overlay-inner">
+      <h1 id="overlayTitle">Allow camera access</h1>
+      <p id="overlayText">Tap the button to let this page use your camera and mic. We only stream while you're recording — nothing leaves your phone otherwise.</p>
+      <button id="overlayBtn">Enable camera</button>
+    </div>
+  </div>
+</div>
+
+<footer id="footer">
+  <button class="record" id="recordBtn" disabled>
+    <span class="inner"></span>
+  </button>
+</footer>
+
+<script>
+(() => {
+  const WS_URL = "{{WS_URL}}";
+  const previewEl = document.getElementById('preview');
+  const recordBtn = document.getElementById('recordBtn');
+  const statusEl  = document.getElementById('statusText');
+  const statusDot = document.getElementById('statusDot');
+  const overlay   = document.getElementById('overlay');
+  const overlayBtn= document.getElementById('overlayBtn');
+  const overlayTitle = document.getElementById('overlayTitle');
+  const overlayText  = document.getElementById('overlayText');
+  const footer    = document.getElementById('footer');
+  const progress  = document.getElementById('progress');
+
+  let stream = null;
+  let recorder = null;
+  let ws = null;
+  let recording = false;
+  let bytesSent = 0;
+
+  function setStatus(text, klass) {
+    statusEl.textContent = text;
+    statusDot.className = 'dot' + (klass ? ' ' + klass : '');
+  }
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + 'B';
+    if (n < 1024*1024) return (n/1024).toFixed(0) + 'KB';
+    return (n/1024/1024).toFixed(2) + 'MB';
+  }
+
+  // ── Camera permission flow ─────────────────────────────────────────
+  // iOS Safari requires the gesture-triggered getUserMedia call —
+  // that's why the overlay button exists. Once we have the stream we
+  // hide the overlay and enable the record button.
+  async function requestCamera() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      previewEl.srcObject = stream;
+      overlay.classList.add('hidden');
+      recordBtn.disabled = false;
+      setStatus('ready', 'ok');
+    } catch (e) {
+      overlayTitle.textContent = 'Camera blocked';
+      overlayText.textContent = 'Open Settings → Safari → Camera → Allow, then reload this page. (' + (e.message || e.name || 'unknown') + ')';
+      overlayBtn.textContent = 'Try again';
+      setStatus('camera blocked', 'warn');
+    }
+  }
+  overlayBtn.addEventListener('click', requestCamera);
+  // Prompt immediately on page load — Safari counts the page tap on
+  // the QR-code link as an active gesture for ~5 seconds. If that grace
+  // window has expired by the time the page is interactive, the user
+  // taps the overlay button and gets the prompt then.
+  requestCamera();
+
+  // ── WebSocket connection — opened LAZILY on record start ──────────
+  // Opening earlier wastes the channel if the user taps the QR but
+  // never records. Opening on tap also gives the cleanest "RECORDING"
+  // status sequence on the dashboard side.
+  function openSocket() {
+    return new Promise((resolve, reject) => {
+      const sock = new WebSocket(WS_URL);
+      sock.binaryType = 'arraybuffer';
+      sock.onopen = () => {
+        ws = sock;
+        setStatus('connected', 'ok');
+        resolve(sock);
+      };
+      sock.onerror = (e) => reject(new Error('ws error'));
+      sock.onclose = () => {
+        if (recording) {
+          setStatus('disconnected', 'warn');
+        }
+      };
+      sock.onmessage = (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+          if (data.type === 'complete') {
+            // Server confirms the upload landed and the pipeline kicked off.
+            // Swap the record button for a "sent!" state so the operator
+            // knows they can stop watching the phone and turn back to the Mac.
+            footer.innerHTML = '<div class="done"><span class="icon">📺</span>Watch the screen</div>';
+            setStatus('sent', 'ok');
+          } else if (data.type === 'error') {
+            setStatus('error: ' + data.message, 'warn');
+          }
+        } catch (_) {}
+      };
+    });
+  }
+
+  // ── MediaRecorder pick ─────────────────────────────────────────────
+  // Pick the first MIME the browser supports, in order of pipeline
+  // preference. ffmpeg can probe any of these; mp4 is preferred because
+  // it needs zero re-mux for downstream tools, but iOS Safari sometimes
+  // only exposes webm depending on version.
+  function pickMimeType() {
+    const candidates = [
+      'video/mp4;codecs=avc1,mp4a',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  }
+
+  // ── Record / stop ──────────────────────────────────────────────────
+  recordBtn.addEventListener('click', async () => {
+    if (!stream) return;
+    if (!recording) {
+      await startRecording();
+    } else {
+      stopRecording();
+    }
+  });
+
+  async function startRecording() {
+    try {
+      await openSocket();
+    } catch (e) {
+      setStatus('ws connect failed', 'warn');
+      return;
+    }
+    const mimeType = pickMimeType();
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_400_000 })
+        : new MediaRecorder(stream, { videoBitsPerSecond: 2_400_000 });
+    } catch (e) {
+      setStatus('MediaRecorder unsupported', 'warn');
+      return;
+    }
+    bytesSent = 0;
+
+    // Tell the server what's coming — it allocates the temp file with
+    // the right extension based on this MIME type.
+    ws.send(JSON.stringify({
+      type: 'start',
+      mime_type: recorder.mimeType || mimeType || 'video/webm',
+      voice_text: 'sell this',
+    }));
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+        // Send the Blob directly — the WS binary frame is the chunk.
+        // FileReader → ArrayBuffer is unnecessary; the browser handles
+        // Blob → binary frame natively and faster.
+        ws.send(ev.data);
+        bytesSent += ev.data.size;
+        progress.classList.add('show');
+        progress.textContent = '↑ ' + fmtBytes(bytesSent);
+      }
+    };
+    recorder.onstop = () => {
+      // Final 'end' message AFTER all chunks have flushed. The
+      // ondataavailable callback runs synchronously to deliver the
+      // last chunk before onstop, so by the time we send 'end' the
+      // server has all the bytes.
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'end' }));
+      }
+      recordBtn.classList.remove('recording');
+      recording = false;
+      setStatus('uploading…', 'live');
+    };
+
+    // 250ms timeslice → server sees a steady stream of chunks rather
+    // than one huge blob at stop time. Lower → more overhead + more WS
+    // frames, higher → bigger pause when the user stops recording.
+    recorder.start(250);
+    recording = true;
+    recordBtn.classList.add('recording');
+    setStatus('recording', 'live');
+  }
+
+  function stopRecording() {
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop();
+    }
+  }
+
+  // Stop and warn if the page is being closed mid-record (iOS will
+  // sometimes background the page when the operator switches apps).
+  window.addEventListener('pagehide', () => {
+    if (recording) stopRecording();
+  });
+})();
+</script>
+</body>
+</html>

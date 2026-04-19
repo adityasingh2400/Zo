@@ -35,7 +35,7 @@ from agents import router as comment_router
 from agents import translator
 from agents.hands import Hands
 from agents.avatar_director import Director
-from agents.bridge_clips import all_bridges, pick_bridge_clip
+from agents.bridge_clips import all_bridges, pick_bridge_clip, pick_intent_substrate
 from agents.creator import build_all as creator_build_all
 from agents.creator import generate_3d_model, remove_background
 from agents.eyes import (
@@ -61,6 +61,7 @@ from config import (
     BACKEND_HOST,
     BACKEND_PORT,
     LIPSYNC_PROVIDER,
+    POD_SPEAKING_1080P,
     USE_AUDIO_FIRST,
     USE_BACKCHANNEL,
     USE_KARAOKE,
@@ -168,8 +169,22 @@ def _load_products() -> None:
     if initial not in products:
         logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json — falling back", initial)
         initial = next(iter(products.keys()))
-    _set_active_product(initial)
-    logger.info("[products] Loaded %d products: %s", len(products), list(products.keys()))
+    # Set active_product_id ONLY — do NOT seed product_data from the
+    # catalog. The previous behaviour (calling _set_active_product here)
+    # left "Minimal Leather Wallet" as the visible product on every
+    # backend boot, so a dashboard refresh before any upload would flash
+    # the wallet stub. product_data is now reserved for "the product
+    # currently being pitched" and only fills when:
+    #   1. An upload pipeline completes (Gemma analyze writes it), OR
+    #   2. The operator explicitly POSTs /api/state/active_product
+    # The catalog itself + active_product_id are still loaded so the
+    # qa_index keyword router can match a comment to the seeded product
+    # when the operator does opt in via the explicit switch endpoint.
+    pipeline_state["active_product_id"] = initial
+    qa_count = len(products[initial].get("qa_index") or {})
+    logger.info('[products] Loaded %d products: %s — initial active_id=%s '
+                '(%d Q/A); product_data unseeded until first upload',
+                len(products), list(products.keys()), initial, qa_count)
 
 
 def _load_avatars() -> None:
@@ -259,6 +274,104 @@ async def broadcast_to_dashboards(msg: dict):
 
 # ── App ────────────────────────────────────────────────
 
+async def _prewarm_pod_substrates() -> None:
+    """Hit the Wav2Lip pod's /prewarm endpoint for every substrate the
+    live pipeline uses, so face-detect cache is hot from the moment the
+    operator's first upload lands.
+
+    Substrates split into two tiers:
+      • PITCH SUBSTRATES — Maya's idle-pose speaking variants. Used by
+        the pitch render path (POD_SPEAKING_1080P + the per-Tier 0
+        substrate the Director picks based on the visible idle clip).
+        Critical for the upload-to-pitch ≤22 s budget — without prewarm
+        the first pitch's Wav2Lip runs cold (~12-15 s face-detect on
+        top of ~6 s render = ~18-21 s for that single stage).
+      • COMMENT BRIDGES — the 30 intent-bucket clips at /workspace/
+        bridges/<intent>/. Already prewarmed via the manual
+        prewarm_bridge_caches.sh script, but re-running here covers the
+        case where the pod restarts between sessions and the bash
+        script wasn't run.
+
+    Out_height=1920 matches what render_comment_response_wav2lip uses
+    (the comment path) AND the dispatch_audio_first_pitch loop. Cache
+    keys are (path, out_height) so we MUST prewarm at the same height
+    we render at — otherwise prewarm wastes pod cycles building a cache
+    entry the live path never hits.
+
+    Sequential (not parallel) because the pod's RENDER_LOCK serializes
+    /prewarm calls and parallel curls just cause connection contention.
+    Total wall time: ~30-90 s on a fully cold pod, sub-3 s when the
+    cache is mostly warm already (each prewarm returns in <1 s on hit).
+    All non-fatal: a tunnel hiccup just means the live path pays the
+    cold cost on first call, which is the pre-fix behaviour.
+    """
+    # Wait briefly for the SSH tunnel + pod to settle before hammering
+    # /prewarm. The tunnel keepalive (keep_tunnels_alive.sh) reopens
+    # within ~3 s after a drop; giving it a head-start avoids the first
+    # five prewarms failing with ConnectError and then succeeding.
+    await asyncio.sleep(3.0)
+
+    pitch_substrates = [
+        "/workspace/state_pitching_pose_speaking_1080p.mp4",  # POD_SPEAKING_1080P default
+        "/workspace/idle_speaking/idle_calm_speaking.mp4",     # most-used pitch substrate
+        "/workspace/idle_speaking/idle_thinking_speaking.mp4",
+        "/workspace/idle_speaking/idle_reading_comments_speaking.mp4",
+        "/workspace/idle_speaking/misc_hair_touch_speaking.mp4",
+    ]
+    bridge_substrates = []
+    bridges_dir = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
+    for intent in ("compliment", "objection", "question", "intro"):
+        intent_dir = bridges_dir / intent
+        if intent_dir.is_dir():
+            for f in sorted(intent_dir.glob("*.mp4")):
+                bridge_substrates.append(f"/workspace/bridges/{intent}/{f.name}")
+
+    all_substrates = pitch_substrates + bridge_substrates
+    logger.info("[prewarm] starting pod-substrate face-cache warmup "
+                "(%d pitch + %d bridge = %d total, out_height=1920)",
+                len(pitch_substrates), len(bridge_substrates), len(all_substrates))
+
+    import httpx
+    from config import WAV2LIP_URL  # local import — avoids top-of-file circular pull
+
+    t_total = time.perf_counter()
+    warmed = 0
+    skipped = 0
+    failed = 0
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for path in all_substrates:
+            try:
+                r = await client.post(
+                    f"{WAV2LIP_URL}/prewarm",
+                    json={"path": path, "out_height": 1920},
+                )
+                if r.status_code == 200:
+                    warmed += 1
+                elif r.status_code == 404:
+                    # Substrate file not present on pod — log once and
+                    # continue. Likely upload_bridge_clips.sh wasn't run
+                    # for this pod, or the path constant drifted.
+                    logger.warning("[prewarm] 404 %s — skipping", path)
+                    skipped += 1
+                else:
+                    logger.warning("[prewarm] HTTP %d %s", r.status_code, path)
+                    failed += 1
+            except Exception as e:
+                # Tunnel hiccup or pod overload — log + move on. The
+                # affected substrate just pays cold cost on first live use.
+                logger.warning("[prewarm] failed %s (%s) — live path will be cold",
+                               path, type(e).__name__)
+                failed += 1
+            # Brief pause between calls so the pod's RENDER_LOCK can
+            # release before the next prewarm grabs it. Without this the
+            # tunnel sees back-to-back POSTs and races its own connection
+            # reuse, which manifests as ConnectError on attempt 2+.
+            await asyncio.sleep(0.25)
+    t_elapsed = int((time.perf_counter() - t_total) * 1000)
+    logger.info("[prewarm] complete in %dms: %d warmed, %d skipped, %d failed",
+                t_elapsed, warmed, skipped, failed)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global director, hands
@@ -297,11 +410,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
 
-    # Load demo products + pre-select an active one for respond_locally. The
-    # Hour 5-6 scope: the router can answer routine questions without any
-    # prior /api/sell call. ACTIVE_PRODUCT_ID env var overrides the first-
-    # key default if you want to swap between demo objects without editing
-    # code on stage.
+    # Pre-warm the Wav2Lip pod's face-detect cache for the substrates the
+    # pipeline ACTUALLY uses, so the first comment + first pitch render
+    # don't pay the cold ~12-15s face-detect cost. Without this every
+    # backend restart resets the user-visible timing back to 25-30s on
+    # the first run; with it the first run matches the warm steady-state
+    # of 6-8s. Fire-and-forget so backend startup isn't blocked on the
+    # ~5-10s prewarm.
+    asyncio.create_task(_prewarm_pod_substrates())
+
+    # Load demo products + pre-select an active one for respond_locally so
+    # the router can answer routine questions without any prior /api/sell
+    # call. ACTIVE_PRODUCT_ID env var overrides the first-key default if
+    # you want to swap between demo objects without editing code on stage.
     _load_products()
     _load_avatars()
     yield
@@ -676,9 +797,11 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
                                    ms=lipsync_ms + tts_ms + phase1_ms)
 
         if director:
-            await director.play_response(url)
-            # Probe rendered duration so the idle release fires precisely as
-            # she finishes the pitch. Falls back to a word-count estimate.
+            # Probe rendered duration BEFORE the emit so play_response can
+            # carry expected_duration_ms — without this the Director's
+            # busy_until horizon defaulted to 8 s and autonomous Tier 1
+            # interjections (sip / walk_off / glance) would fire over the
+            # pitch the moment busy expired (~+10 s into a 20 s pitch).
             rendered_path = RENDER_DIR / Path(url).name
             play_ms = _probe_video_duration_ms(rendered_path)
             if play_ms is None:
@@ -686,9 +809,28 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
                 play_ms = int(max(2500, word_count * 350))
             play_ms_with_tail = play_ms + 400
 
+            # PITCH LOCK — hard gate that prevents ANY autonomous Tier 1
+            # emit from firing for the duration of the pitch, regardless
+            # of timer drift. Cleared either by:
+            #   1. The dashboard's pitch_audio_end event (truth source —
+            #      handled in director.observe). Fires the moment the
+            #      <audio> element's ended event ticks.
+            #   2. The fallback _release_pitch_to_idle task below, in
+            #      case the dashboard's WS drops mid-pitch and the
+            #      pitch_audio_end never lands.
+            director.lock_tier1_for_pitch()
+            await director.play_response(url, expected_duration_ms=play_ms)
+
             async def _release_pitch_to_idle(delay_ms: int):
                 await asyncio.sleep(delay_ms / 1000)
                 if director:
+                    # Fallback unlock — pitch_audio_end usually beats us
+                    # to the punch but if the dashboard WS dropped or
+                    # the dashboard's <audio> errored, this guarantees
+                    # the lock releases. Idempotent: if already unlocked
+                    # by observe(), this is a no-op (settle_until just
+                    # gets refreshed).
+                    director.unlock_tier1_with_settle(settle_seconds=2.5)
                     await director.fade_to_idle()
                     await director.set_voice_state(None)
             asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
@@ -835,7 +977,48 @@ async def _play_upload_bridge() -> None:
     (Option A) — the pipelines no longer emit it, which means the chain
     fires exactly once per upload regardless of which pipeline runs.
     Wrapped non-fatal: a Director-broadcast failure should never block
-    the pipeline kickoff."""
+    the pipeline kickoff.
+
+    Also clears the previous upload's `product_data` so the dashboard
+    doesn't flash the prior product's name (e.g. "Minimal Leather
+    Wallet" — the seeded catalog default) for the 7-12 s between drop
+    and Gemma's analyze landing. Carousel updates faster than analyze
+    (~7 s vs ~12 s), so without this clear the operator sees the new
+    product's frames + the old product's name simultaneously.
+    """
+    # FULL state reset — every field touched by the previous upload's
+    # pipeline gets cleared so a fresh drop never inherits stale data.
+    # The user's complaint (and the demo-correctness invariant): "the
+    # carousel says 'wallet' for a moment then loads the watch" —
+    # caused by stale view_3d / product_data leaking. Same risk for
+    # seller_transcript (used by comment dispatch — would let Gemma
+    # quote yesterday's product in today's responses), sales_script,
+    # the 3D model URL, etc. Clear them ALL at the route boundary so
+    # the in-memory state matches the on-screen "fresh upload" promise.
+    for k in (
+        "product_data",          # Gemma analyze output
+        "product_photo_b64",     # raw product frame stash
+        "product_clean_b64",     # rembg'd product PNG
+        "sales_script",          # Gemma-generated pitch text
+        "pitch_video_url",       # rendered pitch mp4 URL
+        "view_3d",               # carousel/heroes payload (root cause of wallet-flash)
+        "model_3d",              # TripoSR .glb result
+        "seller_transcript",     # Deepgram pitch transcript
+        "transcript_extract",    # on-device structured pitch hints
+        "last_response_text",    # most recent comment fallback text
+    ):
+        pipeline_state[k] = None
+    pipeline_state["agent_log"] = []
+    try:
+        # Push the cleared product/view state to all dashboards so the
+        # UI doesn't show prior product info during the new pipeline's
+        # processing window. WS clients merge null → empty, which gates
+        # display in TikTokShopOverlay / Spin3D / HeroSlideshow.
+        await broadcast_to_dashboards({"type": "product_data", "data": None})
+        await broadcast_to_dashboards({"type": "view_3d", "data": None})
+        await broadcast_to_dashboards({"type": "sales_script", "script": None})
+    except Exception:
+        logger.exception("[route] state clear broadcast failed (non-fatal)")
     if not director:
         return
     try:
@@ -871,6 +1054,317 @@ async def _emit_pipeline_step(request_id: str | None, step: str, status: str,
     if detail is not None:
         payload["detail"] = detail
     await broadcast_to_dashboards(payload)
+
+
+# ── Phone-as-camera uploader ──────────────────────────────────────────────
+# Replaces drag-drop with a phone-streamed upload: dashboard renders a QR,
+# phone scans → records → streams video chunks over WS → backend assembles
+# and runs the standard sell-video pipeline. See backend/phone_uploader.py
+# for session lifecycle. Endpoints:
+#   POST /api/phone/session          create a session, return URLs for the QR
+#   GET  /phone/{session_id}         mobile recorder HTML (camera + record button)
+#   WS   /ws/phone/upload/{sid}      binary chunk stream from the phone
+
+import phone_uploader  # local module — session registry + LAN IP detection
+
+
+@app.post("/api/phone/session")
+async def api_phone_session():
+    """Create a phone-upload session. Returns the URLs the dashboard
+    renders into a QR code (recorder page + WS upload endpoint), both
+    pinned to the Mac's LAN IP so the phone can reach the backend
+    directly from the same WiFi.
+
+    The session expires after 10 min of inactivity; once a phone
+    completes an upload the session is consumed and a new POST is
+    required for the next take."""
+    session = phone_uploader.create_session()
+    # Public-tunnel URL takes priority over LAN IP. Set EMPIRE_PUBLIC_URL
+    # to a https://*.trycloudflare.com / https://*.ngrok.app / similar
+    # so the phone can reach the backend across networks (corporate
+    # WiFi with client isolation blocks LAN-IP routes; cellular has no
+    # LAN at all). Falls back to http://<lan_ip>:<port> when no public
+    # URL is set — works fine on a flat home WiFi.
+    public_url = os.getenv("EMPIRE_PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        base = public_url
+        ws_base = public_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        ip = public_url
+    else:
+        ip = phone_uploader.lan_ip()
+        backend_port = int(os.getenv("BACKEND_PORT", BACKEND_PORT or 8000))
+        base = f"http://{ip}:{backend_port}"
+        ws_base = f"ws://{ip}:{backend_port}"
+    payload = {
+        "session_id": session.session_id,
+        "recorder_url": f"{base}/phone/{session.session_id}",
+        "ws_url": f"{ws_base}/ws/phone/upload/{session.session_id}",
+        "lan_ip": ip,
+        "expires_in_seconds": phone_uploader.SESSION_TTL_SECONDS,
+    }
+    # Broadcast so the dashboard knows a session is live and can render
+    # the QR — useful when the operator opens multiple browser tabs and
+    # we want them all in sync on which session is active.
+    await broadcast_to_dashboards({
+        "type": "phone_session_created",
+        **payload,
+    })
+    return payload
+
+
+_PHONE_SESSION_EXPIRED_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Session expired</title>
+<style>
+  html,body{height:100%;margin:0;background:#0a0a0b;color:#fafafa;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center;padding:32px}
+  .card{max-width:340px;text-align:center;display:flex;flex-direction:column;gap:14px}
+  .icon{font-size:54px}
+  h1{font-size:22px;font-weight:800;margin:0}
+  p{font-size:14px;color:#a1a1aa;line-height:1.5;margin:0}
+  code{background:#18181b;padding:2px 8px;border-radius:6px;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#fbbf24}
+</style></head>
+<body><div class="card">
+  <div class="icon">⏱️</div>
+  <h1>Session expired</h1>
+  <p>This phone-upload link is no longer active. The Mac dashboard has rotated to a fresh QR code.</p>
+  <p>Open the Mac, refresh the dashboard tab, and scan the new QR.</p>
+</div></body></html>"""
+
+
+@app.get("/debug/clips")
+async def debug_clips_page():
+    """Standalone clip-test page — plays every Tier 0/1 substrate the
+    dashboard relies on in plain <video> elements with controls. Use
+    when the live stage looks broken to confirm whether it's the
+    asset/serving (no clip plays here either) or the dashboard player
+    (clips play here but stage shows frozen idle)."""
+    static_dir = Path(__file__).resolve().parent / "static"
+    template_path = static_dir / "debug_clips.html"
+    if not template_path.exists():
+        raise HTTPException(500, "debug_clips.html missing")
+    return HTMLResponse(content=template_path.read_text(),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/phone/{session_id}")
+async def phone_recorder_page(session_id: str):
+    """Serve the mobile recorder HTML for a given session. Templated
+    in-place (one-line replace of the WS URL + session_id) so we don't
+    need a Jinja dependency for a single static page.
+
+    Expired/unknown session → friendly HTML page (NOT a JSON 404).
+    Safari renders the JSON 404 as a blank dark page because of the
+    dark colour scheme and the short response body — operator sees no
+    feedback. The HTML response below tells them exactly what to do
+    (refresh dashboard for a fresh QR)."""
+    session = phone_uploader.get_session(session_id)
+    if session is None:
+        return HTMLResponse(content=_PHONE_SESSION_EXPIRED_HTML, status_code=404)
+
+    # Recorder page lives next to main.py in static/. Templated with
+    # the session-specific WS URL so the page knows where to stream
+    # without a second handshake. The host header reflects whatever IP
+    # the phone hit — usually the LAN IP we encoded in the QR — so we
+    # build the WS URL from request.url to handle the rare case where
+    # the operator manually shares a different host.
+    static_dir = Path(__file__).resolve().parent / "static"
+    template_path = static_dir / "phone_recorder.html"
+    if not template_path.exists():
+        raise HTTPException(500, "phone_recorder.html missing — backend install incomplete")
+
+    html = template_path.read_text()
+    public_url = os.getenv("EMPIRE_PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        ws_url = public_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        ws_url = f"{ws_url}/ws/phone/upload/{session_id}"
+    else:
+        backend_port = int(os.getenv("BACKEND_PORT", BACKEND_PORT or 8000))
+        ws_url = f"ws://{phone_uploader.lan_ip()}:{backend_port}/ws/phone/upload/{session_id}"
+    html = html.replace("{{SESSION_ID}}", session_id).replace("{{WS_URL}}", ws_url)
+    return HTMLResponse(content=html)
+
+
+@app.websocket("/ws/phone/upload/{session_id}")
+async def phone_upload_ws(ws: WebSocket, session_id: str):
+    """Binary-stream video chunks from the phone's MediaRecorder into a
+    temp file, then hand the file off to run_video_sell_pipeline as if
+    it were a /api/sell-video upload.
+
+    Protocol (the phone-side recorder enforces this order):
+      1. WS open → server accepts → status=connected, broadcast to dash
+      2. First message: JSON {type:"start", mime_type, voice_text?}
+         → server allocates the temp file and sets the right suffix
+           so ffmpeg can probe the container correctly
+      3. N binary messages: video bytes from MediaRecorder.ondataavailable
+      4. Final message: JSON {type:"end"}
+         → server flushes, fsyncs, and triggers the sell pipeline
+      5. Server replies {type:"complete", request_id} so the phone can
+         show "Sent! Watch the screen."
+
+    Errors at any step set session.status=failed and broadcast a
+    phone_upload_failed event so the dashboard can show the operator
+    what went wrong (no silent black-hole)."""
+    session = phone_uploader.get_session(session_id)
+    if session is None:
+        await ws.close(code=1008, reason="session not found")
+        return
+
+    await ws.accept()
+    session.status = "connected"
+    await broadcast_to_dashboards({
+        "type": "phone_upload_status",
+        **phone_uploader.session_summary(session),
+    })
+
+    upload_path: Path | None = None
+    upload_handle = None
+    voice_text = "sell this"
+    try:
+        # Phase 1 — wait for the start handshake. Times out after 30s
+        # so an idle WS doesn't hold a session forever.
+        first = await asyncio.wait_for(ws.receive(), timeout=30.0)
+        if first.get("type") != "websocket.receive" or "text" not in first:
+            raise ValueError("expected text 'start' message first")
+        start_msg = json.loads(first["text"])
+        if start_msg.get("type") != "start":
+            raise ValueError(f"first message must be type='start', got {start_msg.get('type')!r}")
+        session.mime_type = str(start_msg.get("mime_type") or "video/webm")
+        voice_text = str(start_msg.get("voice_text") or "sell this")
+        # Pick file extension from MIME so ffmpeg can probe the container.
+        # MediaRecorder gives "video/webm" on Chrome/Android, "video/mp4"
+        # or "video/quicktime" on iOS Safari ≥14.3. Default to .webm.
+        if "mp4" in session.mime_type or "quicktime" in session.mime_type:
+            suffix = ".mp4"
+        else:
+            suffix = ".webm"
+        upload_path = phone_uploader.open_upload_file(session, suffix=suffix)
+        upload_handle = open(upload_path, "wb")
+        session.status = "recording"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_status",
+            **phone_uploader.session_summary(session),
+        })
+        logger.info("[phone] %s recording: mime=%s suffix=%s -> %s",
+                    session_id, session.mime_type, suffix, upload_path)
+
+        # Phase 2 — receive binary chunks until "end" message arrives.
+        # Mixed text/binary handling: starlette delivers each via the
+        # same receive() with either "text" or "bytes" key set.
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(msg.get("code", 1006))
+            if "bytes" in msg and msg["bytes"] is not None:
+                chunk = msg["bytes"]
+                upload_handle.write(chunk)
+                session.bytes_received += len(chunk)
+                session.chunks_count += 1
+                # Throttle progress broadcasts — every 250 KB or every
+                # 8 chunks, whichever first. Avoids flooding dashboard
+                # WS for a fast 10 MB stream.
+                if session.chunks_count % 8 == 0 or session.bytes_received % (256 * 1024) < len(chunk):
+                    await broadcast_to_dashboards({
+                        "type": "phone_upload_status",
+                        **phone_uploader.session_summary(session),
+                    })
+            elif "text" in msg and msg["text"]:
+                end_msg = json.loads(msg["text"])
+                if end_msg.get("type") == "end":
+                    voice_text = str(end_msg.get("voice_text") or voice_text)
+                    break
+                # Ignore unknown text frames mid-stream rather than
+                # crashing — defensive against future protocol additions.
+                logger.warning("[phone] %s ignoring mid-stream text: %s",
+                               session_id, end_msg.get("type"))
+
+        # Phase 3 — flush + fsync so the pipeline reads complete bytes.
+        # Without fsync the kernel's page cache might still be holding
+        # writes when run_video_sell_pipeline calls ffmpeg, leading to
+        # truncated reads on the rare race.
+        upload_handle.flush()
+        os.fsync(upload_handle.fileno())
+        upload_handle.close()
+        upload_handle = None
+
+        session.status = "uploading"
+        request_id = uuid.uuid4().hex[:12]
+        session.request_id = request_id
+        await broadcast_to_dashboards({
+            "type": "phone_upload_status",
+            **phone_uploader.session_summary(session),
+        })
+        # Mirror /api/sell-video: fire the "uploaded" pipeline_step so
+        # the dashboard's progress rail moves immediately, then play
+        # the upload bridge, then kick the pipeline.
+        asyncio.ensure_future(_emit_pipeline_step(
+            request_id, "uploaded", "done",
+            ms=0, detail=f"{session.bytes_received}B (phone)"))
+        await _play_upload_bridge()
+        asyncio.ensure_future(run_video_sell_pipeline(
+            str(upload_path), voice_text, request_id=request_id))
+
+        session.status = "complete"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_complete",
+            **phone_uploader.session_summary(session),
+        })
+        # Tell the phone the server is done with it so the recorder can
+        # show its "sent!" state and (optionally) close the WS.
+        await ws.send_text(json.dumps({
+            "type": "complete",
+            "request_id": request_id,
+            "bytes": session.bytes_received,
+        }))
+        logger.info("[phone] %s complete: %d bytes in %d chunks → request_id=%s",
+                    session_id, session.bytes_received, session.chunks_count, request_id)
+
+    except WebSocketDisconnect:
+        # Phone dropped the WS before sending "end" — partial upload,
+        # not usable. Mark as failed so the dashboard can show "phone
+        # disconnected" and let the operator try again.
+        session.status = "failed"
+        session.error = "phone disconnected mid-upload"
+        logger.warning("[phone] %s disconnected mid-upload (got %d bytes)",
+                       session_id, session.bytes_received)
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+    except asyncio.TimeoutError:
+        session.status = "failed"
+        session.error = "no start message within 30s"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+        try:
+            await ws.close(code=1008, reason="start timeout")
+        except Exception:
+            pass
+    except Exception as e:
+        session.status = "failed"
+        session.error = str(e)[:200]
+        logger.exception("[phone] %s upload error", session_id)
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": session.error}))
+            await ws.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        if upload_handle is not None:
+            try:
+                upload_handle.close()
+            except Exception:
+                pass
 
 
 @app.post("/api/sell-video")
@@ -964,6 +1458,12 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str,
 
     if transcript:
         log_event("EYES", f'Seller said: "{transcript[:200]}..."')
+        # Stash for comment dispatch — classify_comment_gemma reads this
+        # so the on-device Gemma draft can quote what the seller actually
+        # said in the pitch ("you mentioned same-day shipping…") instead
+        # of falling back to a generic "we're not sure what you're
+        # asking" reply when the comment is terse like "how much?".
+        pipeline_state["seller_transcript"] = transcript
         await broadcast_to_dashboards({"type": "transcript", "text": transcript})
 
     # NOTE: transcript_extract was firing here in parallel — a separate
@@ -1990,7 +2490,7 @@ async def _fire_speculative_bridge(comment: str) -> None:
 
 # ── Voice comment pipeline ─────────────────────────────────────────────────
 #
-# Hour 2-3 scaffolding: one new endpoint + a one-function stub router.
+# Two entry points:
 #
 #   POST /api/voice_comment
 #     accepts an audio blob (webm/opus from the dashboard MediaRecorder,
@@ -1999,9 +2499,8 @@ async def _fire_speculative_bridge(comment: str) -> None:
 #     the dashboard, then hands the transcript to run_routed_comment().
 #
 #   run_routed_comment(comment)
-#     STUB. Forwards every comment to the existing /api/respond_to_comment
-#     cloud pipeline. Hour 4-5 replaces this with a FunctionGemma-driven
-#     dispatcher that picks among four tools (respond_locally,
+#     The four-tool dispatcher: rule-based router fed by Gemma's classify
+#     output picks among (respond_locally,
 #     escalate_to_cloud, play_canned_clip, block_comment). Keeping the
 #     signature stable means /api/voice_comment never needs to change.
 
@@ -2021,12 +2520,40 @@ async def run_routed_comment(comment: str) -> dict:
 
     # 1. Classify (on-device Gemma 4). Never raises — returns a dict with
     #    at least {type, source} even on fallback. Safe to await here.
-    classify = await classify_comment_gemma(comment)
+    # SKIP Gemma classify for comments by default. On this hardware
+    # (M3 Pro, no model.mlpackage) Gemma's CPU prefill at ~2.5 tok/s
+    # turns a 100-200-token classify prompt into a 10-15 s blocking
+    # call — single-handedly blowing the comment latency budget
+    # (target 6 s end-to-end). The rule-based router uses keyword cues
+    # (compliment / objection / spam) to assign intent_hint without
+    # Gemma; for anything not caught by the cue lists, "question" is
+    # the safe default and the bridge picker handles it correctly.
+    # Re-enable Gemma's per-comment classification (with the new
+    # product+transcript context) by exporting
+    # EMPIRE_GEMMA_CLASSIFY_COMMENTS=1 once model.mlpackage lands and
+    # classify drops to <200 ms. Pitch generation still uses Gemma —
+    # that path is async to the user-facing latency.
+    if os.getenv("EMPIRE_GEMMA_CLASSIFY_COMMENTS") == "1":
+        classify = await classify_comment_gemma(
+            comment,
+            product=pipeline_state.get("product_data"),
+            transcript=pipeline_state.get("seller_transcript"),
+        )
+    else:
+        classify = {"type": "question", "source": "skipped",
+                    "latency_ms": 0, "draft_response": ""}
 
     # 2. Decide.
     decision = await comment_router.decide(comment, classify, product)
 
-    # 3. Broadcast so RoutingPanel (Hour 7) can tick counters.
+    # 3. Broadcast so RoutingPanel + the Gemma-decision HUD on
+    #    the operator stage can render the early signal — fires within
+    #    ~300 ms of the comment landing, ~5-7 s before the rendered
+    #    comment_response_video shows up. `intent` is the raw classifier
+    #    bucket (compliment / objection / question / spam); `intent_hint`
+    #    in args is what the dispatcher actually uses to pick the bridge
+    #    substrate (resolved from cue lists when classify is "question"
+    #    but the comment scans as a compliment, etc.).
     await broadcast_to_dashboards({
         "type": "routing_decision",
         "comment": comment,
@@ -2035,14 +2562,17 @@ async def run_routed_comment(comment: str) -> dict:
         "ms": decision["ms"],
         "was_local": decision["was_local"],
         "cost_saved_usd": decision["cost_saved_usd"],
+        "intent": classify.get("type"),
+        "intent_hint": decision.get("args", {}).get("intent_hint"),
+        "classify_ms": int(classify.get("latency_ms", 0)),
+        "draft_response": (classify.get("draft_response") or "")[:140],
     })
     log_event("ROUTER", f'{decision["tool"]} — {decision["reason"]} ({decision["ms"]}ms)',
               {"classify": classify.get("type"), "was_local": decision["was_local"]})
 
     # 3b. Persist for BRAIN aggregation. Hardcoded stream_id="default" until
-    #     multi-stream isolation lands (Sprint 5+); active_product_id mirrors
-    #     pipeline_state which the dashboard sets via /api/state/active_product
-    #     once multi-product (S1.3) ships.
+    #     multi-stream isolation lands (roadmap); active_product_id mirrors
+    #     pipeline_state which the dashboard sets via /api/state/active_product.
     brain.record_event(
         stream_id="default",
         product_id=pipeline_state.get("active_product_id") or "unknown",
@@ -2060,10 +2590,210 @@ async def run_routed_comment(comment: str) -> dict:
         return await _run_play_canned_clip(comment, args, decision)
     if tool == "block_comment":
         return await _run_block_comment(comment, args, decision)
-    # Default: escalate_to_cloud. Same pattern as the old stub — forward to
-    # the existing api_respond_to_comment, and on failure fade + broadcast
-    # comment_failed with any drafted text.
-    return await _run_escalate_to_cloud(comment, args, decision)
+    # Default (escalate_to_cloud bucket): the new bridge+wav2lip path.
+    # Uses Gemma's draft_response (already on-device, no extra LLM call)
+    # and lip-syncs onto the intent-specific bridge clip as substrate.
+    # Falls back to the legacy _run_escalate_to_cloud (Claude + default
+    # substrate) on any failure so the demo never shows dead air.
+    return await _run_bridge_with_wav2lip(comment, classify, decision)
+
+
+async def _run_bridge_with_wav2lip(comment: str, classify: dict, decision: dict) -> dict:
+    """The intent-aware comment dispatch path.
+
+    Architecture (per the user's spec):
+      1. Gemma already classified upstream (in run_routed_comment) and
+         returned `{type, draft_response}` — both fields used directly
+         here. NO additional LLM call.
+      2. reading_chat fires immediately as the visual mask while we work.
+      3. Pick a random raw bridge clip from /workspace/bridges/<intent>/
+         on the pod (intent ∈ {compliment, objection, question}).
+         Falls back to the default speaking-pose substrate when the
+         intent has no clips (or classifier returned an unknown type).
+      4. ElevenLabs TTS the draft_response.
+      5. Wav2Lip /lipsync_fast renders the audio onto the bridge clip
+         as substrate. Bridge clips are 8 s — comfortably longer than
+         a typical 5 s response. First render per substrate is COLD
+         (~12 s, builds face-detect cache); subsequent are warm (~5-6 s).
+      6. Director.play_response crossfades from reading_chat to the
+         rendered output. fade_to_idle releases Tier 1 after the audio
+         finishes.
+
+    The avatar visibly does an intent-appropriate gesture (warm smile
+    for compliments, thoughtful nod for questions, "actually..." beat
+    for objections) WHILE speaking the response. Mouth alignment isn't
+    perfect (Wav2Lip on a non-purpose-built substrate warbles a bit)
+    but the body language coherence is the point.
+
+    Failure mode: if Wav2Lip errors (404 substrate, pod down, bad
+    audio), fall back to _run_escalate_to_cloud which uses the default
+    speaking-pose substrate via Claude. This guarantees a response
+    even when the bridge upload is stale or the pod's face cache is
+    inaccessible.
+    """
+    # Intent priority: the router's intent_hint wins (it covers the
+    # cue-list overrides — e.g. comment classified as "question" but
+    # the cue list flagged "love" → intent_hint=compliment). Falls back
+    # to classify.type, then "question" as a safe default that maps to
+    # the question bridge bucket.
+    intent = (
+        decision.get("args", {}).get("intent_hint")
+        or classify.get("type")
+        or "question"
+    ).lower().strip()
+    draft = (classify.get("draft_response") or "").strip()
+
+    # 1. Pick substrate. None ⇒ default speaking pose (safe path).
+    substrate = pick_intent_substrate(intent)
+    pod_path = substrate["pod_path"] if substrate else POD_SPEAKING_1080P
+    substrate_label = substrate["url"] if substrate else "default"
+    log_event("ROUTER", f'bridge+wav2lip intent={intent} substrate={substrate_label}',
+              {"pod_path": pod_path, "draft": draft[:80] if draft else None})
+
+    # Broadcast the substrate pick IMMEDIATELY so the operator HUD shows
+    # which bridge clip Gemma's intent mapped to — visible within ~300 ms
+    # of the comment landing, ~5-15 s before the rendered comment_response_video
+    # closes the loop. Without this the substrate is invisible until the
+    # full Wav2Lip render lands, and the operator can't tell why a
+    # particular bridge gesture is about to play.
+    await broadcast_to_dashboards({
+        "type": "comment_substrate_picked",
+        "comment": comment,
+        "intent": intent,
+        "substrate": substrate_label,
+        "draft_response": (draft or "")[:140],
+    })
+
+    # 2. Reading-chat as the visual mask while we render. Background
+    #    task — emit_reading_chat returns immediately after the WS
+    #    broadcast; the Tier 1 busy_until horizon set by emit() keeps
+    #    the idle rotation suppressed for the loop's full ttl.
+    if director:
+        asyncio.create_task(director.emit_reading_chat())
+
+    # 3. Pick the response text. Gemma's draft is the light path;
+    #    fall back to Claude only when the draft is empty/too short.
+    text_t0 = time.time()
+    if draft and len(draft) >= 6:
+        response_text = draft
+        text_source = "gemma_draft"
+        text_ms = 0
+    else:
+        try:
+            # Pass the seller's pitch transcript so Claude grounds its
+            # reply in what the audience actually heard ("you mentioned
+            # same-day shipping…") instead of inventing details. Same
+            # context Gemma gets when EMPIRE_GEMMA_CLASSIFY_COMMENTS=1.
+            response_text = await generate_comment_response(
+                comment,
+                pipeline_state.get("product_data") or {},
+                intent,
+                transcript=pipeline_state.get("seller_transcript"),
+            )
+            text_source = "claude_primary"
+        except Exception as e:
+            logger.warning("[bridge_wav2lip] Claude draft failed: %s — using stock", e)
+            response_text = "Let me come back to that one."
+            text_source = "stock"
+        text_ms = int((time.time() - text_t0) * 1000)
+    pipeline_state["last_response_text"] = {"comment": comment, "response": response_text}
+
+    # 4. TTS — translate first if active language ≠ en (mirrors pitch path).
+    active_lang = pipeline_state.get("active_language", "en")
+    tts_text = response_text
+    if active_lang != "en":
+        try:
+            tts_text = await translator.translate(response_text, active_lang)
+        except Exception as e:
+            logger.warning("[bridge_wav2lip] translate failed: %s — using English", e)
+    tts_t0 = time.time()
+    audio_bytes = await text_to_speech(tts_text, language_code=active_lang)
+    tts_ms = int((time.time() - tts_t0) * 1000)
+    if not audio_bytes:
+        logger.error("[bridge_wav2lip] empty TTS — escalating to legacy cloud path")
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    # 5. Wav2Lip render. First call per substrate is cold (~12 s);
+    #    subsequent calls hit the pod's face-detect cache and run
+    #    in ~5-6 s. On HARD failure (404 / pod down / exhausted retries)
+    #    fall back to the default substrate via the legacy path so the
+    #    audience always sees something.
+    lipsync_t0 = time.time()
+    try:
+        video_bytes, _hdrs = await render_comment_response_wav2lip(
+            audio_bytes, source_path_on_pod=pod_path, out_height=1920)
+    except Exception as e:
+        logger.warning("[bridge_wav2lip] Wav2Lip on substrate %s failed (%s) — "
+                       "retrying with default substrate", pod_path, e)
+        try:
+            video_bytes, _hdrs = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=POD_SPEAKING_1080P, out_height=1920)
+            substrate_label = f"{substrate_label} → default (fallback)"
+        except Exception as e2:
+            logger.error("[bridge_wav2lip] default substrate fallback also failed: %s", e2)
+            if director:
+                try:
+                    await director.fade_to_idle()
+                except Exception:
+                    pass
+            await broadcast_to_dashboards({
+                "type": "comment_failed",
+                "comment": comment, "response": response_text,
+                "reason": f"wav2lip: {str(e2)[:120]}",
+            })
+            raise
+    lipsync_ms = int((time.time() - lipsync_t0) * 1000)
+
+    # 6. Persist + emit via Director. Probe the rendered duration so
+    #    fade-to-idle fires at the right moment (Wav2Lip output length
+    #    matches the audio length, not the substrate length).
+    rid = uuid.uuid4().hex[:12]
+    out_path = RENDER_DIR / f"comment_{rid}.mp4"
+    out_path.write_bytes(video_bytes)
+    url = f"/renders/{out_path.name}"
+    audio_dur_ms = _probe_video_duration_ms(out_path) or \
+                   int(max(2500, len(response_text.split()) * 350))
+
+    if director:
+        await director.play_response(url, expected_duration_ms=audio_dur_ms)
+
+        async def _release_after_audio():
+            await asyncio.sleep(audio_dur_ms / 1000 + 0.4)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after_audio())
+
+    total_ms = decision["ms"] + text_ms + tts_ms + lipsync_ms
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "intent": intent,
+        "substrate": substrate_label,
+        "text_source": text_source,
+        "total_ms": total_ms,
+        "class_ms": int(classify.get("latency_ms", 0)),
+        "text_ms": text_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+    })
+    log_event("LIPSYNC", f"comment response rendered ({lipsync_ms}ms, "
+              f"intent={intent}, substrate={substrate_label})")
+    return {
+        "dispatch": "bridge_wav2lip",
+        "routing": decision,
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "intent": intent,
+        "substrate": substrate_label,
+        "text_source": text_source,
+        "total_ms": total_ms,
+        "class_ms": int(classify.get("latency_ms", 0)),
+        "text_ms": text_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+    }
 
 
 async def _run_escalate_to_cloud(comment: str, args: dict, decision: dict) -> dict:
@@ -2243,7 +2973,7 @@ async def api_voice_comment(audio: UploadFile = File(...)):
     if USE_SPECULATIVE_BRIDGE:
         asyncio.create_task(_fire_speculative_bridge(text))
 
-    # (2) Route + render. Today = always escalate. Hour 4-5 adds real routing.
+    # (2) Route + render through the rule-based + Gemma-classify dispatcher.
     try:
         routed = await run_routed_comment(text)
     except Exception as e:

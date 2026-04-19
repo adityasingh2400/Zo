@@ -8,8 +8,8 @@ What's NOT here yet:
   - Heavy pipeline endpoints (/api/voice_comment, /api/respond_to_comment,
     /api/sell, /api/sell-video, /api/creator/build) — mocking the full
     Bedrock + ElevenLabs + Wav2Lip + rembg + ffmpeg surface burns the
-    test budget. They get integration tests in Sprint 2 follow-ups when
-    we can run against fakes that share the real interface.
+    test budget. They get integration tests in follow-ups when we can
+    run against fakes that share the real interface.
   - Long-running flows that depend on Cactus/Gemma being loaded —
     conftest.py skips the lifespan deliberately so tests stay fast.
 """
@@ -40,7 +40,7 @@ def test_state_with_product_loaded(client, with_product):
     assert any(p["id"] == "test_wallet" for p in body["products"])
 
 
-# ── Multi-product endpoint (Sprint 1.3) ─────────────────────────────────────
+# ── Multi-product endpoint ──────────────────────────────────────────────────
 
 
 def test_set_active_product_valid(client, with_product):
@@ -60,7 +60,7 @@ def test_set_active_product_invalid_returns_404(client, with_product):
     assert "not in catalog" in r.json()["detail"]
 
 
-# ── BRAIN (Sprint 1.2) ──────────────────────────────────────────────────────
+# ── BRAIN ───────────────────────────────────────────────────────────────────
 
 
 def test_brain_stats_empty(client):
@@ -164,7 +164,7 @@ def test_comment_form_serves_html(client):
     assert "<textarea" in r.text
 
 
-# ── CORS lockdown (Sprint 2.6) ──────────────────────────────────────────────
+# ── CORS lockdown ───────────────────────────────────────────────────────────
 
 
 def test_cors_allows_configured_origin(client):
@@ -180,7 +180,7 @@ def test_cors_denies_unallowed_origin(client):
     assert allow != "http://evil.example.com"
 
 
-# ── WS auth (Sprint 2.6) ────────────────────────────────────────────────────
+# ── WS auth ─────────────────────────────────────────────────────────────────
 
 
 def test_ws_dashboard_default_off_allows_unauth(client):
@@ -209,7 +209,7 @@ def test_ws_dashboard_accepts_correct_token(client, monkeypatch):
         assert msg["type"] == "state_sync"
 
 
-# ── Spend cap (Sprint 2.6) ──────────────────────────────────────────────────
+# ── Spend cap ───────────────────────────────────────────────────────────────
 
 
 def test_spend_cap_default_off():

@@ -7,7 +7,7 @@ a video to start working.
 
 ## Your mission
 
-Build **`/dev/comments`** — a developer page mounted in the dashboard
+Build `**/dev/comments`** — a developer page mounted in the dashboard
 that lets you iterate on the comment routing + bridge picker without
 running the full sell pipeline every time.
 
@@ -18,30 +18,25 @@ lives) and put the component at `dashboard/src/dev/CommentTester.jsx`.
 ## What the page needs
 
 1. **Hydrate from fixture, not live state.** Read
-   `phase0/fixtures/post_pitch_state.json` (or fetch from a new
+  `phase0/fixtures/post_pitch_state.json` (or fetch from a new
    `/api/dev/fixture/post_pitch` endpoint if you'd rather keep it
    server-side) so the page boots in a "post-pitch, ready for
    comments" state without any pipeline run.
-
 2. **Comment input** — text box → `POST /api/comment` (form-encoded,
-   `text=...`). See `COMMENT_API.md` §1.
-
+  `text=...`). See `COMMENT_API.md` §1.
 3. **Routing decision panel.** Subscribe to `/ws/dashboard`, render the
-   incoming `routing_decision` event: which tool fired, why, latency,
+  incoming `routing_decision` event: which tool fired, why, latency,
    cost saved, was-local flag.
-
 4. **Avatar response preview.** Show the resulting clip URL — local
-   answer mp4, bridge clip, or pitch render. Use the existing
+  answer mp4, bridge clip, or pitch render. Use the existing
    `<video>` rendering pattern from `TikTokShopOverlay.jsx`.
-
 5. **Bridge picker iteration UI.** This is the meat. Load
-   `bridge_library.json`. For each intent bucket, show the 6-12 clips
+  `bridge_library.json`. For each intent bucket, show the 6-12 clips
    side by side with thumbnails. Let yourself force-pick a specific
    variant for testing (debug override via querystring, or a dropdown
    per intent).
-
 6. **FunctionGemma prompt editor.** The `play_canned_clip` tool today
-   does random pick. The roadmap (`router.py:13`) has FunctionGemma on
+  does random pick. The roadmap (`router.py:13`) has FunctionGemma on
    Gemma 4 doing intent-aware picks ("compliment_C feels warmer for
    first-time viewers"). Build a textarea where you can edit the
    FunctionGemma prompt and re-run dispatch with the edited prompt.
@@ -59,19 +54,22 @@ lives) and put the component at `dashboard/src/dev/CommentTester.jsx`.
 
 ## Ownership boundaries — do not touch
 
-| Path | Owner | Why |
-|---|---|---|
-| `backend/main.py:run_video_sell_pipeline / run_sell_pipeline` | Aditya | intake + pitch generation |
-| `backend/agents/eyes.py:analyze_and_script_*` | Aditya | Gemma vision + text-only paths |
-| `backend/agents/threed.py` | Aditya | carousel + raw_heroes + Spin3D |
-| `backend/agents/seller.py:render_pitch_*` | Aditya | TTS + pitch Wav2Lip |
-| `dashboard/src/App.jsx` | Aditya | the main stage shell |
-| `dashboard/src/components/TikTokShopOverlay.jsx` | Aditya | live phone surface |
-| `phase0/assets/bridges/processing/` | Aditya | the upload-bridge clip |
-| `ios/EmpirePhone/`, `phone-quickdrop/` | Cody (active branch) | iOS phone surface |
+
+| Path                                                          | Owner                | Why                            |
+| ------------------------------------------------------------- | -------------------- | ------------------------------ |
+| `backend/main.py:run_video_sell_pipeline / run_sell_pipeline` | Aditya               | intake + pitch generation      |
+| `backend/agents/eyes.py:analyze_and_script_`*                 | Aditya               | Gemma vision + text-only paths |
+| `backend/agents/threed.py`                                    | Aditya               | carousel + raw_heroes + Spin3D |
+| `backend/agents/seller.py:render_pitch_*`                     | Aditya               | TTS + pitch Wav2Lip            |
+| `dashboard/src/App.jsx`                                       | Aditya               | the main stage shell           |
+| `dashboard/src/components/TikTokShopOverlay.jsx`              | Aditya               | live phone surface             |
+| `phase0/assets/bridges/processing/`                           | Aditya               | the upload-bridge clip         |
+| `ios/EmpirePhone/`, `phone-quickdrop/`                        | Cody (active branch) | iOS phone surface              |
+
 
 You **may** touch:
-- `backend/main.py:run_routed_comment` and `_run_*` dispatch helpers
+
+- `backend/main.py:run_routed_comment` and `_run_`* dispatch helpers
 - `backend/agents/router.py` — the picker logic, cost model, FunctionGemma prompt
 - `backend/agents/eyes.py:classify_comment_gemma` — classifier improvements
 - `backend/agents/seller.py:render_comment_response_wav2lip` — comment-render path (already has the retry loop Aditya added)
@@ -80,18 +78,16 @@ You **may** touch:
 
 ## Open questions to flag, not solve
 
-1. **`question/` bucket has 12 clips but no tool routes there.**
-   Currently `play_canned_clip` accepts `compliment | objection | neutral`
+1. `**question/` bucket has 12 clips but no tool routes there.**
+  Currently `play_canned_clip` accepts `compliment | objection | neutral`
    only. Should `question` become a 5th label, or do questions always
    route to `respond_locally` / `escalate_to_cloud`? The 12 clips are
    curated and ready — they want a home.
-
-2. **`neutral` label has no dedicated bucket.** Today the picker would
-   404 on `play_canned_clip(neutral)`. Should it borrow from compliment
+2. `**neutral` label has no dedicated bucket.** Today the picker would
+  404 on `play_canned_clip(neutral)`. Should it borrow from compliment
    or objection? Or use `processing/processing.mp4`?
-
 3. **Active product mismatch in fixture.** `post_pitch_state.json` shows
-   `product_data` = the watch (just pitched) but `active_product_id` =
+  `product_data` = the watch (just pitched) but `active_product_id` =
    `leather_wallet` (the catalog default with the live qa_index). Comments
    route through the catalog's qa_index, not `product_data`. Confirm
    with Aditya whether the watch should also become the active product

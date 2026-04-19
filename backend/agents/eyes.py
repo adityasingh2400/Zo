@@ -182,11 +182,55 @@ Give a brief product analysis as JSON:
             "latency_ms": int(latency), "cost": "$0.00"}
 
 
-async def classify_comment_gemma(comment: str) -> dict:
-    """On-device comment classification."""
-    prompt = f"""Classify this livestream comment and draft a short response.
-Comment: "{comment}"
-Reply as JSON only: {{"type": "question|compliment|objection|spam", "draft_response": "1 sentence"}}"""
+async def classify_comment_gemma(
+    comment: str,
+    product: dict | None = None,
+    transcript: str | None = None,
+) -> dict:
+    """On-device classify + draft for a viewer comment.
+
+    Returns `{type, draft_response, source, latency_ms}` where:
+      - `type` ∈ {question, compliment, objection, spam} drives the bridge
+        substrate pick downstream (compliment/objection/question).
+      - `draft_response` is the spoken reply — used directly by
+        _run_bridge_with_wav2lip (no Claude round-trip in the warm path).
+
+    `product` and `transcript` give Gemma the same context the seller
+    gave the audience during the pitch. Without them Gemma sees only the
+    raw comment string and produces generic "we're not sure what you're
+    asking" fallbacks for anything beyond simple greetings. With them
+    Gemma can reference real product fields (price, materials, shipping)
+    AND the seller's own narration ("you mentioned same-day shipping —
+    yes, ships in 24 h"). Both are optional so the function stays
+    callable from test contexts without wiring the full state.
+
+    Token-budget aware: product is JSON-trimmed to ~300 chars, transcript
+    to ~400 chars. Cactus prefill is the bottleneck on M-series Macs
+    (CPU not Metal until model.mlpackage ships) so keeping the prompt
+    tight matters — every extra 100 input tokens adds ~150-300 ms of
+    classify latency.
+    """
+    ctx_lines = []
+    if product:
+        try:
+            product_blob = json.dumps(product, separators=(",", ":"))[:300]
+            ctx_lines.append(f"Product: {product_blob}")
+        except (TypeError, ValueError):
+            pass
+    if transcript:
+        ctx_lines.append(f'Seller said in pitch: "{transcript[:400]}"')
+    ctx = ("\n".join(ctx_lines) + "\n") if ctx_lines else ""
+
+    prompt = f"""You are an AI sales avatar on a livestream. A viewer just commented.
+
+{ctx}Viewer comment: "{comment}"
+
+Classify the comment and draft a SHORT spoken reply (1 sentence, max 20 words, conversational).
+- Use the product info / seller's pitch when relevant — quote prices, materials, shipping if they were mentioned.
+- If the answer wasn't covered in the pitch, admit it gracefully ("good question — that wasn't covered, I'll get back to you").
+- Skip preambles ("Great question…"), stage directions, hedging.
+
+Reply as JSON only: {{"type":"question|compliment|objection|spam","draft_response":"…"}}"""
 
     if CACTUS_AVAILABLE:
         import asyncio

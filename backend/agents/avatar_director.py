@@ -199,6 +199,29 @@ class Director:
         # layer — kills the "she glances aside silently DURING the
         # processing.mp4 readback" overlap class. Cleared by fade_to_idle.
         self._tier1_busy_until: float = 0.0
+        # PITCH LOCK — set True for the duration of an opening pitch
+        # (audio-first or legacy single-render). Stronger than busy_until:
+        # blocks ALL autonomous Tier 1 emits unconditionally, immune to
+        # timer drift if the pitch audio runs longer than the renderer's
+        # estimate. Cleared explicitly by unlock_tier1_with_settle()
+        # which is called by:
+        #   1. observe(pitch_audio_end) — dashboard signals audio finished
+        #   2. caller's fallback timer based on probed audio duration
+        # Once cleared, _post_pitch_settle_until enforces a brief idle
+        # hold (default 2.5 s of pure Tier 0) before autonomous Tier 1
+        # interjections can fire again — gives the avatar a "settled"
+        # beat after the pitch instead of jumping straight to a sip.
+        self._tier1_locked: bool = False
+        self._post_pitch_settle_until: float = 0.0
+        # Phone-upload coalescing: if a new upload arrives while the
+        # previous pitch is still playing (pitch_lock active), the
+        # bridge would jump on top of the still-speaking avatar
+        # ("froze and jumped to new pitch" from the operator's seat).
+        # Stash a "deferred bridge" flag here that
+        # unlock_tier1_with_settle drains after the prior pitch
+        # releases — the new bridge then fires cleanly into the
+        # post-pitch idle window instead of mid-speech.
+        self._pending_play_processing: bool = False
 
     def current_substrate_pod_path(self) -> str:
         """The Wav2Lip server-side path that matches the visible Tier 0 clip,
@@ -274,22 +297,38 @@ class Director:
         }
         self._last_intent[layer] = intent
         self._last_url[layer] = url
-        # Tier 1 busy-tracking. Any deliberate Tier 1 emit (anything not
-        # produced by the autonomous idle rotation or the explicit
-        # fade-to-idle release) extends the busy horizon to ttl_ms in the
-        # future (or 60 s for looped pitches that have no natural end and
-        # rely on dispatch_audio_first_pitch's _release task to call
-        # fade_to_idle when audio ends). _idle_loop checks this every
-        # tick and skips the random Tier 1 interjection branch while a
-        # deliberate clip owns the layer — prevents the silent-glance /
-        # sip / walk-off rotation from overlaying pitch / processing /
-        # response renders.
+        # Tier 1 busy-tracking + PITCH LOCK gate.
+        #
+        # Hard gate (pitch lock): autonomous Tier 1 emits are SUPPRESSED
+        # entirely while a pitch is on stage — the lock is set explicitly
+        # by lock_tier1_for_pitch() and cleared by unlock_tier1_with_settle()
+        # which is called by the dashboard's pitch_audio_end observer.
+        # Same suppression also covers the post-pitch settle window so
+        # autonomous Tier 1 doesn't fire the instant the lock releases.
+        # Deliberate Tier 1 emits (response, dispatch_audio_first_pitch,
+        # fade_to_idle, etc.) are NEVER suppressed — they're the caller's
+        # responsibility to sequence correctly.
+        #
+        # Soft gate (busy_until): every deliberate Tier 1 emit extends a
+        # rolling horizon based on ttl_ms (or 60 s for looped clips with
+        # no natural end). _idle_loop checks this for the common case
+        # where no pitch is in flight but a bridge / response is on stage.
         if layer == "tier1":
             if emitted_by in _IDLE_TIER1_EMITTERS:
-                pass  # autonomous emit — don't claim the layer
+                # Autonomous Tier 1 — suppress while the pitch lock owns
+                # the layer or we're in the post-pitch settle window.
+                if self._tier1_locked or time.monotonic() < self._post_pitch_settle_until:
+                    logger.info("[director] suppressing autonomous tier1 (%s) — "
+                                "locked=%s settle_until=%.2f",
+                                emitted_by, self._tier1_locked,
+                                self._post_pitch_settle_until)
+                    return
+                # Otherwise fall through to the broadcast — autonomous
+                # emit doesn't claim the layer.
             elif emitted_by == "fade_to_idle":
                 # The release sentinel — explicitly clear the horizon so
-                # idle rotation can resume at the very next tick.
+                # idle rotation can resume at the very next tick (subject
+                # to settle if it was set by the pitch path).
                 self._tier1_busy_until = 0.0
             else:
                 if loop:
@@ -377,6 +416,21 @@ class Director:
         clean — same target pose as the welcome clip + the Wav2Lip
         substrates. No special handoff logic needed.
         """
+        # PITCH-LOCK DEFERENCE — when the operator drops a 2nd upload
+        # while the 1st pitch is still talking, firing the bridge here
+        # would crossfade the walk_off clip RIGHT ON TOP of the still-
+        # speaking avatar (the pitch's standalone <audio> keeps playing
+        # through the crossfade, so audience hears Pitch-A while seeing
+        # Avatar-walking-off — visually reads as "froze and jumped to
+        # new pitch"). Instead, set a flag and let
+        # unlock_tier1_with_settle() drain it after the prior pitch
+        # finishes — bridge then lands cleanly into post-pitch idle.
+        if self._tier1_locked:
+            logger.info("[director] play_processing deferred — pitch lock active; "
+                        "bridge will fire after the current pitch releases")
+            self._pending_play_processing = True
+            return
+
         # No debounce needed — the route handler is the sole call site
         # post-Option-A, so this fires exactly once per upload. Back-to-
         # back uploads bump the chain_id and the queued processing.mp4
@@ -506,6 +560,11 @@ class Director:
         # from overlaying the pitch mid-speech if the pipeline finishes
         # before the walk_off → processing handoff has happened.
         self._processing_chain_id += 1
+        # Also lock Tier 1 for the duration of the pitch — same hard gate
+        # used by the legacy pitch path. unlock_tier1_with_settle() fires
+        # from observe(pitch_audio_end) when the dashboard's <audio>
+        # signals the audio finished.
+        self.lock_tier1_for_pitch()
 
         # Tier 1 muted looping pose. Dashboard mutes the video element
         # (audio is owned by the standalone <audio>) and skips the
@@ -595,6 +654,72 @@ class Director:
             emitted_by="fade_to_idle",
         )
 
+    # ── Pitch lock ────────────────────────────────────────────────────────
+    # The opening pitch is sacred — it's the first thing the audience hears,
+    # it sets the entire demo's tone, and it MUST NOT be interrupted by an
+    # autonomous idle gesture firing mid-sentence. The busy_until timer
+    # (set by emit() based on ttl_ms) is the soft layer; this lock is the
+    # hard layer and exists because the legacy pitch path passes
+    # expected_duration_ms=None which silently defaults busy_until to 8 s
+    # while the pitch is actually 20+ s long. With the lock, no autonomous
+    # Tier 1 emit fires regardless of timer state. Cleared explicitly by
+    # the dashboard's pitch_audio_end event (truth source for "audio
+    # actually stopped") with a fallback timer in case the event drops.
+
+    def lock_tier1_for_pitch(self) -> None:
+        """Mark Tier 1 as pitch-locked. While locked, _idle_loop and
+        emit() refuse to fire autonomous Tier 1 (idle interjection /
+        motivated sip). Deliberate emits (response, fade_to_idle,
+        dispatch_audio_first_pitch's own follow-ups) still go through.
+        Idempotent — safe to call multiple times."""
+        if not self._tier1_locked:
+            logger.info("[director] tier1 PITCH-LOCKED — autonomous Tier 1 suppressed")
+        self._tier1_locked = True
+
+    def unlock_tier1_with_settle(self, settle_seconds: float = 2.5) -> None:
+        """Release the pitch lock and start a brief settle window during
+        which autonomous Tier 1 still won't fire — gives the avatar a
+        deliberate "phew, that was the pitch" beat in pure Tier 0 idle
+        before sips / glances / walk-offs resume.
+
+        If a `play_processing` was deferred during the lock (operator
+        dropped a 2nd upload while the 1st pitch was still talking),
+        drain the flag here and re-fire it AFTER the settle window so
+        the bridge lands cleanly into post-pitch idle instead of mid-
+        speech.
+
+        Caller is responsible for issuing fade_to_idle separately when
+        appropriate (this method only manages lock state, not the visual
+        Tier 1 release)."""
+        if self._tier1_locked:
+            logger.info("[director] tier1 unlocked, settle for %.1f s before autonomous resume",
+                        settle_seconds)
+        self._tier1_locked = False
+        self._post_pitch_settle_until = time.monotonic() + max(0.0, settle_seconds)
+        # Also clear the soft busy horizon — it may still be in the future
+        # from the pitch's own emit (60 s for looped) and would otherwise
+        # extend the suppression window past the settle period.
+        self._tier1_busy_until = 0.0
+
+        # Drain any deferred bridge so the next-upload narrative
+        # (walk_off → processing) plays cleanly after the prior pitch
+        # finishes, rather than getting silently dropped or jumping on
+        # top of speech mid-sentence.
+        if self._pending_play_processing:
+            self._pending_play_processing = False
+            sleep_s = max(0.0, settle_seconds) + 0.1
+
+            async def _fire_deferred_bridge() -> None:
+                try:
+                    await asyncio.sleep(sleep_s)
+                    logger.info("[director] firing deferred play_processing after %.1f s settle",
+                                sleep_s)
+                    await self.play_processing()
+                except Exception:
+                    logger.exception("[director] deferred play_processing failed")
+
+            asyncio.create_task(_fire_deferred_bridge())
+
     # ── Voice flow integration ────────────────────────────────────────────
     # The dashboard's <Spin3D> reacts to a `state` prop ('idle' | 'listening'
     # | 'thinking' | 'responding') with rim-light gain, rotation speed, and
@@ -656,15 +781,19 @@ class Director:
                 # underlying Tier 0 substrate; the Director keeps the active
                 # idle pose paired with the next response.
                 #
-                # SUPPRESS while a deliberate Tier 1 (bridge / pitch /
-                # response / reading_chat / fetching / processing) is
-                # active — checked via _tier1_busy_until set in emit().
-                # When the deliberate horizon expires, we naturally fall
-                # through to either another Tier 1 interjection on the
-                # next tick or rotate Tier 0 below.
+                # SUPPRESS during any of:
+                #   1. _tier1_locked (pitch in progress) — hard gate
+                #   2. _post_pitch_settle_until (idle hold after pitch) — hard gate
+                #   3. _tier1_busy_until in the future (deliberate Tier 1
+                #      currently on stage, e.g. bridge / response /
+                #      reading_chat / fetching / processing) — soft gate
+                # When all clear, fall through to weighted-pick + emit.
+                now = time.monotonic()
                 if (random.random() < INTERJECTION_PROBABILITY
                         and TIER1_INTERJECTIONS
-                        and time.monotonic() >= self._tier1_busy_until):
+                        and not self._tier1_locked
+                        and now >= self._post_pitch_settle_until
+                        and now >= self._tier1_busy_until):
                     pick = self._weighted_pick(TIER1_INTERJECTIONS)
                     if pick:
                         intent, url, _w, _pod = pick
@@ -750,9 +879,16 @@ class Director:
                 if est_audio_ms >= self._SIP_AUDIO_FLOOR_MS:
                     self._schedule_sip_after(est_audio_ms + 600)
             elif mtype == "pitch_audio_end":
-                # Pitch ended — schedule sip 1.5s after fade-to-idle settles
-                # so the avatar reads as "phew, that was a lot, taking a sip".
-                self._schedule_sip_after(2000)
+                # Pitch finished. Truth source from the dashboard's <audio>
+                # ended event — release the pitch lock and start the
+                # post-pitch settle window so autonomous Tier 1 stays
+                # suppressed for an additional 2.5 s of pure idle. After
+                # the settle, _idle_loop resumes random interjections at
+                # the natural cadence. The motivated sip schedule below
+                # picks up after the settle window ends (the sip itself
+                # checks _post_pitch_settle_until before firing).
+                self.unlock_tier1_with_settle(settle_seconds=2.5)
+                self._schedule_sip_after(2500 + 1500)  # settle + 1.5 s
         except Exception:
             logger.exception("[director] observe failed (non-fatal)")
 
@@ -807,15 +943,21 @@ class Director:
         async def _fire():
             try:
                 await asyncio.sleep(delay_ms / 1000)
-                # Skip the sip if a deliberate Tier 1 currently owns the
-                # layer (pitch / response / processing / fetching /
-                # reading_chat / listening). Uses the same busy_until
-                # horizon as _idle_loop's interjection branch — single
-                # mechanism, consistent behaviour. Replaces the older
-                # explicit-intent skip-list which missed the new chain
-                # intents (fetching / processing).
-                if time.monotonic() < self._tier1_busy_until:
-                    logger.debug("[director] motivated sip skipped — tier1 busy")
+                # Three suppression gates (same set as _idle_loop's
+                # interjection branch — single mechanism):
+                #   1. _tier1_locked — pitch in progress (hard gate)
+                #   2. _post_pitch_settle_until — post-pitch idle hold (hard gate)
+                #   3. _tier1_busy_until — deliberate Tier 1 on stage (soft gate)
+                # Skipping is silent + non-rescheduling: the next eligible
+                # comment_response_audio event will queue a fresh sip.
+                now_m = time.monotonic()
+                if (self._tier1_locked
+                        or now_m < self._post_pitch_settle_until
+                        or now_m < self._tier1_busy_until):
+                    logger.debug("[director] motivated sip skipped — locked=%s settle=%.1f busy=%.1f",
+                                 self._tier1_locked,
+                                 max(0, self._post_pitch_settle_until - now_m),
+                                 max(0, self._tier1_busy_until - now_m))
                     return
                 logger.info("[director] motivated idle: sip_drink after %dms", delay_ms)
                 await self.emit(

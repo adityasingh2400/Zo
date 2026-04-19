@@ -140,14 +140,14 @@ An AI avatar that responds to viewer comments in real-time. Today it:
 - For novel questions: escalates to Bedrock Claude → TTS → live Wav2Lip render in ~5s
 - Handles objections + compliments via canned bridge clips, blocks spam silently
 
-**Today (limitations):** dashboard-only demo. Doesn't actually post to TikTok/Instagram chat — that integration is planned (Sprint 4 for TikTok Shop, separate sprints for IG / WhatsApp).
+**Today (limitations):** dashboard-only demo. Doesn't actually post to TikTok/Instagram chat — that integration is on the roadmap (TikTok Shop first, then IG / WhatsApp).
 
 ---
 
-**AGENT 4: CLOSER (Customer Intelligence)** — *planned (Sprint 4)*
+**AGENT 4: CLOSER (Customer Intelligence)** — *roadmap*
 *Will run on: Gemma 4 on-device for classification + the same Q/A index SELLER uses, behind a per-platform webhook adapter.*
 
-Will handle inbound DMs across TikTok / Instagram / WhatsApp using the same on-device router as live comments. v0 (Sprint 4) ships single-platform via webhook + persistent thread state in BRAIN's SQLite. Per-platform integration is one sprint each.
+Will handle inbound DMs across TikTok / Instagram / WhatsApp using the same on-device router as live comments. v0 ships single-platform via webhook + persistent thread state in BRAIN's SQLite. Per-platform integration follows.
 
 Today: no code shipped. Out-of-scope for the current demo.
 
@@ -161,7 +161,7 @@ Persists every router decision (comment, classify type, tool dispatched, answer 
 - Top matched Q/A entries — which answers do the work
 - Top "miss" tokens — recurring words in `escalate_to_cloud` comments, signaling which questions the local Q/A index is missing (the seller's authoring queue, generated automatically)
 
-**Planned (Sprint 4):** conversion event ingestion + conversion-aware Q/A keyword reranking (e.g., "`is_it_real_leather` correlates with add-to-cart 3× more than `warranty` for this product → boost its keyword priority"). That's the moat — accumulated conversion data per category becomes the proprietary layer once the platform has N sellers and M streams.
+**Roadmap:** conversion event ingestion + conversion-aware Q/A keyword reranking (e.g., "`is_it_real_leather` correlates with add-to-cart 3× more than `warranty` for this product → boost its keyword priority"). That's the moat — accumulated conversion data per category becomes the proprietary layer once the platform has N sellers and M streams.
 
 ---
 
@@ -178,7 +178,7 @@ Persists every router decision (comment, classify type, tool dispatched, answer 
 | Photo + promo gen (CREATOR) | rembg + PIL + ffmpeg (on-device) | shipped (v0) | 3 photos + 15s 9:16 slideshow. ~4s warm. |
 | 3D product model | TripoSR on RunPod | scaffolded | Single photo → GLB mesh. Server present in repo; not deployed in current pod config. |
 | Telemetry + aggregation (BRAIN) | SQLite (on-device) | shipped (v0) | Every routed comment persisted; dashboard panel shows top-matched answers + miss-token authoring queue. |
-| DM auto-responder (CLOSER) | webhook + same on-device router | **planned (Sprint 4)** | Inbox → router → response, one platform at a time. |
+| DM auto-responder (CLOSER) | webhook + same on-device router | **roadmap** | Inbox → router → response, one platform at a time. |
 | Generative photo variants | Vertex AI Imagen or Stability AI | **planned** | Lifestyle scene composition. Skipped in v0 (no API keys today). |
 | 3D world / virtual showroom | World Labs Marble | **dropped from roadmap** | Removed from pitch — no integration plan, marginal value vs. the GLB mesh. |
 

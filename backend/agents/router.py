@@ -10,9 +10,10 @@ classify output + loaded product index and routes to:
     block_comment(reason)        spam filter — no visual, just a counter
     escalate_to_cloud(comment)   the full Claude + TTS + Wav2Lip path
 
-Hour 4-5 ships the rule-based primary. Hour 6-7 swaps in FunctionGemma
-on Gemma 4 as the primary decider, with rule-based kept as the fallback
-when Cactus is unavailable or the FunctionGemma call errors.
+Rule-based decider is the shipped primary. FunctionGemma on Gemma 4 is
+the roadmap upgrade — it would slot in as the primary decider with the
+rule-based path kept as the fallback when Cactus is unavailable or the
+FunctionGemma call errors.
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ COST_SAVED_USD_PER_TOOL = {
 }
 
 
-# ── Tool schema (for FunctionGemma in Hour 6-7) ─────────────────────────────
+# ── Tool schema (for FunctionGemma roadmap) ─────────────────────────────────
 # Shape matches Cactus' `tools_json` param for cactus_complete. Kept here so
 # the FunctionGemma call path and the rule-based fallback share the exact
 # same set of valid tools and arg keys.
@@ -199,9 +200,9 @@ _SPAM_CUES = ("http://", "https://", ".com/", ".net/", "www.",
 
 
 def _rule_based_decide(comment: str, classify: dict, product: dict | None) -> dict:
-    """Decision logic when Cactus FunctionGemma isn't available (Hour 4-5
-    default; Hour 6-7 promotes FunctionGemma to primary and keeps this as
-    the fallback). Returns {tool, args, reason}.
+    """Decision logic when Cactus FunctionGemma isn't available (the
+    shipped default; the roadmap promotes FunctionGemma to primary and
+    keeps this as the fallback). Returns {tool, args, reason}.
 
     Note: pitch detection used to live here for chat-typed "sell this"
     triggers — removed entirely. Pitches fire from the video-upload
@@ -222,28 +223,11 @@ def _rule_based_decide(comment: str, classify: dict, product: dict | None) -> di
             "reason": "Classified as spam / URL spam",
         }
 
-    # 2. Compliment → acknowledge with a canned clip. No LLM, no render.
-    #    Emoji-only comments like "❤️" land here via the emoji cue list
-    #    because the word-tokenizer strips emoji.
-    if (t == "compliment"
-            or (c_tokens & _COMPLIMENT_CUES)
-            or any(em in comment for em in _COMPLIMENT_EMOJI)):
-        return {
-            "tool": "play_canned_clip",
-            "args": {"label": "compliment"},
-            "reason": "Acknowledging compliment with pre-rendered bridge clip",
-        }
-
-    # 3. Objection → canned reassurance ("totally hear you on that").
-    if t == "objection" or (c_tokens & _OBJECTION_CUES):
-        return {
-            "tool": "play_canned_clip",
-            "args": {"label": "objection"},
-            "reason": "Defusing objection with pre-rendered bridge clip",
-        }
-
-    # 4. Question we've pre-authored an answer for → respond_locally.
-    if t == "question" and product:
+    # 2. Question we've pre-authored an answer for → respond_locally.
+    #    Checked BEFORE intent-based routing so price/shipping/sizing
+    #    questions hit the sub-300 ms pre-rendered path even when the
+    #    classifier tags them as plain "question".
+    if product:
         hit = _match_product_field(comment, product)
         if hit:
             return {
@@ -252,11 +236,25 @@ def _rule_based_decide(comment: str, classify: dict, product: dict | None) -> di
                 "reason": f"Matched product.qa_index key: {hit}",
             }
 
-    # 5. Default — anything requiring real reasoning goes to cloud.
+    # 3. Everything else (compliment / objection / question / neutral) →
+    #    escalate_to_cloud. The dispatcher's "escalate" bucket now drives
+    #    _run_bridge_with_wav2lip in main.py — Gemma-drafted response
+    #    lip-synced onto the intent-specific bridge clip as substrate.
+    #    Pre-rendered acknowledgement clips (play_canned_clip) are kept
+    #    as a fallback for callers that explicitly want them but the
+    #    rule-based router no longer selects them: every non-spam comment
+    #    now produces a properly-spoken response with intent-coherent
+    #    body language, per the avatar choreography spec.
+    intent_label = (
+        "compliment" if (t == "compliment" or (c_tokens & _COMPLIMENT_CUES)
+                          or any(em in comment for em in _COMPLIMENT_EMOJI))
+        else "objection" if (t == "objection" or (c_tokens & _OBJECTION_CUES))
+        else "question"
+    )
     return {
         "tool": "escalate_to_cloud",
-        "args": {"comment": comment},
-        "reason": "Needs cloud reasoning / no local match",
+        "args": {"comment": comment, "intent_hint": intent_label},
+        "reason": f"bridge+wav2lip ({intent_label})",
     }
 
 
@@ -267,7 +265,7 @@ async def decide(
     classify: dict,
     product: dict | None = None,
 ) -> dict:
-    """Public entry. Currently rule-based; Hour 6-7 wraps this with a
+    """Public entry. Currently rule-based; the roadmap wraps this with a
     FunctionGemma call and keeps the rule-based path as the fallback.
 
     Returns a dict with:

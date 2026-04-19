@@ -1,6 +1,6 @@
 """CREATOR — content factory for product photos + promo video.
 
-v0 scope (this build, ships in Sprint 1.1):
+Scope (this build):
   - generate_product_photos: 3 marketplace-style photos from one input frame
     (rembg bg-strip, white-bg composite, branded composite with name + price)
   - generate_promo_video: 15s 9:16 MP4 slideshow stitched from the 3 photos
@@ -8,15 +8,15 @@ v0 scope (this build, ships in Sprint 1.1):
   - build_all: orchestrator that runs the above + the existing 3D model call,
     writes outputs under backend/renders/creator/<request_id>/, returns URLs
 
-What's NOT here yet (planned for later sprints):
+What's NOT here yet (roadmap):
   - Vertex AI Imagen / Stability AI generative variants — needs API keys we
     don't have wired today. Once available, drop in a fourth generator that
     creates a "lifestyle scene" with the product composited into a generated
     environment.
   - World Labs Marble 3D world — no integration plan, deferred.
-  - Short-form clip variants (TikTok/Reels/Shorts cuts) — planned Sprint 3+.
+  - Short-form clip variants (TikTok/Reels/Shorts cuts).
   - Per-Q/A response photo (e.g., a close-up of the leather grain to pair
-    with the "is it real leather" answer) — Sprint 4.
+    with the "is it real leather" answer).
 """
 from __future__ import annotations
 

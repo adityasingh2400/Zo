@@ -96,20 +96,23 @@ else
   warn "no pre-rendered local answers — router will cloud-escalate every product question (run: python scripts/render_local_answers.py)"
 fi
 
-# 5. Audience comment intake routes are wired.
-if curl -fsSI "$BACKEND_URL/comment" --max-time 3 2>/dev/null | head -1 | grep -q "200"; then
+# 5. Audience comment intake routes are wired. Use GET (not HEAD) — FastAPI
+#    doesn't auto-route HEAD to GET handlers, so HEAD returns 405 here.
+comment_code=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_URL/comment" --max-time 3)
+if [ "$comment_code" = "200" ]; then
   ok "/comment form serves (audience QR target)"
 else
-  fail "/comment form not serving — backend may be stale (older build)"
+  fail "/comment form not serving (HTTP $comment_code) — backend may be stale (older build)"
 fi
 
-# 6. Stage hotkey endpoint is wired.
-if curl -fsSI -X POST "$BACKEND_URL/api/go_live" --max-time 3 2>/dev/null | head -1 | grep -qE "200|503"; then
-  # 503 is fine here — means the endpoint is wired but no clips rendered yet,
-  # which step 3 already flagged. 200 means it'd actually fire a clip.
-  ok "POST /api/go_live wired (G hotkey target)"
+# 6. Stage hotkey endpoint is wired. Drop -f so curl doesn't abort on 503
+#    (which is a legitimate "endpoint exists but no clips yet" response).
+go_live_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BACKEND_URL/api/go_live" --max-time 3)
+if [ "$go_live_code" = "200" ] || [ "$go_live_code" = "503" ]; then
+  # 503 is fine — endpoint wired but no clips rendered yet (step 3 flags it).
+  ok "POST /api/go_live wired (G hotkey target, HTTP $go_live_code)"
 else
-  fail "POST /api/go_live not wired — backend may be stale"
+  fail "POST /api/go_live not wired (HTTP $go_live_code) — backend may be stale"
 fi
 
 # 7. CLI tools for QR + tunnel workflow.
@@ -135,6 +138,35 @@ if [ -n "$WITH_CLOUD" ]; then
   else
     fail "cloud escalate failed (check RunPod tunnel + ELEVENLABS_* + AWS_* in backend/.env)"
   fi
+fi
+
+# 9. End-to-end local-route smoke. Hits the on-device classify endpoint with
+#    a known-good wallet question, then HEADs the specific MP4 that the
+#    router's keyword matcher WOULD dispatch. Catches:
+#      - Gemma classify dead / Cactus model not loaded
+#      - products.json edited (new qa_index entry) but matching MP4 not rendered
+#    Costs ~1-2s to cold-load Gemma if backend just started — that's the point;
+#    we want the first real comment to be warm.
+known_local_comment="is it real leather"
+expected_mp4="/local_answers/wallet_real_leather.mp4"
+if classify=$(curl -fsS -X POST "$BACKEND_URL/api/classify_comment" \
+                -F "comment=$known_local_comment" --max-time 8 2>/dev/null); then
+  label=$(printf '%s' "$classify" \
+    | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("label",""))
+except Exception: pass' 2>/dev/null)
+  if [ "$label" = "question" ]; then
+    ok "classify(\"$known_local_comment\") → question (Gemma warm)"
+  else
+    warn "classify(\"$known_local_comment\") → \"$label\" (expected question)"
+  fi
+  if curl -fsSI "$BACKEND_URL$expected_mp4" --max-time 3 >/dev/null 2>&1; then
+    ok "$expected_mp4 reachable (router would dispatch this for \"$known_local_comment\")"
+  else
+    fail "$expected_mp4 missing — products.json references it but file not rendered (re-run scripts/render_local_answers.py)"
+  fi
+else
+  fail "/api/classify_comment failed — Cactus may not be loaded (check backend logs)"
 fi
 
 elapsed=$(($(date +%s)-t0))

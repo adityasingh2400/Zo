@@ -1,4 +1,10 @@
-.PHONY: start stop
+.PHONY: bootstrap bootstrap-render start stop
+
+bootstrap:
+	@bash scripts/demo_bootstrap.sh
+
+bootstrap-render:
+	@bash scripts/demo_bootstrap.sh --render
 
 start: stop
 	@echo "================================="

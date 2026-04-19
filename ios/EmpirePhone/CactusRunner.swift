@@ -77,17 +77,28 @@ final class CactusRunner: ObservableObject {
     func transcribe(pcm: Data) async throws -> TranscribeResult {
         guard let handle = whisperHandle else { throw RunnerError.modelNotLoaded }
         let t0 = DispatchTime.now()
-        let prompt = "Transcribe the English audio."
+        // Streaming API forces language=en. The non-stream cactus_transcribe
+        // ignores the language option (only temperature/top_p/top_k/max_tokens
+        // are parsed from its options JSON), which made whisper-tiny auto-detect
+        // iPhone-mic audio as Norwegian Nynorsk and emit garbled <|nn|> tokens.
+        let optionsJson = "{\"language\":\"en\"}"
         let raw = try await runOn(whisperQueue) {
-            try cactusTranscribe(handle, nil, prompt, nil, nil, pcm)
+            let stream = try cactusStreamTranscribeStart(handle, optionsJson)
+            do {
+                _ = try cactusStreamTranscribeProcess(stream, pcm)
+                return try cactusStreamTranscribeStop(stream)
+            } catch {
+                _ = try? cactusStreamTranscribeStop(stream)
+                throw error
+            }
         }
         let ms = Int(Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
 
-        // Cactus whisper returns JSON like {"text": "...", "segments": [...]}.
-        // Fall back to the raw string if the shape changes.
+        // Streaming API: {"success": bool, "confirmed": "..."}.
+        // Non-stream API: {"text": "...", "segments": [...]} — kept as fallback.
         if let data = raw.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let text = obj["text"] as? String
+           let text = (obj["confirmed"] as? String) ?? (obj["text"] as? String)
         {
             return TranscribeResult(text: text.trimmingCharacters(in: .whitespaces),
                                     latencyMs: ms)

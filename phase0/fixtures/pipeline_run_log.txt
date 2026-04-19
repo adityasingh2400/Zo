@@ -1,0 +1,43 @@
+06:13:58 [INFO] empire: [API] /api/sell-video called — file: IMG_7401.MOV, voice: sell this, request_id: c686a942d713
+06:13:58 [INFO] empire: [API] Video received: 6891821 bytes (IMG_7401.MOV)
+06:13:58 [INFO] empire: [API] Saved to temp: /var/folders/jn/brh9bvyj2gs0cjk0xkzc0spw0000gn/T/tmpx5tv7ntj.MOV
+06:13:58 [INFO] empire: ============================================================
+06:13:58 [INFO] empire: VIDEO PIPELINE START
+06:13:58 [INFO] empire:   video_path: /var/folders/jn/brh9bvyj2gs0cjk0xkzc0spw0000gn/T/tmpx5tv7ntj.MOV
+06:13:58 [INFO] empire:   voice_text: sell this
+06:13:58 [INFO] empire: ============================================================
+06:13:58 [INFO] empire.director: [director] emit tier1/processing -> /bridges/processing/processing.mp4 (mode=crossfade fade=120ms muted=False dur=None)
+06:13:58 [INFO] empire: [INTAKE] Starting video processing + carousel in parallel...
+06:13:58 [INFO] empire: [clip_ack] processing//bridges/processing/processing.mp4 status=started
+06:13:59 [INFO] empire.threed: carousel cache stale (raw_heroes missing) for 79f5b8e748 — rebuilding
+06:14:02 [INFO] httpx: HTTP Request: POST https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true "HTTP/1.1 200 OK"
+06:14:02 [INFO] empire.intake: Deepgram transcription: 80 chars in 1499ms
+06:14:02 [INFO] empire.intake: Quality filter: 15 → 4 frames (spread across timeline)
+06:14:02 [INFO] empire.intake: Intake complete: 4.1s total (audio=0.6, transcribe=1.5, frames=1.8, filter=0.1) 15→4 frames, 80 chars transcript
+06:14:05 [INFO] empire.threed: carousel built: 79f5b8e748, 24 frames + 4 heroes (kept 24/24, dropped sharp=0 cov=0, cutoff=253.7), 7170ms (extract=1956 pick=556 process=3364 hero=352, model=u2net, stabilize=True, median_side=862px, center_drift=77.1px, size_drift=302.4px, clipped=0)
+06:14:05 [INFO] empire: [INTAKE] Complete in 7182ms
+06:14:05 [INFO] empire: [INTAKE]   frames: 15 raw → 4 best
+06:14:05 [INFO] empire: [INTAKE]   transcript: 80 chars
+06:14:05 [INFO] empire: [INTAKE]   timings: {"audio_extraction_sec": 0.61, "transcription_sec": 1.5, "frame_extraction_sec": 1.8, "filter_sec": 0.15, "total_sec": 4.06, "frame_count": 15, "filtered_frame_count": 4}
+06:14:05 [INFO] empire: ============================================================
+06:14:05 [INFO] empire: SELL PIPELINE START
+06:14:05 [INFO] empire:   frame_b64 length: 109452 chars
+06:14:05 [INFO] empire:   voice_text: sell this. Seller's narration: Is a black sports watch. We do same day shipping. I want you to sell 
+06:14:05 [INFO] empire: ============================================================
+06:14:05 [INFO] empire.director: [director] emit tier1/processing -> /bridges/processing/processing.mp4 (mode=crossfade fade=120ms muted=False dur=None)
+06:14:05 [INFO] empire.eyes: [GEMMA-text] analyze_and_script_text_only called (voice_text: 111 chars, cactus: True)
+06:14:06 [INFO] empire.director: [director] emit tier1/misc_glance_aside -> /states/idle/misc_glance_aside_speaking.mp4 (mode=crossfade fade=120ms muted=False dur=None)
+06:14:06 [INFO] empire: [clip_ack] processing//bridges/processing/processing.mp4 status=started
+06:14:06 [INFO] empire: [clip_ack] misc_glance_aside//states/idle/misc_glance_aside_speaking.mp4 status=started
+06:14:15 [INFO] empire: [clip_ack] misc_glance_aside//states/idle/misc_glance_aside_speaking.mp4 status=ended
+06:14:17 [INFO] empire.eyes: [GEMMA-text] OK in 12126ms (1 text-only call) — 1x faster than vision path
+06:14:17 [INFO] empire.seller: [TTS] text_to_speech (text: 197 chars, voice=default, model=default(flash), lang=en, timings=False, eleven=yes)
+06:14:18 [INFO] httpx: HTTP Request: POST https://api.elevenlabs.io/v1/text-to-speech/yj30vwTGJxSHezdAGsv9?output_format=mp3_44100_128 "HTTP/1.1 200 OK"
+06:14:18 [INFO] empire.seller: [LIPSYNC] Wav2Lip /lipsync_fast — audio=170571B source=/workspace/idle_speaking/idle_calm_speaking.mp4
+06:14:19 [INFO] empire.director: [director] emit tier0/misc_hair_touch -> /states/idle/misc_hair_touch.mp4 (mode=crossfade fade=600ms muted=False dur=None)
+06:14:24 [INFO] httpx: HTTP Request: POST http://127.0.0.1:8010/lipsync_fast "HTTP/1.1 200 OK"
+06:14:26 [INFO] empire.seller: [LIPSYNC] Wav2Lip done in 7.94s, 7544741 bytes
+06:14:26 [INFO] empire.director: [director] emit tier1/response -> /renders/pitch_1776604466.mp4 (mode=crossfade fade=120ms muted=False dur=None)
+06:14:26 [INFO] empire: ============================================================
+06:14:26 [INFO] empire: SELL PIPELINE COMPLETE — 20968ms total
+06:14:26 [INFO] empire: ============================================================

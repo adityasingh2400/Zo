@@ -1,0 +1,91 @@
+{
+  "_about": "Curated bridge clip inventory by intent bucket. URLs are served from /bridges/* (FastAPI mount at backend/main.py). Cody's bridge picker should select one of these per comment intent.",
+  "_source_of_truth": "phase0/assets/bridges/manifest.json + filesystem walk of phase0/assets/bridges/<intent>/",
+  "_curation_notes": "phase0/assets/bridges/PICKS.md",
+  "intents": {
+    "intro": {
+      "use": "stream-open / first-comment of a session",
+      "tool_label": null,
+      "clips": [
+        {"variant": "A", "url": "/bridges/intro/intro_A.mp4"},
+        {"variant": "B", "url": "/bridges/intro/intro_B.mp4"},
+        {"variant": "C", "url": "/bridges/intro/intro_C.mp4"},
+        {"variant": "D", "url": "/bridges/intro/intro_D.mp4"},
+        {"variant": "E", "url": "/bridges/intro/intro_E.mp4"},
+        {"variant": "F", "url": "/bridges/intro/intro_F.mp4"}
+      ]
+    },
+    "compliment": {
+      "use": "audience praise (\"this looks amazing\", \"wow love it\")",
+      "tool_label": "compliment",
+      "clips": [
+        {"variant": "A", "url": "/bridges/compliment/compliment_A.mp4"},
+        {"variant": "B", "url": "/bridges/compliment/compliment_B.mp4"},
+        {"variant": "C", "url": "/bridges/compliment/compliment_C.mp4"},
+        {"variant": "D", "url": "/bridges/compliment/compliment_D.mp4"},
+        {"variant": "E", "url": "/bridges/compliment/compliment_E.mp4"},
+        {"variant": "F", "url": "/bridges/compliment/compliment_F.mp4"}
+      ]
+    },
+    "objection": {
+      "use": "soft pushback (\"too expensive\", \"not for me\")",
+      "tool_label": "objection",
+      "clips": [
+        {"variant": "A", "url": "/bridges/objection/objection_A.mp4"},
+        {"variant": "B", "url": "/bridges/objection/objection_B.mp4"},
+        {"variant": "C", "url": "/bridges/objection/objection_C.mp4"},
+        {"variant": "D", "url": "/bridges/objection/objection_D.mp4"},
+        {"variant": "E", "url": "/bridges/objection/objection_E.mp4"},
+        {"variant": "F", "url": "/bridges/objection/objection_F.mp4"}
+      ]
+    },
+    "neutral": {
+      "use": "filler ack while another tool is computing (no dedicated bucket; pick from compliment+objection or use processing)",
+      "tool_label": "neutral",
+      "clips": []
+    },
+    "question": {
+      "use": "open question — currently no tool routes here; classifier returns intent=question but router uses respond_locally / escalate_to_cloud. OPEN QUESTION for Cody: does this become a 5th label for play_canned_clip, or stay unmapped?",
+      "tool_label": null,
+      "clips": [
+        {"variant": "A", "url": "/bridges/question/question_A.mp4"},
+        {"variant": "B", "url": "/bridges/question/question_B.mp4"},
+        {"variant": "C", "url": "/bridges/question/question_C.mp4"},
+        {"variant": "D", "url": "/bridges/question/question_D.mp4"},
+        {"variant": "E", "url": "/bridges/question/question_E.mp4"},
+        {"variant": "F", "url": "/bridges/question/question_F.mp4"},
+        {"variant": "G", "url": "/bridges/question/question_G.mp4"},
+        {"variant": "H", "url": "/bridges/question/question_H.mp4"},
+        {"variant": "I", "url": "/bridges/question/question_I.mp4"},
+        {"variant": "J", "url": "/bridges/question/question_J.mp4"},
+        {"variant": "K", "url": "/bridges/question/question_K.mp4"},
+        {"variant": "L", "url": "/bridges/question/question_L.mp4"}
+      ]
+    },
+    "welcome": {
+      "use": "viewer-joins-stream notification",
+      "tool_label": null,
+      "clips": [
+        {"variant": "default", "url": "/bridges/welcome/welcome.mp4"},
+        {"variant": "A", "url": "/bridges/welcome/welcome_A.mp4"},
+        {"variant": "B", "url": "/bridges/welcome/welcome_B.mp4"}
+      ]
+    },
+    "pitch": {
+      "use": "30s product pitch — fired ONLY by sell-video pipeline, never by comment router",
+      "tool_label": null,
+      "clips": [
+        {"variant": "A", "url": "/bridges/pitch/pitch_A.mp4"},
+        {"variant": "B", "url": "/bridges/pitch/pitch_B.mp4"},
+        {"variant": "chained", "url": "/bridges/pitch/pitch_chained.mp4"}
+      ]
+    },
+    "processing": {
+      "use": "14s paper-reading bridge — fires immediately on upload to cover the Gemma+Wav2Lip dead-air window. Aditya's domain (sell pipeline).",
+      "tool_label": null,
+      "clips": [
+        {"variant": "default", "url": "/bridges/processing/processing.mp4"}
+      ]
+    }
+  }
+}

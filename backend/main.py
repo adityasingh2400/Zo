@@ -2215,6 +2215,598 @@ async def api_photo():
     return Response(content=base64.b64decode(b64), media_type="image/png")
 
 
+
+# Visit /dev/transitions in a browser to watch the same idle-rotation +
+# ambient-interjection loop the live Director runs on stage, but with
+# adjustable speed and a live transition log so visual issues
+# (crossfade artefacts, pose-mismatch pops, audio glitches at swap
+# boundaries, etc.) are easy to spot and reproduce.
+#
+# Implements the same machinery LiveStage uses: 4 stacked <video>
+# elements (Tier 0 A/B ping-pong, Tier 1 A/B ping-pong), prepareFirstFrame
+# seek-to-t=0 before the opacity ramp, weighted random clip selection
+# from the Director's TIER0_LIBRARY + TIER1_INTERJECTIONS tables,
+# 35% chance per rotation tick that a Tier 1 interjection fires instead
+# of a Tier 0 swap.
+@app.get("/dev/transitions", response_class=HTMLResponse)
+async def dev_transitions() -> HTMLResponse:
+    body = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8" />
+<title>Zo · transition simulator</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #050507; color: #fafafa;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                 "Segoe UI", Roboto, Inter, Arial, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 360px;
+         gap: 18px; padding: 18px; min-height: 100vh;
+         /* Make sizes available to children's calc() — see .stage-wrap */
+         --stage-h: calc(100vh - 36px);
+         --stage-w: calc((100vh - 36px) * 9 / 16); }
+  .stage-col { display: flex; flex-direction: column; align-items: center;
+               gap: 12px; min-width: 0; }
+  /* Explicit width + height keeps the 9:16 frame intact across browsers
+     that flake on `aspect-ratio` + `max-height` inside a flex column
+     (which collapses to 0×0 in Safari and some Chromium versions, leaving
+     the video AND the in-stage badges invisible — that was the bug). */
+  .stage-wrap { background: #000; border-radius: 14px; overflow: hidden;
+                position: relative;
+                width: var(--stage-w); height: var(--stage-h);
+                max-width: 100%; }
+  .stage-wrap video { position: absolute; inset: 0;
+                       width: 100%; height: 100%; object-fit: contain;
+                       background: #000; display: block;
+                       opacity: 0; }
+  /* Wrapper around ONLY the four <video> elements (siblings of .badges).
+     Carrier for the blur trick — a short CSS filter:blur() pulse during
+     each crossfade destroys the high-frequency facial edges (mouth, eyes,
+     jawline) that betray "two faces overlapping" while the opacity ramp
+     is mid-flight. Filter applied to .stage-videos (not .stage-wrap) so
+     the badges + control overlays stay sharp. will-change keeps the GPU
+     layer ready so the first blur tick doesn't jank. */
+  .stage-videos { position: absolute; inset: 0; will-change: filter; }
+  /* In-stage state badges: Tier 0 always shown; Tier 1 only when active.
+     Both pulse for 600ms when the state changes so the eye locks onto the
+     exact transition frame. Designed to be readable at-a-glance from
+     several feet away — same readability target as the live stage. */
+  .badges { position: absolute; top: 14px; left: 14px; right: 14px;
+            display: flex; flex-direction: column; gap: 8px;
+            pointer-events: none; z-index: 100; }
+  .badge { display: inline-flex; align-items: center; gap: 10px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           padding: 8px 14px; border-radius: 8px;
+           background: rgba(9,9,11,0.85); backdrop-filter: blur(8px);
+           border: 1px solid #27272a;
+           transition: border-color 220ms ease, box-shadow 220ms ease,
+                       transform 220ms ease;
+           align-self: flex-start; max-width: 100%; }
+  .badge .tier-tag { font-size: 10px; font-weight: 900;
+                     letter-spacing: 2px; padding: 3px 8px;
+                     border-radius: 4px; color: #09090b; }
+  .badge.t0 .tier-tag { background: #38bdf8; }
+  .badge.t1 .tier-tag { background: #fbbf24; }
+  .badge .state-name { font-size: 16px; font-weight: 800;
+                       letter-spacing: 0.5px; color: #fafafa; }
+  .badge .elapsed { font-size: 10px; color: #71717a; font-weight: 600;
+                    letter-spacing: 1px; }
+  .badge.flash { transform: scale(1.04); }
+  .badge.t0.flash { border-color: #38bdf8;
+                    box-shadow: 0 0 24px rgba(56,189,248,0.55); }
+  .badge.t1.flash { border-color: #fbbf24;
+                    box-shadow: 0 0 24px rgba(251,191,36,0.55); }
+  .badge.hidden { display: none; }
+  .panel { background: #0f0f12; border: 1px solid #27272a;
+           border-radius: 10px; padding: 16px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .panel h2 { font-size: 11px; letter-spacing: 1.5px; margin: 0 0 12px;
+              color: #a78bfa; text-transform: uppercase; font-weight: 800; }
+  .row { display: flex; justify-content: space-between; align-items: baseline;
+         padding: 4px 0; font-size: 12px; gap: 10px; }
+  .row .k { color: #71717a; text-transform: uppercase; letter-spacing: 1px;
+            font-size: 10px; }
+  .row .v { color: #fafafa; font-weight: 700; }
+  .row .v.big { font-size: 16px; color: #22c55e; }
+  .row .v.muted { color: #52525b; }
+  button { background: #27272a; color: #fafafa; border: 1px solid #3f3f46;
+           border-radius: 6px; padding: 6px 12px; font-size: 11px;
+           font-weight: 700; cursor: pointer;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           letter-spacing: 1px; text-transform: uppercase; }
+  button:hover { border-color: #7c3aed; }
+  button.on { background: linear-gradient(135deg,#ec4899,#7c3aed);
+              border-color: transparent; color: #fff; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; }
+  .log { font-size: 11px; color: #d4d4d8; max-height: 280px;
+         overflow-y: auto; line-height: 1.5; }
+  .log .ts { color: #52525b; margin-right: 6px; }
+  .log .lvl-tier0 { color: #38bdf8; }
+  .log .lvl-tier1 { color: #fbbf24; }
+  .log .lvl-skip { color: #52525b; font-style: italic; }
+  .weights { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 12px;
+             font-size: 11px; align-items: center; }
+  .weights label { color: #d4d4d8; }
+  .weights input[type=number] { width: 56px; background: #050507;
+                                  color: #fafafa; border: 1px solid #27272a;
+                                  border-radius: 4px; padding: 3px 6px;
+                                  font-family: inherit; font-size: 11px; }
+  .weights .pct { color: #52525b; min-width: 36px; text-align: right; }
+  hr { border: 0; border-top: 1px solid #18181b; margin: 14px 0; }
+</style>
+</head><body>
+<div class="stage-col">
+  <div class="stage-wrap">
+    <div class="stage-videos" id="stage-videos">
+      <video id="t0a" playsinline muted loop></video>
+      <video id="t0b" playsinline muted loop></video>
+      <video id="t1a" playsinline muted></video>
+      <video id="t1b" playsinline muted></video>
+    </div>
+    <div class="badges">
+      <div class="badge t0" id="badge-t0">
+        <span class="tier-tag">TIER 0</span>
+        <span class="state-name" id="badge-t0-name">—</span>
+        <span class="elapsed" id="badge-t0-elapsed">0.0s</span>
+      </div>
+      <div class="badge t1 hidden" id="badge-t1">
+        <span class="tier-tag">TIER 1</span>
+        <span class="state-name" id="badge-t1-name">—</span>
+        <span class="elapsed" id="badge-t1-elapsed">0.0s</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div>
+  <div class="panel">
+    <h2>now playing</h2>
+    <div class="row"><span class="k">tier 0</span>
+      <span class="v big" id="now-t0">—</span></div>
+    <div class="row"><span class="k">tier 1</span>
+      <span class="v" id="now-t1">(idle)</span></div>
+    <div class="row"><span class="k">next rotation</span>
+      <span class="v" id="next-rot">—</span></div>
+    <hr />
+    <div class="controls">
+      <button id="btn-pause">pause</button>
+      <button id="btn-skip">skip to next rotation</button>
+      <button id="btn-force-t1">force interjection now</button>
+    </div>
+    <hr />
+    <div class="row"><span class="k">speed</span>
+      <span class="controls">
+        <button class="speed" data-mult="1">1×</button>
+        <button class="speed on" data-mult="2">2×</button>
+        <button class="speed" data-mult="5">5×</button>
+        <button class="speed" data-mult="10">10×</button>
+      </span></div>
+    <div class="row"><span class="k">interjection p</span>
+      <span><input type="number" id="prob-input"
+        min="0" max="1" step="0.05" value="0.35" /></span></div>
+    <div class="row"><span class="k">rotation min/max (s)</span>
+      <span>
+        <input type="number" id="rot-min" min="1" max="60" step="1" value="8" />
+        –
+        <input type="number" id="rot-max" min="1" max="60" step="1" value="18" />
+      </span></div>
+    <hr />
+    <div class="row"><span class="k">blur peak (px)</span>
+      <span>
+        <input type="range" id="blur-peak" min="0" max="20" step="0.5" value="8"
+               style="vertical-align: middle; width: 140px;" />
+        <span id="blur-peak-val" class="v" style="display:inline-block; min-width: 30px; text-align: right;">8.0</span>
+      </span></div>
+    <div class="row"><span class="k">blur max (ms)</span>
+      <span>
+        <input type="range" id="blur-max" min="60" max="1000" step="20" value="500"
+               style="vertical-align: middle; width: 140px;" />
+        <span id="blur-max-val" class="v" style="display:inline-block; min-width: 36px; text-align: right;">500</span>
+      </span></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>tier 0 weights</h2>
+    <div class="weights" id="t0-weights"></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>tier 1 weights</h2>
+    <div class="weights" id="t1-weights"></div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <h2>transition log</h2>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+// Mirrors backend/agents/avatar_director.py constants. Edit there + here
+// in lockstep when the live Director numbers change.
+const TIER0_CROSSFADE_MS = 600;
+const TIER1_CROSSFADE_MS = 120;
+const TIER1_FADEOUT_MS = 500;
+const PREPARE_TIMEOUT_MS = 4000;
+
+// Mirror of TIER0_LIBRARY in avatar_director.py
+const T0 = [
+  { intent: 'idle_calm',       url: '/states/idle/idle_calm.mp4',       weight: 0.75 },
+  { intent: 'idle_thinking',   url: '/states/idle/idle_thinking.mp4',   weight: 0.10 },
+  { intent: 'misc_hair_touch', url: '/states/idle/misc_hair_touch.mp4', weight: 0.15 },
+];
+
+// Mirror of TIER1_INTERJECTIONS + the new welcome (low probability per
+// the new spec). Editable from the right-side controls.
+const T1 = [
+  { intent: 'misc_sip_drink',       url: '/states/idle/misc_sip_drink.mp4',            weight: 0.40 },
+  { intent: 'misc_walk_off_return', url: '/states/idle/misc_walk_off_return.mp4',      weight: 0.20 },
+  { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_speaking.mp4',weight: 0.25 },
+  { intent: 'welcome',              url: '/bridges/welcome/welcome.mp4',               weight: 0.15 },
+];
+
+let interjectionProbability = 0.35;
+let rotMinS = 8, rotMaxS = 18;
+let speed = 2;
+let paused = false;
+// Blur trick — symmetric pulse 0 → peak → 0 of CSS filter:blur() on
+// the .stage-videos wrapper during every crossfade. Destroys high-
+// frequency facial edges (mouth, eyes, jawline) so two faces
+// overlapping at intermediate opacity can't be picked apart by the
+// eye. Curve = sin(t * π) → smooth bell, peak at midpoint.
+//   blurPeakPx = 0   disables the trick (A/B baseline against today's
+//                    pure-opacity behaviour)
+//   blurMaxMs        hard cap so long crossfades (Tier 0 600ms) never
+//                    sit blurred — the pulse ends well before the
+//                    opacity ramp does. Short stab only, just enough
+//                    to hide the seam.
+let blurPeakPx = 8;
+let blurMaxMs  = 500;
+let activeBlurRaf = null;
+
+const els = {
+  t0a: document.getElementById('t0a'),
+  t0b: document.getElementById('t0b'),
+  t1a: document.getElementById('t1a'),
+  t1b: document.getElementById('t1b'),
+  nowT0: document.getElementById('now-t0'),
+  nowT1: document.getElementById('now-t1'),
+  nextRot: document.getElementById('next-rot'),
+  badgeT0: document.getElementById('badge-t0'),
+  badgeT0Name: document.getElementById('badge-t0-name'),
+  badgeT0Elapsed: document.getElementById('badge-t0-elapsed'),
+  badgeT1: document.getElementById('badge-t1'),
+  badgeT1Name: document.getElementById('badge-t1-name'),
+  badgeT1Elapsed: document.getElementById('badge-t1-elapsed'),
+  log: document.getElementById('log'),
+};
+
+// Track when each tier last changed so we can show "elapsed on this state"
+// counters and trigger the flash animation right at the swap moment.
+let t0StartedAt = 0;
+let t1StartedAt = 0;
+
+function flashBadge(badgeEl) {
+  badgeEl.classList.add('flash');
+  setTimeout(() => badgeEl.classList.remove('flash'), 600);
+}
+
+let t0ActiveIsA = true;
+let t1ActiveIsA = true;
+let currentT0 = null;
+let currentT1 = null;
+let nextRotationAt = 0;
+let rotationTimer = null;
+
+function logEvt(level, msg) {
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const div = document.createElement('div');
+  div.innerHTML = `<span class="ts">${ts}</span><span class="lvl-${level}">${msg}</span>`;
+  els.log.prepend(div);
+  while (els.log.children.length > 80) {
+    els.log.removeChild(els.log.lastChild);
+  }
+}
+
+function weightedPick(pool) {
+  const total = pool.reduce((s, p) => s + p.weight, 0);
+  let r = Math.random() * total;
+  for (const p of pool) {
+    r -= p.weight;
+    if (r <= 0) return p;
+  }
+  return pool[pool.length - 1];
+}
+
+// Blur pulse — call at the start of every crossfade. Duration scales
+// with the crossfade itself: Tier 1 in (120ms) → 120ms pulse; Tier 0
+// rotation (600ms) → clipped to blurMaxMs so the blur is OUT well
+// before the opacity ramp finishes. We force a 60ms floor so even
+// the 120ms Tier 1 crossfade gets a perceptible blur arc instead of
+// flickering on/off in two frames. Cancels any in-flight pulse before
+// starting a new one so rapid back-to-back transitions don't stack.
+function blurStage(crossfadeMs) {
+  if (blurPeakPx <= 0) return;
+  const stage = document.getElementById('stage-videos');
+  if (!stage) return;
+  if (activeBlurRaf) cancelAnimationFrame(activeBlurRaf);
+  const dur = Math.max(60, Math.min(crossfadeMs, blurMaxMs));
+  const start = performance.now();
+  function tick(now) {
+    const t = Math.max(0, Math.min(1, (now - start) / dur));
+    const px = blurPeakPx * Math.sin(t * Math.PI);
+    stage.style.filter = px > 0.05 ? `blur(${px.toFixed(2)}px)` : 'none';
+    if (t < 1) {
+      activeBlurRaf = requestAnimationFrame(tick);
+    } else {
+      stage.style.filter = 'none';
+      activeBlurRaf = null;
+    }
+  }
+  activeBlurRaf = requestAnimationFrame(tick);
+}
+
+// Mirror of the LiveStage prepareFirstFrame helper — load the new src,
+// seek to t=0, await the seeked event so the FIRST frame is decoded
+// before the opacity ramp begins. Without this the crossfade can show
+// frames 2-5 of the new clip mid-fade (visible head jump).
+function prepareFirstFrame(el, src) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      el.removeEventListener('seeked', onSeeked);
+      el.removeEventListener('error', onError);
+      clearTimeout(timer);
+    };
+    function onError() { cleanup(); reject(el.error || 'video_error'); }
+    function trySeek() {
+      if (el.currentTime > 0.001) el.currentTime = 0;
+      else Promise.resolve().then(onSeeked);
+    }
+    function onLoadedMeta() {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      trySeek();
+    }
+    function onSeeked() {
+      if (el.readyState >= 2) { cleanup(); resolve(); }
+      else el.addEventListener('canplay', () => { cleanup(); resolve(); }, { once: true });
+    }
+    el.addEventListener('error', onError, { once: true });
+    el.addEventListener('seeked', onSeeked);
+    const timer = setTimeout(() => { cleanup(); reject(new Error('prepare_timeout')); }, PREPARE_TIMEOUT_MS);
+    if (el.src === src && el.readyState >= 2 && el.currentTime <= 0.01) {
+      cleanup(); resolve(); return;
+    }
+    if (el.src !== src) {
+      el.src = src;
+      el.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
+      try { el.load(); } catch {}
+    } else {
+      trySeek();
+    }
+  });
+}
+
+async function swapTier0(pick) {
+  const incoming = t0ActiveIsA ? els.t0b : els.t0a;
+  const outgoing = t0ActiveIsA ? els.t0a : els.t0b;
+  incoming.muted = true;
+  incoming.loop = true;
+  try {
+    await prepareFirstFrame(incoming, pick.url);
+    await incoming.play();
+    blurStage(TIER0_CROSSFADE_MS);
+    incoming.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
+    outgoing.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
+    incoming.style.opacity = 1;
+    outgoing.style.opacity = 0;
+    t0ActiveIsA = !t0ActiveIsA;
+    currentT0 = pick;
+    t0StartedAt = Date.now();
+    els.nowT0.textContent = pick.intent;
+    els.badgeT0Name.textContent = pick.intent;
+    flashBadge(els.badgeT0);
+    setTimeout(() => { try { outgoing.pause(); } catch {} }, TIER0_CROSSFADE_MS + 50);
+    logEvt('tier0', `tier 0 → ${pick.intent} (crossfade ${TIER0_CROSSFADE_MS}ms)`);
+  } catch (e) {
+    logEvt('skip', `tier 0 → ${pick.intent} FAILED: ${e?.message || e}`);
+  }
+}
+
+async function fireTier1(pick) {
+  const incoming = t1ActiveIsA ? els.t1b : els.t1a;
+  const outgoing = t1ActiveIsA ? els.t1a : els.t1b;
+  incoming.muted = true;
+  incoming.loop = false;
+  try {
+    await prepareFirstFrame(incoming, pick.url);
+    await incoming.play();
+    blurStage(TIER1_CROSSFADE_MS);
+    incoming.style.transition = `opacity ${TIER1_CROSSFADE_MS}ms ease`;
+    outgoing.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
+    incoming.style.opacity = 1;
+    if (currentT1) outgoing.style.opacity = 0;
+    t1ActiveIsA = !t1ActiveIsA;
+    currentT1 = pick;
+    t1StartedAt = Date.now();
+    els.nowT1.textContent = pick.intent;
+    els.badgeT1Name.textContent = pick.intent;
+    els.badgeT1.classList.remove('hidden');
+    flashBadge(els.badgeT1);
+    logEvt('tier1', `tier 1 → ${pick.intent} (crossfade ${TIER1_CROSSFADE_MS}ms; auto fade-out on natural end)`);
+    incoming.addEventListener('ended', () => {
+      blurStage(TIER1_FADEOUT_MS);
+      incoming.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
+      incoming.style.opacity = 0;
+      const ended = pick;
+      currentT1 = null;
+      els.nowT1.textContent = '(idle)';
+      // Hide the Tier 1 badge after the fade-out settles so it disappears
+      // in lockstep with the visual fade — flash Tier 0 to redirect the
+      // eye back to "what's underneath."
+      setTimeout(() => {
+        els.badgeT1.classList.add('hidden');
+        flashBadge(els.badgeT0);
+      }, TIER1_FADEOUT_MS);
+      logEvt('tier1', `tier 1 ← ${ended.intent} ended (fade-out ${TIER1_FADEOUT_MS}ms)`);
+    }, { once: true });
+  } catch (e) {
+    logEvt('skip', `tier 1 → ${pick.intent} FAILED: ${e?.message || e}`);
+  }
+}
+
+function rotationDelay() {
+  const min = rotMinS * 1000, max = rotMaxS * 1000;
+  return Math.round((min + Math.random() * (max - min)) / Math.max(speed, 0.1));
+}
+
+async function rotationTick() {
+  if (paused) { scheduleNext(); return; }
+  // 35% (configurable) chance to fire a tier 1 interjection instead of
+  // swapping tier 0. Mirrors the live Director.
+  if (Math.random() < interjectionProbability && !currentT1) {
+    const pick = weightedPick(T1);
+    await fireTier1(pick);
+  } else {
+    let pick;
+    do { pick = weightedPick(T0); } while (currentT0 && pick.intent === currentT0.intent && T0.length > 1);
+    await swapTier0(pick);
+  }
+  scheduleNext();
+}
+
+function scheduleNext() {
+  if (rotationTimer) clearTimeout(rotationTimer);
+  const ms = rotationDelay();
+  nextRotationAt = Date.now() + ms;
+  rotationTimer = setTimeout(rotationTick, ms);
+}
+
+setInterval(() => {
+  // While paused, freeze the displayed elapsed at pausedAt (not Date.now())
+  // so the badges stop ticking when the videos are stopped.
+  const now = paused ? pausedAt : Date.now();
+  if (!paused) {
+    const remain = Math.max(0, nextRotationAt - Date.now());
+    els.nextRot.textContent = `${(remain / 1000).toFixed(1)}s`;
+  } else {
+    els.nextRot.textContent = '(paused)';
+  }
+  if (currentT0) {
+    els.badgeT0Elapsed.textContent = `${((now - t0StartedAt) / 1000).toFixed(1)}s`;
+  }
+  if (currentT1) {
+    els.badgeT1Elapsed.textContent = `${((now - t1StartedAt) / 1000).toFixed(1)}s`;
+  }
+}, 100);
+
+// Controls
+document.querySelectorAll('button.speed').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('button.speed').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    speed = parseFloat(b.dataset.mult);
+    logEvt('skip', `speed → ${speed}×`);
+  });
+});
+// Pause does THREE things: stop the rotation scheduler, pause whichever
+// video elements are currently playing, and freeze the elapsed counters.
+// Resume reverses all three. Without the video.pause() the playback kept
+// going while the state machine was idle — confusing because "paused" only
+// stopped FUTURE transitions, not the current one.
+let pausedAt = 0;
+function pausedVideos() {
+  const out = [];
+  if (currentT0) out.push(t0ActiveIsA ? els.t0a : els.t0b);
+  if (currentT1) out.push(t1ActiveIsA ? els.t1a : els.t1b);
+  return out;
+}
+document.getElementById('btn-pause').addEventListener('click', (e) => {
+  paused = !paused;
+  e.target.textContent = paused ? 'resume' : 'pause';
+  e.target.classList.toggle('on', paused);
+  if (paused) {
+    pausedAt = Date.now();
+    if (rotationTimer) { clearTimeout(rotationTimer); rotationTimer = null; }
+    pausedVideos().forEach(v => { try { v.pause(); } catch {} });
+    logEvt('skip', 'paused (videos + rotation frozen)');
+  } else {
+    // Shift the startedAt timestamps forward by the pause duration so
+    // the elapsed counters resume from where they were, not from zero.
+    const dt = Date.now() - pausedAt;
+    if (currentT0) t0StartedAt += dt;
+    if (currentT1) t1StartedAt += dt;
+    pausedAt = 0;
+    pausedVideos().forEach(v => { v.play().catch(() => {}); });
+    scheduleNext();
+    logEvt('skip', `resumed (after ${(dt / 1000).toFixed(1)}s pause)`);
+  }
+});
+document.getElementById('btn-skip').addEventListener('click', () => {
+  if (rotationTimer) clearTimeout(rotationTimer);
+  rotationTick();
+});
+document.getElementById('btn-force-t1').addEventListener('click', async () => {
+  if (currentT1) { logEvt('skip', 'force-t1 skipped (already on)'); return; }
+  await fireTier1(weightedPick(T1));
+});
+document.getElementById('prob-input').addEventListener('change', (e) => {
+  interjectionProbability = parseFloat(e.target.value);
+  logEvt('skip', `interjection p → ${interjectionProbability}`);
+});
+document.getElementById('rot-min').addEventListener('change', (e) => {
+  rotMinS = parseInt(e.target.value, 10);
+});
+document.getElementById('rot-max').addEventListener('change', (e) => {
+  rotMaxS = parseInt(e.target.value, 10);
+});
+// Live blur tuning. `input` (not `change`) so dragging the slider
+// updates instantly — pair with btn-skip to fire a transition with
+// each new peak value and dial in the right "tiny" amount visually.
+const blurPeakInput = document.getElementById('blur-peak');
+const blurPeakLabel = document.getElementById('blur-peak-val');
+blurPeakInput.addEventListener('input', (e) => {
+  blurPeakPx = parseFloat(e.target.value);
+  blurPeakLabel.textContent = blurPeakPx.toFixed(1);
+});
+const blurMaxInput = document.getElementById('blur-max');
+const blurMaxLabel = document.getElementById('blur-max-val');
+blurMaxInput.addEventListener('input', (e) => {
+  blurMaxMs = parseInt(e.target.value, 10);
+  blurMaxLabel.textContent = `${blurMaxMs}`;
+});
+
+// Render the editable weight tables
+function renderWeights(pool, target) {
+  const total = pool.reduce((s, p) => s + p.weight, 0);
+  target.innerHTML = '';
+  pool.forEach((p, i) => {
+    const lab = document.createElement('label'); lab.textContent = p.intent;
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = 0; inp.max = 1; inp.step = 0.05;
+    inp.value = p.weight.toFixed(2);
+    inp.addEventListener('change', () => {
+      p.weight = parseFloat(inp.value);
+      renderWeights(pool, target);
+    });
+    const pct = document.createElement('span'); pct.className = 'pct';
+    pct.textContent = total > 0 ? `${Math.round(100 * p.weight / total)}%` : '—';
+    target.append(lab, inp, pct);
+  });
+}
+renderWeights(T0, document.getElementById('t0-weights'));
+renderWeights(T1, document.getElementById('t1-weights'));
+
+// Boot — pick a starting tier 0 then start rotating
+(async () => {
+  await swapTier0(weightedPick(T0));
+  scheduleNext();
+})();
+</script>
+</body></html>"""
+    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
+
+
 # ── Run ────────────────────────────────────────────────
 
 if __name__ == "__main__":

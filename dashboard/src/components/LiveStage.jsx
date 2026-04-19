@@ -4,6 +4,18 @@ import { dlog } from '../lib/dlog';
 import { KaraokeCaptions } from './KaraokeCaptions';
 import { TranslationChip } from './TranslationChip';
 
+// Blur pulse — symmetric 0 → peak → 0 of CSS filter:blur() on the
+// .stage-videos wrapper during every crossfade. Destroys high-frequency
+// facial edges (mouth, eyes, jawline) so two faces overlapping at
+// intermediate opacity can't be picked apart by the eye. Lets us keep
+// crossfades visually smooth without re-introducing the pose-mismatch
+// ghosting that the 350→120ms shrink fixed by brute force. Mirror of
+// the same trick in /dev/transitions — tune visually there with the
+// peak/max sliders before bumping these. Set BLUR_PEAK_PX = 0 to
+// disable and A/B against pure-opacity behaviour.
+const BLUR_PEAK_PX = 8;
+const BLUR_MAX_MS = 500;
+
 const API_BASE = `http://${window.location.hostname}:8000`;
 
 /**
@@ -67,6 +79,18 @@ export function LiveStage({
   // the IndexSizeError volume crashes from out-of-range t values.
   const tier1FadeRafRef = useRef(null);
 
+  // Wrapper around just the four <video> elements (carrier for the
+  // blur pulse — see blurStage). Overlays (LIVE pill, voice/routing
+  // pills, comment card, karaoke captions, translation chip) live as
+  // siblings of this wrapper inside styles.stage so the blur applies
+  // ONLY to the videos and the chrome stays sharp.
+  const stageVideosRef = useRef(null);
+  // rAF id for the in-flight blur pulse. Cancelled at the start of
+  // each new transition so rapid back-to-back crossfades (reading_chat
+  // → bridge → response in the cloud-escalate path, all within ~200ms)
+  // don't stack two blur ramps fighting over the same filter property.
+  const blurRafRef = useRef(null);
+
   // Speculative preload (Pass 2). When the router fires a routing_decision
   // we often know the URL of the upcoming Tier 1 clip 100-300ms BEFORE the
   // play_clip event lands. Stashing it here makes the Tier 1 driver use the
@@ -90,6 +114,44 @@ export function LiveStage({
   const [overlayVisible, setOverlayVisible] = useState(false);
 
   const stream = useAvatarStream({ wsRef });
+
+  // ── Blur pulse ──────────────────────────────────────────────────────────
+  // Triggered at the start of every crossfade. Duration scales with the
+  // crossfade itself: Tier 1 in (120ms) → 120ms pulse, Tier 0 rotation
+  // (600ms) → clipped to BLUR_MAX_MS so the blur ends well before the
+  // opacity ramp does. 60ms floor keeps the 120ms case from flickering
+  // on/off in two frames. sin(t·π) gives a smooth bell with peak at
+  // midpoint — no perceptible "stays blurred" tail, no hard turn-off.
+  // Identical algorithm to the dev simulator at /dev/transitions; keep
+  // them in sync when tuning.
+  function blurStage(crossfadeMs) {
+    if (BLUR_PEAK_PX <= 0) return;
+    const stage = stageVideosRef.current;
+    if (!stage) return;
+    if (blurRafRef.current) {
+      cancelAnimationFrame(blurRafRef.current);
+      blurRafRef.current = null;
+    }
+    const dur = Math.max(60, Math.min(crossfadeMs, BLUR_MAX_MS));
+    const start = performance.now();
+    function tick(now) {
+      const t = Math.max(0, Math.min(1, (now - start) / dur));
+      const px = BLUR_PEAK_PX * Math.sin(t * Math.PI);
+      try {
+        stage.style.filter = px > 0.05 ? `blur(${px.toFixed(2)}px)` : 'none';
+      } catch {
+        blurRafRef.current = null;
+        return;
+      }
+      if (t < 1) {
+        blurRafRef.current = requestAnimationFrame(tick);
+      } else {
+        stage.style.filter = 'none';
+        blurRafRef.current = null;
+      }
+    }
+    blurRafRef.current = requestAnimationFrame(tick);
+  }
 
   // ── Tier 0 driver ────────────────────────────────────────────────────────
   // Always-on idle layer. Two stacked elements ping-pong with a 600ms opacity
@@ -118,6 +180,7 @@ export function LiveStage({
     prepareFirstFrame(incomingEl, `${API_BASE}${url}`)
       .then(() => incomingEl.play())
       .then(() => {
+        blurStage(fadeMs);
         setTier0ActiveIsA(prev => !prev);
         setTier0Opacity(1);
         stream.sendStageReady();
@@ -195,6 +258,7 @@ export function LiveStage({
         try { if (activeEl) activeEl.volume = 0; } catch {}
       }
 
+      blurStage(fadeMs);
       setTier1Opacity(0);
       setOverlayVisible(false);
       // After the fade settles, pause the active element so the decoder is free.
@@ -286,7 +350,12 @@ export function LiveStage({
       })
       .then(() => {
         // First frame is decoded AND positioned at t=0; opacity ramp
-        // happens against a known-good frame, no head-jump pop.
+        // happens against a known-good frame, no head-jump pop. Blur
+        // pulse fires HERE (not before play) so it's synchronised with
+        // the same render frame the opacity ramp begins on — otherwise
+        // the blur arc could lead the visual swap by 30-100ms (canplay
+        // → play() round trip) and the seam moment wouldn't line up.
+        blurStage(fadeMs);
         setTier1ActiveIsA(prev => !prev);
         setTier1Opacity(1);
         setOverlayVisible(stream.tier1.intent === 'response');
@@ -352,6 +421,10 @@ export function LiveStage({
       // Only act if THIS element is the active one.
       const activeEl = tier1ActiveIsA ? tier1ARef.current : tier1BRef.current;
       if (e.target !== activeEl) return;
+      // Blur the Tier 0 floor reveal — this seam is also a pose change
+      // (avatar dropping back to idle) and benefits from the same edge-
+      // softening trick as the in-bound crossfades.
+      blurStage(stream.tier1?.fadeMs ?? TIER1_FADEOUT_MS);
       setTier1Opacity(0);
       setOverlayVisible(false);
       stream.sendAck(stream.tier1?.intent || '', stream.tier1?.url || '', 'ended');
@@ -470,62 +543,69 @@ export function LiveStage({
   return (
     <div style={styles.container}>
       <div style={styles.stage}>
-        {/* Tier 0A: always-on idle layer (ping-pong A) */}
-        <video
-          ref={tier0ARef}
-          playsInline
-          autoPlay
-          loop
-          muted
-          controls={false}
-          style={{
-            ...styles.video,
-            ...styles.tier0,
-            opacity: tier0ActiveIsA ? tier0Opacity : 0,
-            transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
-          }}
-        />
+        {/* Wrapper around just the four <video> elements so the blur
+            pulse (filter:blur on this div, ramped via blurStage) only
+            applies to the avatar imagery and leaves the LIVE pill /
+            voice pill / routing badge / comment card / karaoke captions
+            sharp. Empty `style` lets blurStage own the inline filter. */}
+        <div ref={stageVideosRef} style={styles.stageVideos}>
+          {/* Tier 0A: always-on idle layer (ping-pong A) */}
+          <video
+            ref={tier0ARef}
+            playsInline
+            autoPlay
+            loop
+            muted
+            controls={false}
+            style={{
+              ...styles.video,
+              ...styles.tier0,
+              opacity: tier0ActiveIsA ? tier0Opacity : 0,
+              transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
+            }}
+          />
 
-        {/* Tier 0B: always-on idle layer (ping-pong B) */}
-        <video
-          ref={tier0BRef}
-          playsInline
-          loop
-          muted
-          controls={false}
-          style={{
-            ...styles.video,
-            ...styles.tier0,
-            opacity: !tier0ActiveIsA ? tier0Opacity : 0,
-            transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
-          }}
-        />
+          {/* Tier 0B: always-on idle layer (ping-pong B) */}
+          <video
+            ref={tier0BRef}
+            playsInline
+            loop
+            muted
+            controls={false}
+            style={{
+              ...styles.video,
+              ...styles.tier0,
+              opacity: !tier0ActiveIsA ? tier0Opacity : 0,
+              transition: `opacity ${stream.tier0?.fadeMs ?? 600}ms ease`,
+            }}
+          />
 
-        {/* Tier 1A */}
-        <video
-          ref={tier1ARef}
-          playsInline
-          controls={false}
-          style={{
-            ...styles.video,
-            ...styles.tier1,
-            opacity: tier1ActiveIsA ? tier1Opacity : 0,
-            ...tier1FadeStyle,
-          }}
-        />
+          {/* Tier 1A */}
+          <video
+            ref={tier1ARef}
+            playsInline
+            controls={false}
+            style={{
+              ...styles.video,
+              ...styles.tier1,
+              opacity: tier1ActiveIsA ? tier1Opacity : 0,
+              ...tier1FadeStyle,
+            }}
+          />
 
-        {/* Tier 1B */}
-        <video
-          ref={tier1BRef}
-          playsInline
-          controls={false}
-          style={{
-            ...styles.video,
-            ...styles.tier1,
-            opacity: !tier1ActiveIsA ? tier1Opacity : 0,
-            ...tier1FadeStyle,
-          }}
-        />
+          {/* Tier 1B */}
+          <video
+            ref={tier1BRef}
+            playsInline
+            controls={false}
+            style={{
+              ...styles.video,
+              ...styles.tier1,
+              opacity: !tier1ActiveIsA ? tier1Opacity : 0,
+              ...tier1FadeStyle,
+            }}
+          />
+        </div>
 
         {/* LIVE pill — visible whenever Tier 1 is active (i.e. avatar is reactive).
             Hidden in overlay mode because TikTokShopOverlay paints its own
@@ -805,6 +885,13 @@ const styles = {
   stage: {
     position: 'relative', width: '100%', flex: 1, minHeight: 0,
     background: '#000',
+  },
+  stageVideos: {
+    position: 'absolute', inset: 0,
+    // Hint the GPU compositor to keep this layer ready for filter
+    // changes — without it the FIRST blur tick after a fresh mount
+    // can drop a frame while the browser promotes the layer.
+    willChange: 'filter',
   },
   video: {
     position: 'absolute', inset: 0,

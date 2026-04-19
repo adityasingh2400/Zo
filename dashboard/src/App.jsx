@@ -1,8 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { TikTokShopOverlay } from './components/TikTokShopOverlay';
 import { StartDemoOverlay } from './components/StartDemoOverlay';
 import { ChatPanel } from './components/ChatPanel';
+import { PhoneQRPanel } from './components/PhoneQRPanel';
+import { EventLogHUD } from './components/EventLogHUD';
+import { dlog } from './lib/dlog';
 import { LanguagePicker } from './components/LanguagePicker';
 
 /**
@@ -41,6 +44,7 @@ export default function App() {
     activeLanguage, setActiveLanguage,
     commentResponse, sendComment,
     routingDecision,
+    phoneUpload,
   } = useEmpireSocket();
 
   const [dragging, setDragging] = useState(false);
@@ -54,6 +58,13 @@ export default function App() {
   // Flips true the moment the operator drops a file; never resets within
   // a tab session (refreshing the tab is the only way back to empty).
   const [hasUploaded, setHasUploaded] = useState(false);
+
+  // dlog hasUploaded transitions so the EventLog reflects the same
+  // mount/unmount story you'd see by inspecting React DevTools.
+  useEffect(() => {
+    dlog('app', hasUploaded ? 'live_stage_mounted' : 'live_stage_unmounted',
+         { hasUploaded });
+  }, [hasUploaded]);
 
   const handleAudioEnded = (kind) => {
     if (kind === 'pitch') setPitchAudio(null);
@@ -129,8 +140,11 @@ export default function App() {
             activeLanguage={activeLanguage}
             onChange={setActiveLanguage}
           />
-          <span style={styles.emptyHintIcon}>📦</span>
-          <p style={styles.emptyHintLabel}>Drop a product video to start</p>
+          <PhoneQRPanel
+            phoneUpload={phoneUpload}
+            connected={connected}
+            onUploadComplete={() => setHasUploaded(true)}
+          />
           <p style={styles.emptyHintSub}>
             Gemma analyzes · ElevenLabs voices · Wav2Lip lip-syncs · live
           </p>
@@ -243,6 +257,17 @@ export default function App() {
           pendingComments={pendingComments}
         />
       </div>
+
+      {/* Live event-log HUD — bottom-right floating panel that shows
+          every dlog() call (WS connect/close, phone status changes,
+          play_clip events received, listener attach/detach, tier1
+          driver state). Critical when iterating on phone-upload bugs:
+          a 5-second glance at this panel tells you exactly which step
+          in the chain dropped instead of having to triangulate from
+          the avatar's frozen frame + browser console. Toggle hidden
+          via the ✕ button — subscription stays alive in the background
+          so re-opening shows the live feed instantly. */}
+      <EventLogHUD />
 
       {/* Tiny connection indicator — bottom-right corner. Only loud when
           DISCONNECTED so the operator knows when to refresh. CONNECTED

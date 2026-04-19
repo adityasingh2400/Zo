@@ -23,6 +23,7 @@ import concurrent.futures
 import hashlib
 import io
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -545,8 +546,22 @@ async def carousel_from_video(
                        "median_side_px": 0, "clipped_frames": 0,
                        "raw_center_stddev_px": 0.0, "smooth_window": 0}
 
-    # 6. Crop to per-frame center, resize, save. Sequence-renumbered so the
-    #    dashboard sees a clean 0..N-1 set even if some inputs were dropped.
+    # Per-build cache-bust token. Same video re-uploaded → same slug →
+    # same on-disk paths, so without this token the dashboard sees the
+    # exact same frame URLs across runs and the browser serves cached
+    # bytes from the prior build (which may be a different rembg/orbit
+    # output for the same source). Appending ?v=<build_ts> as a query
+    # string forces the browser to treat each build's URLs as unique
+    # while the backend's static mount serves the same on-disk path
+    # (FastAPI StaticFiles ignores query strings for routing).
+    build_ts = int(time.time() * 1000)
+
+    # 6. Crop to per-frame center, resize, save ATOMICALLY. Sequence-renumbered
+    #    so the dashboard sees a clean 0..N-1 set even if some inputs were
+    #    dropped. Atomic-save (write tmp + os.replace) so a re-upload of the
+    #    same video can't serve a half-written PNG to a dashboard mid-fetch
+    #    — that race produced the magenta texture-array artifact seen on
+    #    repeated uploads (corrupt PNG → image load fails → uninit GPU slot).
     saved: list[str] = []
     clipped_frames = 0
     for j, (rec, crop_box) in enumerate(zip(frame_records, crops)):
@@ -560,8 +575,8 @@ async def carousel_from_video(
                 if did_clip:
                     clipped_frames += 1
             rgba = _square_resize_rgba(rgba, out_size)
-            rgba.save(out_path, format="PNG", optimize=False)
-            saved.append(f"/renders/spin/{slug}/{out_path.name}")
+            _atomic_save_image(rgba, out_path, format="PNG", optimize=False)
+            saved.append(f"/renders/spin/{slug}/{out_path.name}?v={build_ts}")
         except Exception as e:
             logger.warning("frame %d save failed: %s", j, e)
     orbit_stats["clipped_frames"] = clipped_frames
@@ -613,8 +628,8 @@ async def carousel_from_video(
                     ImageFilter.UnsharpMask(radius=1.4, percent=120, threshold=2)
                 )
                 out_path = out_dir / f"hero_{j:02d}.png"
-                hero_img.save(out_path, format="PNG", optimize=False)
-                hero_urls.append(f"/renders/spin/{slug}/{out_path.name}")
+                _atomic_save_image(hero_img, out_path, format="PNG", optimize=False)
+                hero_urls.append(f"/renders/spin/{slug}/{out_path.name}?v={build_ts}")
 
                 # RAW hero — same source frame, no rembg, no crop. Saved as
                 # JPEG (smaller than PNG, no transparency needed). Falls
@@ -637,9 +652,9 @@ async def carousel_from_video(
                                 raw_to_save = bg
                             else:
                                 raw_to_save = raw_to_save.convert("RGB")
-                        raw_to_save.save(raw_out, format="JPEG",
-                                         quality=88, optimize=True)
-                        raw_hero_urls.append(f"/renders/spin/{slug}/{raw_out.name}")
+                        _atomic_save_image(raw_to_save, raw_out, format="JPEG",
+                                          quality=88, optimize=True)
+                        raw_hero_urls.append(f"/renders/spin/{slug}/{raw_out.name}?v={build_ts}")
                     except Exception as raw_e:
                         logger.warning("raw hero %d save failed: %s", j, raw_e)
 
@@ -778,6 +793,36 @@ def _video_slug(video_path: str) -> str:
         while chunk := f.read(1 << 16):
             h.update(chunk)
     return h.hexdigest()[:10]
+
+
+def _atomic_save_image(img: "Image.Image", out_path: Path, **save_kwargs) -> None:
+    """Save a PIL image atomically — write to a sibling .tmp file, then
+    os.replace() into the destination. Critical for the carousel
+    re-build pattern where the same path is overwritten on every
+    re-upload of the same video: without atomic write, a dashboard
+    fetching the URL mid-save receives a corrupt mix of old + new
+    bytes (PIL's .save streams pixels as it goes), the resulting PNG
+    fails to decode, the WebGL texture-array slot is left
+    uninitialised, and the carousel renders as magenta artifacts.
+
+    os.replace() is atomic on POSIX (rename(2)) and Windows
+    (MoveFileEx with REPLACE_EXISTING) — the destination either
+    points at the OLD complete file or the NEW complete file, never
+    a partial mix. Combined with the per-build `?v=<ts>` cache-bust
+    on URLs (forces the dashboard to re-fetch), this kills the
+    re-upload race entirely.
+    """
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        img.save(tmp_path, **save_kwargs)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        # Best-effort cleanup of the temp file if save raised mid-write.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 async def _video_duration(video_path: str) -> float:

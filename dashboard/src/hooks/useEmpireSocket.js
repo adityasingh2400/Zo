@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { dlog } from '../lib/dlog';
 
 // Backend's /ws/dashboard requires `?token=<value>` when WS_SHARED_SECRET
 // is set in backend .env. We forward VITE_WS_TOKEN if defined;
@@ -67,6 +68,11 @@ export function useEmpireSocket() {
   // useEmpireSocket and useAvatarStream listen to the same wsRef and
   // each handler is a pure read.
   const [activeClips, setActiveClips] = useState({ tier0: null, tier1: null });
+  // Phone-as-camera upload progress. Driven by phone_upload_status /
+  // phone_upload_complete / phone_upload_failed broadcasts that the
+  // backend's /ws/phone/upload/{sid} handler emits as the operator's
+  // phone streams a video. Shape mirrors phone_uploader.session_summary().
+  const [phoneUpload, setPhoneUpload] = useState(null);
   // Live target language (ISO code, mirrors backend pipeline_state["active_language"]).
   // Source of truth is the backend — we seed from GET /api/live/language on
   // mount and keep it in sync via the `language_changed` WS event broadcast
@@ -84,13 +90,65 @@ export function useEmpireSocket() {
     }
   }, []);
 
-  const connect = useCallback(() => {
-    const ws = new WebSocket(WS_URL);
+  // Reconnect bookkeeping — single in-flight retry with exponential
+  // backoff (1s → 2s → 4s → … → 10s cap). The previous fixed 2s
+  // setTimeout(connect, 2000) had two failure modes:
+  //   1. Stuck-disconnected: if connect() ran while a previous WS was
+  //      still in some weird half-open state, the new ws.onclose fired
+  //      synchronously and queued ANOTHER setTimeout, doubling the
+  //      retry rate every cycle until the dashboard was making 100s
+  //      of WS connection attempts per second.
+  //   2. Tight loop on backend-down: 2s retry × backend takes 8s to
+  //      respawn = 4 wasted CPU-spike retries before success.
+  // Backoff + dedupe via reconnectTimerRef fixes both.
+  const reconnectTimerRef = useRef(null);
+  const reconnectAttemptsRef = useRef(0);
 
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => {
+  const connect = useCallback(() => {
+    // Cancel any pending retry — we're connecting NOW.
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    let ws;
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch (e) {
+      // Synchronous WebSocket constructor failure (very rare). Schedule
+      // a retry directly.
+      // eslint-disable-next-line no-console
+      console.warn('[ws] constructor threw:', e);
+      scheduleReconnect();
+      return;
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimerRef.current) return;  // already scheduled
+      const attempt = ++reconnectAttemptsRef.current;
+      const delay = Math.min(10_000, 1000 * Math.pow(2, Math.min(attempt - 1, 4)));
+      // eslint-disable-next-line no-console
+      console.info(`[ws] reconnecting in ${delay}ms (attempt ${attempt})`);
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, delay);
+    }
+
+    ws.onopen = () => {
+      setConnected(true);
+      reconnectAttemptsRef.current = 0;  // reset backoff on success
+      dlog('ws', 'connected', { url: WS_URL });
+    };
+    ws.onerror = () => {
+      // Browser fires onerror BEFORE onclose for unreachable hosts.
+      // Don't schedule reconnect here — onclose handles it; otherwise
+      // we'd schedule twice.
+      dlog('ws', 'error');
+    };
+    ws.onclose = (ev) => {
       setConnected(false);
-      setTimeout(connect, 2000);
+      dlog('ws', 'closed', { code: ev.code, reason: ev.reason || '' });
+      scheduleReconnect();
     };
 
     ws.onmessage = (e) => {
@@ -129,6 +187,29 @@ export function useEmpireSocket() {
           break;
         case 'status':
           setStatus(msg.status);
+          break;
+        case 'phone_session_created':
+          // POST /api/phone/session response is also broadcast so multiple
+          // dashboard tabs share the same QR. We don't need to store the
+          // session here — PhoneQRPanel allocates its own — but we log
+          // so debugging session collisions is easy.
+          break;
+        case 'phone_upload_status':
+        case 'phone_upload_complete':
+        case 'phone_upload_failed':
+          // Stream-of-state broadcasts during a phone upload (connected →
+          // recording → uploading → complete). PhoneQRPanel reads
+          // `phoneUpload` to drive its visible state machine.
+          setPhoneUpload({
+            ...msg,
+            // Normalize complete/failed → status field so the consumer
+            // can switch on a single field regardless of event type.
+            status: msg.type === 'phone_upload_complete'
+              ? 'complete'
+              : msg.type === 'phone_upload_failed'
+                ? 'failed'
+                : msg.status,
+          });
           break;
         case 'comment_substrate_picked':
           // Fired by _run_bridge_with_wav2lip the moment Gemma's intent
@@ -445,15 +526,29 @@ export function useEmpireSocket() {
     if (!text?.trim()) return;
     const id = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     setPendingComments(prev => [...prev, { id, text: text.trim(), t0: Date.now() }]);
-    // client_id round-trips through the backend so the audience_comment
-    // echo handler can dedup THIS optimistic entry without false-positiving
-    // on a real audience phone that happened to type the same text within
-    // a few seconds. See the audience_comment case below for the dedup.
-    wsRef.current?.send(JSON.stringify({
-      type: 'simulate_comment',
-      text: text.trim(),
-      client_id: id,
-    }));
+    // HTTP POST instead of WS send — comments work even when the WS is
+    // briefly down (backend restart, hot-reload, transient network).
+    // Previous WS-only path silently dropped any comment fired while
+    // the dashboard was reconnecting, so the user typed "When can you
+    // ship?" and saw the rendering placeholder forever. The HTTP path
+    // is fire-and-forget; the response still arrives via the WS
+    // broadcast (comment_response_video) once it lands. Falls back to
+    // WS only if the fetch itself fails (offline / DNS).
+    const body = new URLSearchParams({ text: text.trim() });
+    fetch(`http://${window.location.hostname}:8000/api/comment`, {
+      method: 'POST',
+      body,
+    }).catch((e) => {
+      // Best-effort fallback to WS so a flaky local network doesn't
+      // lose the comment entirely if HTTP is down but WS happens to be up.
+      // eslint-disable-next-line no-console
+      console.warn('[sendComment] HTTP failed, trying WS fallback:', e);
+      wsRef.current?.send?.(JSON.stringify({
+        type: 'simulate_comment',
+        text: text.trim(),
+        client_id: id,
+      }));
+    });
   }, []);
 
   const sendSell = useCallback((voiceText) => {
@@ -474,6 +569,8 @@ export function useEmpireSocket() {
     wsRef, // exposed so useAvatarStream can attach an extra message listener
     // Debug HUD surface — last play_clip emit per Director layer.
     activeClips,
+    // Phone-as-camera upload state for PhoneQRPanel.
+    phoneUpload,
     // Live-language surface — App reads activeLanguage to drive the
     // LanguagePicker; setActiveLanguage is the optimistic local writer
     // (the picker calls it before the WS roundtrip lands so the UI

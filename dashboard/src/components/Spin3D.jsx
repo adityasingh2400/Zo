@@ -129,19 +129,39 @@ function stepSpring(curr, target, vel, k = 18, d = 7, dt = 1 / 60) {
 }
 
 // ── Image loader. Returns a promise that resolves to an HTMLImageElement[]. ──
+//
+// Each URL gets ONE retry with a 250 ms backoff. The carousel publish path
+// in the backend is a write-then-broadcast pattern, but the dashboard can
+// still race the disk flush on a fresh build (view_3d WS event arrives
+// before the OS finalises the last PNG write). One quick retry absorbs
+// that race; on permanent 404 we resolve(null) and the texture-upload step
+// fills the slot with a fallback pixel so we never leave uninitialised
+// GPU memory in the texture array — that's the magenta artifact source.
 function loadImages(urls) {
-  return Promise.all(
-    urls.map(
-      (url) =>
-        new Promise((resolve) => {
-          const img = new Image();
-          img.crossOrigin = 'anonymous';
-          img.onload = () => resolve(img);
-          img.onerror = () => resolve(null);
-          img.src = `${API_BASE}${url}`;
-        }),
-    ),
-  );
+  function loadOne(url, attempts = 2) {
+    return new Promise((resolve) => {
+      const tryLoad = (left) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = () => {
+          if (left > 1) {
+            setTimeout(() => tryLoad(left - 1), 250);
+          } else {
+            // eslint-disable-next-line no-console
+            console.warn('[Spin3D] frame failed to load after retry:', url);
+            resolve(null);
+          }
+        };
+        // Cache-bust on retry so we don't re-fetch the cached 404.
+        const sep = url.includes('?') ? '&' : '?';
+        const buster = left < attempts ? `${sep}r=${Date.now()}` : '';
+        img.src = `${API_BASE}${url}${buster}`;
+      };
+      tryLoad(attempts);
+    });
+  }
+  return Promise.all(urls.map((url) => loadOne(url)));
 }
 
 // ── WebGL helpers ────────────────────────────────────────────────────────────
@@ -570,15 +590,27 @@ function CarouselSpin({
       const scratch = document.createElement('canvas');
       scratch.width = scratch.height = target;
       const sctx = scratch.getContext('2d', { willReadFrequently: false });
+      // Pick a fallback image for any slot whose load failed. Using the
+      // first successful image (instead of leaving the slot blank) means
+      // a missing frame visually duplicates a neighbour rather than
+      // showing as a phantom skip in the spin — and CRITICALLY it means
+      // the texture-array slot has KNOWN pixel data instead of the
+      // uninitialised GPU memory that renders as magenta artifacts.
+      const fallbackImg = imgs.find((im) => im) || null;
       imgs.forEach((img, i) => {
-        if (!img) return;
+        const useImg = img || fallbackImg;
         sctx.clearRect(0, 0, target, target);
-        // Fit-to-square (preserve aspect). PNGs are already squared by threed.py
-        // but be defensive — never want to stretch the product.
-        const ratio = Math.min(target / img.naturalWidth, target / img.naturalHeight);
-        const w = img.naturalWidth * ratio;
-        const h = img.naturalHeight * ratio;
-        sctx.drawImage(img, (target - w) / 2, (target - h) / 2, w, h);
+        if (useImg) {
+          // Fit-to-square (preserve aspect). PNGs are already squared by threed.py
+          // but be defensive — never want to stretch the product.
+          const ratio = Math.min(target / useImg.naturalWidth, target / useImg.naturalHeight);
+          const w = useImg.naturalWidth * ratio;
+          const h = useImg.naturalHeight * ratio;
+          sctx.drawImage(useImg, (target - w) / 2, (target - h) / 2, w, h);
+        }
+        // Even when useImg is null (every load failed) we still upload
+        // the cleared scratch canvas — transparent black is a valid
+        // texture, magenta-from-uninit-GPU-memory is not.
         gl.texSubImage3D(
           gl.TEXTURE_2D_ARRAY, 0,
           0, 0, i, target, target, 1,

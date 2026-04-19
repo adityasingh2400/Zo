@@ -22,7 +22,32 @@ const API = `http://${window.location.hostname}:8000`;
 let _lastTrace = null;
 export function setTrace(t) { if (t) _lastTrace = t; }
 
+// Subscribers receive every dlog call client-side so a visible
+// EventLogHUD can render the live trace alongside the avatar without
+// needing a console open. Listeners are stored in a Set so adding /
+// removing one is O(1) and we don't leak refs.
+const _listeners = new Set();
+export function subscribe(fn) {
+  _listeners.add(fn);
+  return () => _listeners.delete(fn);
+}
+
 export function dlog(src, msg, data = {}) {
+  // 1. Mirror to the browser console so the trace is visible without
+  //    opening backend logs. Single-line format with a ▶ prefix so it's
+  //    grep-able vs other console noise.
+  try {
+    // eslint-disable-next-line no-console
+    console.info(`▶ [${src}] ${msg}`, data);
+  } catch {}
+
+  // 2. Notify in-page subscribers (EventLogHUD).
+  const evt = { src, msg, data, ts: Date.now() };
+  for (const fn of _listeners) {
+    try { fn(evt); } catch {}
+  }
+
+  // 3. Mirror to backend so a tail -f covers BOTH sides of the trace.
   try {
     fetch(`${API}/api/dashboard_log`, {
       method: 'POST',

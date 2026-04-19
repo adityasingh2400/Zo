@@ -113,7 +113,7 @@ export function LiveStage({
   const [tier1Opacity, setTier1Opacity] = useState(0);
   const [overlayVisible, setOverlayVisible] = useState(false);
 
-  const stream = useAvatarStream({ wsRef });
+  const stream = useAvatarStream({ wsRef, connected });
 
   // ── Blur pulse ──────────────────────────────────────────────────────────
   // Triggered at the start of every crossfade. Duration scales with the

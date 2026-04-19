@@ -213,6 +213,15 @@ class Director:
         # beat after the pitch instead of jumping straight to a sip.
         self._tier1_locked: bool = False
         self._post_pitch_settle_until: float = 0.0
+        # Phone-upload coalescing: if a new upload arrives while the
+        # previous pitch is still playing (pitch_lock active), the
+        # bridge would jump on top of the still-speaking avatar
+        # ("froze and jumped to new pitch" from the operator's seat).
+        # Stash a "deferred bridge" flag here that
+        # unlock_tier1_with_settle drains after the prior pitch
+        # releases — the new bridge then fires cleanly into the
+        # post-pitch idle window instead of mid-speech.
+        self._pending_play_processing: bool = False
 
     def current_substrate_pod_path(self) -> str:
         """The Wav2Lip server-side path that matches the visible Tier 0 clip,
@@ -407,6 +416,21 @@ class Director:
         clean — same target pose as the welcome clip + the Wav2Lip
         substrates. No special handoff logic needed.
         """
+        # PITCH-LOCK DEFERENCE — when the operator drops a 2nd upload
+        # while the 1st pitch is still talking, firing the bridge here
+        # would crossfade the walk_off clip RIGHT ON TOP of the still-
+        # speaking avatar (the pitch's standalone <audio> keeps playing
+        # through the crossfade, so audience hears Pitch-A while seeing
+        # Avatar-walking-off — visually reads as "froze and jumped to
+        # new pitch"). Instead, set a flag and let
+        # unlock_tier1_with_settle() drain it after the prior pitch
+        # finishes — bridge then lands cleanly into post-pitch idle.
+        if self._tier1_locked:
+            logger.info("[director] play_processing deferred — pitch lock active; "
+                        "bridge will fire after the current pitch releases")
+            self._pending_play_processing = True
+            return
+
         # No debounce needed — the route handler is the sole call site
         # post-Option-A, so this fires exactly once per upload. Back-to-
         # back uploads bump the chain_id and the queued processing.mp4
@@ -658,6 +682,12 @@ class Director:
         deliberate "phew, that was the pitch" beat in pure Tier 0 idle
         before sips / glances / walk-offs resume.
 
+        If a `play_processing` was deferred during the lock (operator
+        dropped a 2nd upload while the 1st pitch was still talking),
+        drain the flag here and re-fire it AFTER the settle window so
+        the bridge lands cleanly into post-pitch idle instead of mid-
+        speech.
+
         Caller is responsible for issuing fade_to_idle separately when
         appropriate (this method only manages lock state, not the visual
         Tier 1 release)."""
@@ -670,6 +700,25 @@ class Director:
         # from the pitch's own emit (60 s for looped) and would otherwise
         # extend the suppression window past the settle period.
         self._tier1_busy_until = 0.0
+
+        # Drain any deferred bridge so the next-upload narrative
+        # (walk_off → processing) plays cleanly after the prior pitch
+        # finishes, rather than getting silently dropped or jumping on
+        # top of speech mid-sentence.
+        if self._pending_play_processing:
+            self._pending_play_processing = False
+            sleep_s = max(0.0, settle_seconds) + 0.1
+
+            async def _fire_deferred_bridge() -> None:
+                try:
+                    await asyncio.sleep(sleep_s)
+                    logger.info("[director] firing deferred play_processing after %.1f s settle",
+                                sleep_s)
+                    await self.play_processing()
+                except Exception:
+                    logger.exception("[director] deferred play_processing failed")
+
+            asyncio.create_task(_fire_deferred_bridge())
 
     # ── Voice flow integration ────────────────────────────────────────────
     # The dashboard's <Spin3D> reacts to a `state` prop ('idle' | 'listening'

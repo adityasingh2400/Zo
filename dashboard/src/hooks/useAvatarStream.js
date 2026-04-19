@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { dlog } from '../lib/dlog';
 
 /**
  * useAvatarStream — listens to play_clip events on the existing EMPIRE
@@ -31,7 +32,7 @@ export const TIER1_FADEOUT_MS = 500;
  *   sendStageReady: () => void,
  * }}
  */
-export function useAvatarStream({ wsRef } = {}) {
+export function useAvatarStream({ wsRef, connected } = {}) {
   const [tier0, setTier0] = useState(null);
   const [tier1, setTier1] = useState(null);
   const localWsRef = useRef(null);
@@ -45,6 +46,22 @@ export function useAvatarStream({ wsRef } = {}) {
     return () => ws.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // dlog when the listener attaches/detaches so we can see in the
+  // event log whether useAvatarStream is actually subscribed at the
+  // moment a play_clip event fires. The historical bug was a stale
+  // listener attached to a closed WS; if you see "play_clip_received"
+  // events but no "listener_attached" before them, that's the symptom.
+  // Re-attach the play_clip listener whenever the WS RECONNECTS. The
+  // `wsRef` object is stable across renders (React useRef doesn't change
+  // identity), so without re-running on `connected` toggles the listener
+  // would stay glued to the OLD closed WebSocket after a backend
+  // restart — play_clip events would broadcast to the new WS, the HUD
+  // (useEmpireSocket switch case) would still show them, but the avatar
+  // player here would be deaf and the on-screen video would freeze on
+  // whatever frame it last had. The `connected` prop changes false→true
+  // on every reconnect, which re-runs the effect below and rebinds the
+  // listener to the live WebSocket.
 
   const sendAck = useCallback((intent, url, status) => {
     const ws = wsRef?.current || localWsRef.current;
@@ -67,6 +84,13 @@ export function useAvatarStream({ wsRef } = {}) {
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
     if (msg.type !== 'play_clip') return;
+    dlog('avatarStream', 'play_clip_received', {
+      layer: msg.layer,
+      intent: msg.intent,
+      url: msg.url,
+      muted: msg.muted,
+      emitted_by: msg.emitted_by,
+    });
     const clip = {
       intent: msg.intent,
       url: msg.url,
@@ -91,13 +115,22 @@ export function useAvatarStream({ wsRef } = {}) {
 
   // If the parent passed a shared wsRef, attach a listener to it. We use
   // addEventListener so we don't clobber its existing onmessage handler.
+  // Re-runs on every `connected` toggle so the listener follows the WS
+  // through reconnects (see the comment block above the top of the hook).
   useEffect(() => {
     const ws = wsRef?.current;
-    if (!ws) return;
+    if (!ws) {
+      dlog('avatarStream', 'listener_skip', { reason: 'wsRef not set' });
+      return;
+    }
     ws.addEventListener('message', handleMessage);
-    return () => ws.removeEventListener('message', handleMessage);
+    dlog('avatarStream', 'listener_attached', { connected, ws_state: ws.readyState });
+    return () => {
+      ws.removeEventListener('message', handleMessage);
+      dlog('avatarStream', 'listener_detached', { connected });
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsRef]);
+  }, [wsRef, connected]);
 
   return { tier0, tier1, sendAck, sendStageReady };
 }

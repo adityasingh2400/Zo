@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>EMPIRE clip debug</title>
+<style>
+  html,body{margin:0;padding:0;background:#0a0a0b;color:#fafafa;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid #27272a;
+    display:flex;justify-content:space-between;align-items:center}
+  header h1{margin:0;font-size:18px;font-weight:800;letter-spacing:1px}
+  header .hint{font-size:11px;color:#71717a;letter-spacing:1px;text-transform:uppercase}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));
+    gap:18px;padding:24px}
+  .card{background:#18181b;border:1px solid #27272a;border-radius:12px;
+    overflow:hidden;display:flex;flex-direction:column}
+  .card video{width:100%;display:block;background:#000;aspect-ratio:9/16;
+    object-fit:cover}
+  .meta{padding:10px 14px;display:flex;justify-content:space-between;
+    align-items:center;font-size:11px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .meta .url{color:#71717a;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap;flex:1;margin-right:8px}
+  .meta .status{font-weight:800;letter-spacing:1px;text-transform:uppercase;
+    flex-shrink:0}
+  .status.ok{color:#22c55e}
+  .status.err{color:#ef4444}
+  .status.pending{color:#fbbf24}
+  .hud{position:fixed;top:14px;right:24px;background:#18181b;
+    border:1px solid #27272a;border-radius:6px;padding:6px 10px;
+    font-size:11px;font-family:ui-monospace,monospace;
+    display:flex;gap:14px}
+  .hud .ct{color:#a1a1aa}
+  .hud .ok{color:#22c55e}
+  .hud .err{color:#ef4444}
+</style>
+</head>
+<body>
+<header>
+  <h1>📺 Clip debug</h1>
+  <span class="hint">If a clip below plays, the asset + serving works. Bug is in the dashboard player.</span>
+</header>
+<div class="hud">
+  <span class="ct">total: <span id="ctTotal">0</span></span>
+  <span class="ok">loaded: <span id="ctLoaded">0</span></span>
+  <span class="err">failed: <span id="ctFailed">0</span></span>
+</div>
+<div class="grid" id="grid"></div>
+<script>
+// All the clips the dashboard relies on, in priority order. Each one
+// gets a video element with controls + autoplay-muted. Status flips
+// to OK once the video can play through, ERR if it errors out.
+const CLIPS = [
+  // Bridge sequence (the user's specific complaint)
+  { url: '/states/idle/misc_walk_off_return.mp4',          label: 'walk_off (bridge step 1)' },
+  { url: '/bridges/processing/processing.mp4',             label: 'processing.mp4 (bridge step 2)' },
+  // Tier 0 idle pool
+  { url: '/states/idle/idle_calm.mp4',                     label: 'idle_calm (T0 default)' },
+  { url: '/states/idle/idle_thinking.mp4',                 label: 'idle_thinking (T0)' },
+  { url: '/states/idle/misc_hair_touch.mp4',               label: 'misc_hair_touch (T0)' },
+  // Tier 1 random interjections
+  { url: '/states/idle/misc_sip_drink.mp4',                label: 'misc_sip_drink (T1)' },
+  { url: '/states/idle/misc_glance_aside_silent.mp4',      label: 'misc_glance_aside_silent (T1)' },
+  // Reading clip used during comments
+  { url: '/states/idle/idle_reading_comments.mp4',         label: 'idle_reading_comments (T1)' },
+];
+
+const grid = document.getElementById('grid');
+const ctTotal  = document.getElementById('ctTotal');
+const ctLoaded = document.getElementById('ctLoaded');
+const ctFailed = document.getElementById('ctFailed');
+let total = CLIPS.length, loaded = 0, failed = 0;
+ctTotal.textContent = total;
+
+CLIPS.forEach(({ url, label }) => {
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const vid = document.createElement('video');
+  vid.src = url;
+  vid.autoplay = true;
+  vid.muted = true;
+  vid.loop = true;
+  vid.playsInline = true;
+  vid.controls = true;
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const urlEl = document.createElement('span');
+  urlEl.className = 'url';
+  urlEl.textContent = label;
+  urlEl.title = url;
+  const status = document.createElement('span');
+  status.className = 'status pending';
+  status.textContent = 'loading';
+  meta.appendChild(urlEl);
+  meta.appendChild(status);
+
+  vid.addEventListener('canplaythrough', () => {
+    status.className = 'status ok';
+    status.textContent = `OK ${vid.videoWidth}×${vid.videoHeight}`;
+    loaded++; ctLoaded.textContent = loaded;
+  });
+  vid.addEventListener('error', () => {
+    status.className = 'status err';
+    const err = vid.error;
+    status.textContent = `ERR ${err?.code || '?'}: ${err?.message || 'load failed'}`;
+    failed++; ctFailed.textContent = failed;
+  });
+
+  card.appendChild(vid);
+  card.appendChild(meta);
+  grid.appendChild(card);
+});
+</script>
+</body>
+</html>

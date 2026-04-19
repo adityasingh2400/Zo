@@ -1056,6 +1056,317 @@ async def _emit_pipeline_step(request_id: str | None, step: str, status: str,
     await broadcast_to_dashboards(payload)
 
 
+# ── Phone-as-camera uploader ──────────────────────────────────────────────
+# Replaces drag-drop with a phone-streamed upload: dashboard renders a QR,
+# phone scans → records → streams video chunks over WS → backend assembles
+# and runs the standard sell-video pipeline. See backend/phone_uploader.py
+# for session lifecycle. Endpoints:
+#   POST /api/phone/session          create a session, return URLs for the QR
+#   GET  /phone/{session_id}         mobile recorder HTML (camera + record button)
+#   WS   /ws/phone/upload/{sid}      binary chunk stream from the phone
+
+import phone_uploader  # local module — session registry + LAN IP detection
+
+
+@app.post("/api/phone/session")
+async def api_phone_session():
+    """Create a phone-upload session. Returns the URLs the dashboard
+    renders into a QR code (recorder page + WS upload endpoint), both
+    pinned to the Mac's LAN IP so the phone can reach the backend
+    directly from the same WiFi.
+
+    The session expires after 10 min of inactivity; once a phone
+    completes an upload the session is consumed and a new POST is
+    required for the next take."""
+    session = phone_uploader.create_session()
+    # Public-tunnel URL takes priority over LAN IP. Set EMPIRE_PUBLIC_URL
+    # to a https://*.trycloudflare.com / https://*.ngrok.app / similar
+    # so the phone can reach the backend across networks (corporate
+    # WiFi with client isolation blocks LAN-IP routes; cellular has no
+    # LAN at all). Falls back to http://<lan_ip>:<port> when no public
+    # URL is set — works fine on a flat home WiFi.
+    public_url = os.getenv("EMPIRE_PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        base = public_url
+        ws_base = public_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        ip = public_url
+    else:
+        ip = phone_uploader.lan_ip()
+        backend_port = int(os.getenv("BACKEND_PORT", BACKEND_PORT or 8000))
+        base = f"http://{ip}:{backend_port}"
+        ws_base = f"ws://{ip}:{backend_port}"
+    payload = {
+        "session_id": session.session_id,
+        "recorder_url": f"{base}/phone/{session.session_id}",
+        "ws_url": f"{ws_base}/ws/phone/upload/{session.session_id}",
+        "lan_ip": ip,
+        "expires_in_seconds": phone_uploader.SESSION_TTL_SECONDS,
+    }
+    # Broadcast so the dashboard knows a session is live and can render
+    # the QR — useful when the operator opens multiple browser tabs and
+    # we want them all in sync on which session is active.
+    await broadcast_to_dashboards({
+        "type": "phone_session_created",
+        **payload,
+    })
+    return payload
+
+
+_PHONE_SESSION_EXPIRED_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Session expired</title>
+<style>
+  html,body{height:100%;margin:0;background:#0a0a0b;color:#fafafa;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    display:flex;align-items:center;justify-content:center;padding:32px}
+  .card{max-width:340px;text-align:center;display:flex;flex-direction:column;gap:14px}
+  .icon{font-size:54px}
+  h1{font-size:22px;font-weight:800;margin:0}
+  p{font-size:14px;color:#a1a1aa;line-height:1.5;margin:0}
+  code{background:#18181b;padding:2px 8px;border-radius:6px;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#fbbf24}
+</style></head>
+<body><div class="card">
+  <div class="icon">⏱️</div>
+  <h1>Session expired</h1>
+  <p>This phone-upload link is no longer active. The Mac dashboard has rotated to a fresh QR code.</p>
+  <p>Open the Mac, refresh the dashboard tab, and scan the new QR.</p>
+</div></body></html>"""
+
+
+@app.get("/debug/clips")
+async def debug_clips_page():
+    """Standalone clip-test page — plays every Tier 0/1 substrate the
+    dashboard relies on in plain <video> elements with controls. Use
+    when the live stage looks broken to confirm whether it's the
+    asset/serving (no clip plays here either) or the dashboard player
+    (clips play here but stage shows frozen idle)."""
+    static_dir = Path(__file__).resolve().parent / "static"
+    template_path = static_dir / "debug_clips.html"
+    if not template_path.exists():
+        raise HTTPException(500, "debug_clips.html missing")
+    return HTMLResponse(content=template_path.read_text(),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/phone/{session_id}")
+async def phone_recorder_page(session_id: str):
+    """Serve the mobile recorder HTML for a given session. Templated
+    in-place (one-line replace of the WS URL + session_id) so we don't
+    need a Jinja dependency for a single static page.
+
+    Expired/unknown session → friendly HTML page (NOT a JSON 404).
+    Safari renders the JSON 404 as a blank dark page because of the
+    dark colour scheme and the short response body — operator sees no
+    feedback. The HTML response below tells them exactly what to do
+    (refresh dashboard for a fresh QR)."""
+    session = phone_uploader.get_session(session_id)
+    if session is None:
+        return HTMLResponse(content=_PHONE_SESSION_EXPIRED_HTML, status_code=404)
+
+    # Recorder page lives next to main.py in static/. Templated with
+    # the session-specific WS URL so the page knows where to stream
+    # without a second handshake. The host header reflects whatever IP
+    # the phone hit — usually the LAN IP we encoded in the QR — so we
+    # build the WS URL from request.url to handle the rare case where
+    # the operator manually shares a different host.
+    static_dir = Path(__file__).resolve().parent / "static"
+    template_path = static_dir / "phone_recorder.html"
+    if not template_path.exists():
+        raise HTTPException(500, "phone_recorder.html missing — backend install incomplete")
+
+    html = template_path.read_text()
+    public_url = os.getenv("EMPIRE_PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        ws_url = public_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+        ws_url = f"{ws_url}/ws/phone/upload/{session_id}"
+    else:
+        backend_port = int(os.getenv("BACKEND_PORT", BACKEND_PORT or 8000))
+        ws_url = f"ws://{phone_uploader.lan_ip()}:{backend_port}/ws/phone/upload/{session_id}"
+    html = html.replace("{{SESSION_ID}}", session_id).replace("{{WS_URL}}", ws_url)
+    return HTMLResponse(content=html)
+
+
+@app.websocket("/ws/phone/upload/{session_id}")
+async def phone_upload_ws(ws: WebSocket, session_id: str):
+    """Binary-stream video chunks from the phone's MediaRecorder into a
+    temp file, then hand the file off to run_video_sell_pipeline as if
+    it were a /api/sell-video upload.
+
+    Protocol (the phone-side recorder enforces this order):
+      1. WS open → server accepts → status=connected, broadcast to dash
+      2. First message: JSON {type:"start", mime_type, voice_text?}
+         → server allocates the temp file and sets the right suffix
+           so ffmpeg can probe the container correctly
+      3. N binary messages: video bytes from MediaRecorder.ondataavailable
+      4. Final message: JSON {type:"end"}
+         → server flushes, fsyncs, and triggers the sell pipeline
+      5. Server replies {type:"complete", request_id} so the phone can
+         show "Sent! Watch the screen."
+
+    Errors at any step set session.status=failed and broadcast a
+    phone_upload_failed event so the dashboard can show the operator
+    what went wrong (no silent black-hole)."""
+    session = phone_uploader.get_session(session_id)
+    if session is None:
+        await ws.close(code=1008, reason="session not found")
+        return
+
+    await ws.accept()
+    session.status = "connected"
+    await broadcast_to_dashboards({
+        "type": "phone_upload_status",
+        **phone_uploader.session_summary(session),
+    })
+
+    upload_path: Path | None = None
+    upload_handle = None
+    voice_text = "sell this"
+    try:
+        # Phase 1 — wait for the start handshake. Times out after 30s
+        # so an idle WS doesn't hold a session forever.
+        first = await asyncio.wait_for(ws.receive(), timeout=30.0)
+        if first.get("type") != "websocket.receive" or "text" not in first:
+            raise ValueError("expected text 'start' message first")
+        start_msg = json.loads(first["text"])
+        if start_msg.get("type") != "start":
+            raise ValueError(f"first message must be type='start', got {start_msg.get('type')!r}")
+        session.mime_type = str(start_msg.get("mime_type") or "video/webm")
+        voice_text = str(start_msg.get("voice_text") or "sell this")
+        # Pick file extension from MIME so ffmpeg can probe the container.
+        # MediaRecorder gives "video/webm" on Chrome/Android, "video/mp4"
+        # or "video/quicktime" on iOS Safari ≥14.3. Default to .webm.
+        if "mp4" in session.mime_type or "quicktime" in session.mime_type:
+            suffix = ".mp4"
+        else:
+            suffix = ".webm"
+        upload_path = phone_uploader.open_upload_file(session, suffix=suffix)
+        upload_handle = open(upload_path, "wb")
+        session.status = "recording"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_status",
+            **phone_uploader.session_summary(session),
+        })
+        logger.info("[phone] %s recording: mime=%s suffix=%s -> %s",
+                    session_id, session.mime_type, suffix, upload_path)
+
+        # Phase 2 — receive binary chunks until "end" message arrives.
+        # Mixed text/binary handling: starlette delivers each via the
+        # same receive() with either "text" or "bytes" key set.
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(msg.get("code", 1006))
+            if "bytes" in msg and msg["bytes"] is not None:
+                chunk = msg["bytes"]
+                upload_handle.write(chunk)
+                session.bytes_received += len(chunk)
+                session.chunks_count += 1
+                # Throttle progress broadcasts — every 250 KB or every
+                # 8 chunks, whichever first. Avoids flooding dashboard
+                # WS for a fast 10 MB stream.
+                if session.chunks_count % 8 == 0 or session.bytes_received % (256 * 1024) < len(chunk):
+                    await broadcast_to_dashboards({
+                        "type": "phone_upload_status",
+                        **phone_uploader.session_summary(session),
+                    })
+            elif "text" in msg and msg["text"]:
+                end_msg = json.loads(msg["text"])
+                if end_msg.get("type") == "end":
+                    voice_text = str(end_msg.get("voice_text") or voice_text)
+                    break
+                # Ignore unknown text frames mid-stream rather than
+                # crashing — defensive against future protocol additions.
+                logger.warning("[phone] %s ignoring mid-stream text: %s",
+                               session_id, end_msg.get("type"))
+
+        # Phase 3 — flush + fsync so the pipeline reads complete bytes.
+        # Without fsync the kernel's page cache might still be holding
+        # writes when run_video_sell_pipeline calls ffmpeg, leading to
+        # truncated reads on the rare race.
+        upload_handle.flush()
+        os.fsync(upload_handle.fileno())
+        upload_handle.close()
+        upload_handle = None
+
+        session.status = "uploading"
+        request_id = uuid.uuid4().hex[:12]
+        session.request_id = request_id
+        await broadcast_to_dashboards({
+            "type": "phone_upload_status",
+            **phone_uploader.session_summary(session),
+        })
+        # Mirror /api/sell-video: fire the "uploaded" pipeline_step so
+        # the dashboard's progress rail moves immediately, then play
+        # the upload bridge, then kick the pipeline.
+        asyncio.ensure_future(_emit_pipeline_step(
+            request_id, "uploaded", "done",
+            ms=0, detail=f"{session.bytes_received}B (phone)"))
+        await _play_upload_bridge()
+        asyncio.ensure_future(run_video_sell_pipeline(
+            str(upload_path), voice_text, request_id=request_id))
+
+        session.status = "complete"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_complete",
+            **phone_uploader.session_summary(session),
+        })
+        # Tell the phone the server is done with it so the recorder can
+        # show its "sent!" state and (optionally) close the WS.
+        await ws.send_text(json.dumps({
+            "type": "complete",
+            "request_id": request_id,
+            "bytes": session.bytes_received,
+        }))
+        logger.info("[phone] %s complete: %d bytes in %d chunks → request_id=%s",
+                    session_id, session.bytes_received, session.chunks_count, request_id)
+
+    except WebSocketDisconnect:
+        # Phone dropped the WS before sending "end" — partial upload,
+        # not usable. Mark as failed so the dashboard can show "phone
+        # disconnected" and let the operator try again.
+        session.status = "failed"
+        session.error = "phone disconnected mid-upload"
+        logger.warning("[phone] %s disconnected mid-upload (got %d bytes)",
+                       session_id, session.bytes_received)
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+    except asyncio.TimeoutError:
+        session.status = "failed"
+        session.error = "no start message within 30s"
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+        try:
+            await ws.close(code=1008, reason="start timeout")
+        except Exception:
+            pass
+    except Exception as e:
+        session.status = "failed"
+        session.error = str(e)[:200]
+        logger.exception("[phone] %s upload error", session_id)
+        await broadcast_to_dashboards({
+            "type": "phone_upload_failed",
+            **phone_uploader.session_summary(session),
+        })
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": session.error}))
+            await ws.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        if upload_handle is not None:
+            try:
+                upload_handle.close()
+            except Exception:
+                pass
+
+
 @app.post("/api/sell-video")
 async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("sell this")):
     """Upload a product video. Extracts frames + transcript, runs full pipeline.

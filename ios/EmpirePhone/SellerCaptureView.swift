@@ -24,6 +24,8 @@ struct SellerCaptureView: View {
     @State private var timerTick: Int = 0  // seconds since recording started
     @State private var activeRequestID: String?
     @State private var timerTask: Task<Void, Never>?
+    @State private var showingHostSheet = false
+    @State private var hostInput = ""
 
     enum FlowState: Equatable {
         case recordingReady
@@ -84,13 +86,34 @@ struct SellerCaptureView: View {
             socket.stop()
             cameraSession.teardown()
         }
+        .alert("Backend host", isPresented: $showingHostSheet) {
+            TextField("IP or https://...trycloudflare.com", text: $hostInput)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Button("Save + retry") {
+                GemmaClient.setBackendHost(hostInput.trimmingCharacters(in: .whitespacesAndNewlines))
+                flowState = .recordingReady
+            }
+            Button("Reset to default", role: .destructive) {
+                GemmaClient.setBackendHost(nil)
+                flowState = .recordingReady
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let resolved = GemmaClient.backendHost ?? "(none)"
+            let source = GemmaClient.hasUserDefaultsOverride ? "runtime override"
+                       : "Info.plist / default"
+            Text("Current: \(resolved)\nSource: \(source)")
+        }
     }
 
     // MARK: - Top chrome (REC pill + close)
 
     private var topChrome: some View {
         HStack {
-            // REC pill
+            // REC pill — long-press to change backend host (shortcut to the
+            // host-override sheet without needing to close the camera).
             HStack(spacing: 6) {
                 Circle()
                     .fill(flowState == .recording ? Color.red : Color.white.opacity(0.3))
@@ -104,6 +127,10 @@ struct SellerCaptureView: View {
             .padding(.vertical, 6)
             .background(.ultraThinMaterial.opacity(0.4), in: Capsule())
             .overlay(Capsule().stroke(Color.white.opacity(0.2), lineWidth: 0.5))
+            .onLongPressGesture(minimumDuration: 0.6) {
+                hostInput = GemmaClient.backendHost ?? ""
+                showingHostSheet = true
+            }
 
             Spacer()
 
@@ -152,35 +179,49 @@ struct SellerCaptureView: View {
     }
 
     private func failureBanner(message: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.red)
-                Text(message)
-                    .font(.system(size: 12))
-                    .foregroundColor(.white)
-                    .lineLimit(3)
+        Button {
+            // Open the host sheet immediately — no more close-camera dance.
+            hostInput = GemmaClient.backendHost ?? ""
+            showingHostSheet = true
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                    Text(message)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+                HStack(spacing: 6) {
+                    Text("target")
+                        .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                        .tracking(1)
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(GemmaClient.backendHost ?? "?")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.65))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                HStack {
+                    Text("TAP TO CHANGE HOST")
+                        .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                        .tracking(1.2)
+                        .foregroundColor(.blue)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.blue)
+                }
+                .padding(.top, 2)
             }
-            // Show the target host + port so the user knows exactly which
-            // Mac IP to fix. On "Could not connect to the server" (-1004)
-            // the fix is almost always: same-network or long-press host
-            // override. Surfacing the host here makes the fix obvious.
-            HStack(spacing: 6) {
-                Text("target")
-                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
-                    .tracking(1)
-                    .foregroundColor(.white.opacity(0.4))
-                Text("\(GemmaClient.backendHost ?? "?"):8000")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.65))
-            }
-            Text("close this → long-press TAP TO FILM to change the host")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.35))
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.ultraThinMaterial.opacity(0.6), in: RoundedRectangle(cornerRadius: 14))
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.ultraThinMaterial.opacity(0.6), in: RoundedRectangle(cornerRadius: 14))
+        .buttonStyle(.plain)
     }
 
     // MARK: - Shutter cluster

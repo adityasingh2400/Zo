@@ -32,6 +32,7 @@ logger = logging.getLogger("empire")
 
 from agents import brain
 from agents import router as comment_router
+from agents.hands import Hands
 from agents.avatar_director import Director
 from agents.bridge_clips import all_bridges, pick_bridge_clip
 from agents.creator import build_all as creator_build_all
@@ -124,6 +125,7 @@ def _audience_rate_check(ip: str) -> bool:
 # Single Director instance owns all play_clip emission. Bound to the
 # dashboard broadcast helper so it can talk to every connected client.
 director: "Director | None" = None  # set in app startup, see below
+hands: "Hands | None" = None        # set in app startup (Item 5)
 
 
 PRODUCTS_PATH = Path(__file__).resolve().parent / "data" / "products.json"
@@ -256,8 +258,12 @@ async def broadcast_to_dashboards(msg: dict):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global director
+    global director, hands
     print(f"EMPIRE backend running on {BACKEND_HOST}:{BACKEND_PORT}")
+    # Bring up the Hands agent (Item 5). Idempotent — reuses the same
+    # broadcast_to_dashboards callable the Director uses for WS emits.
+    hands = Hands(broadcast=broadcast_to_dashboards)
+    logger.info("[hands] initialized with platforms: %s", list(hands.adapters.keys()))
     # Bring up the Avatar Director early so the first dashboard connect can
     # immediately receive a Tier 0 idle clip.
     director = Director(broadcast_to_dashboards)
@@ -966,6 +972,68 @@ async def api_director_force_phase(phase: str = Form(...)):
     # handler (backward-compat; handler ships in Item 2).
     await broadcast_to_dashboards({"type": "status", "status": new_status})
     return {"status": "ok", "phase": p, "backend_status": new_status}
+
+
+# ── Hands agent (Item 5) ──────────────────────────────────────────────────
+#
+# GET  /api/hands/state        — platforms + enabled + last publish
+# POST /api/hands/toggle       — toggle a single platform on/off
+# POST /api/hands/publish      — fan out the current product to all enabled
+#
+# DistributionToggles (dashboard) hydrates from /api/hands/state on mount
+# and POSTs /api/hands/toggle on each toggle. MetricsStrip subscribes to
+# hands_published events (broadcast by Hands.publish_all) to animate the
+# BASKETS counter in real time.
+
+@app.get("/api/hands/state")
+async def api_hands_state():
+    if hands is None:
+        return {"platforms": {}}
+    return hands.get_state()
+
+
+@app.post("/api/hands/toggle")
+async def api_hands_toggle(platform: str = Form(...),
+                            enabled: str = Form(...)):
+    if hands is None:
+        raise HTTPException(503, "hands not initialized yet")
+    flag = enabled.strip().lower() in ("true", "1", "yes", "on")
+    try:
+        hands.set_enabled(platform, flag)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    await broadcast_to_dashboards({
+        "type": "hands_toggle",
+        "platform": platform,
+        "enabled": flag,
+    })
+    return {"ok": True, "platform": platform, "enabled": flag}
+
+
+@app.post("/api/hands/publish")
+async def api_hands_publish():
+    """Fan out the currently-active product to every enabled platform.
+    Returns per-platform results. Fires hands_published events on each."""
+    if hands is None:
+        raise HTTPException(503, "hands not initialized yet")
+    product = pipeline_state.get("product_data")
+    if not product:
+        raise HTTPException(400, "no active product — POST /api/sell first")
+    results = await hands.publish_all(product)
+    return {
+        "product_name": product.get("name"),
+        "results": {
+            p: {
+                "ok": r.ok,
+                "url": r.url,
+                "listing_id": r.listing_id,
+                "basket_impressions": r.basket_impressions,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+            }
+            for p, r in results.items()
+        },
+    }
 
 
 @app.get("/api/avatars")

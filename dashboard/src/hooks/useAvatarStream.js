@@ -74,6 +74,13 @@ export function useAvatarStream({ wsRef } = {}) {
       fadeMs: msg.fade_ms ?? (msg.layer === 'tier1' ? TIER1_CROSSFADE_MS : TIER0_CROSSFADE_MS),
       ts: msg.ts,
       mode: msg.mode || 'crossfade',
+      // Audio-first metadata. `muted` tells LiveStage to set incomingEl.muted=true
+      // and skip the volume ramp (audio is coming from a separate <audio>
+      // element). `expectedDurationMs` enables the duration handshake on
+      // canplaythrough — if the video duration drifts >150ms from this,
+      // LiveStage rejects the video and lets the standalone audio play alone.
+      muted: !!msg.muted,
+      expectedDurationMs: msg.expected_duration_ms ?? null,
     };
     if (msg.layer === 'tier0') setTier0(clip);
     else if (msg.layer === 'tier1') setTier1(clip);

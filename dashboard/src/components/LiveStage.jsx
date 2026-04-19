@@ -18,6 +18,8 @@ const API_BASE = `http://${window.location.hostname}:8000`;
  * Source selection itself is no longer driven by them — that's the Director's
  * job now.
  */
+const API_BASE_FOR_AUDIO = `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000`;
+
 export function LiveStage({
   productData,
   pitchVideoUrl,           // kept for placeholder context only
@@ -25,6 +27,9 @@ export function LiveStage({
   pendingComments = [],
   liveStage,
   wsRef,
+  audioResponse,           // audio-first dispatch: {url, word_timings, expected_duration_ms, ...}
+  pitchAudio,              // 30s Veo pitch audio: same shape, separate slot
+  onAudioEnded,            // (kind: 'response' | 'pitch') -> void; parent clears state
 }) {
   // Voice/routing state listened off the shared WS directly so LiveStage stays
   // self-contained — no prop changes needed in App.jsx (which Cody is also
@@ -38,6 +43,14 @@ export function LiveStage({
   const tier0BRef = useRef(null);
   const tier1ARef = useRef(null);
   const tier1BRef = useRef(null);
+
+  // Hidden <audio> element owned by LiveStage. Drives both audio-first
+  // comment responses AND 30s pitch playback. KaraokeCaptions (Phase 4)
+  // reads currentTime off this element via the ref. Single instance reused
+  // across plays — setting src + calling load() is cheaper than churning
+  // through new Audio() objects.
+  const audioRef = useRef(null);
+  const [audioPlaying, setAudioPlaying] = useState(null); // {kind, url, word_timings, ts}
 
   // Which element of each tier is currently visible (true = A, false = B).
   const [tier0ActiveIsA, setTier0ActiveIsA] = useState(true);
@@ -114,14 +127,41 @@ export function LiveStage({
     if (!incomingEl) return;
 
     incomingEl.src = `${API_BASE}${url}`;
-    incomingEl.muted = false;
+    // Audio-first path: Director sets muted=true on the play_clip event. The
+    // soundtrack is coming from a standalone <audio> element (audioResponse
+    // / pitchAudio), so this video element must stay silent or we double
+    // the audio. We also skip the volume ramp below.
+    const audioFirstMuted = !!stream.tier1.muted;
+    incomingEl.muted = audioFirstMuted;
     incomingEl.loop = !!stream.tier1.loop;
     // Start muted in volume terms then ramp up alongside opacity to avoid a
-    // hard audio cut.
+    // hard audio cut. On audio-first we leave volume at 0 forever (muted).
     incomingEl.volume = 0;
 
+    const expectedDurationMs = stream.tier1.expectedDurationMs;
     const onCanPlay = () => {
       incomingEl.removeEventListener('canplay', onCanPlay);
+
+      // Duration handshake (REVISIONS §4). When the audio is already playing
+      // through a standalone <audio> element, we want the video to match the
+      // audio length within ~150ms — otherwise we'd see either a silent
+      // video tail (video > audio) or a clipped audio finale (audio > video).
+      // Reject the late video and let audio finish alone in the mismatch.
+      if (audioFirstMuted && expectedDurationMs && incomingEl.duration) {
+        const videoMs = incomingEl.duration * 1000;
+        const driftMs = Math.abs(videoMs - expectedDurationMs);
+        if (driftMs > 150) {
+          console.warn('[LiveStage] audio-first duration drift', {
+            videoMs: Math.round(videoMs), expectedDurationMs, driftMs: Math.round(driftMs),
+          });
+          // Don't promote, don't crossfade. Tier 0 keeps painting underneath
+          // and audio finishes from the standalone element. Ack as
+          // 'skipped' so backend telemetry can record it.
+          stream.sendAck(stream.tier1.intent, url, 'skipped');
+          return;
+        }
+      }
+
       incomingEl.play().then(() => {
         // Swap which element is active and run the opacity transition.
         setTier1ActiveIsA(prev => !prev);
@@ -129,7 +169,17 @@ export function LiveStage({
         setOverlayVisible(stream.tier1.intent === 'response');
         stream.sendAck(stream.tier1.intent, url, 'started');
 
-        // rAF audio fade alongside the CSS opacity transition.
+        if (audioFirstMuted) {
+          // No audio ramp — the standalone <audio> already owns the
+          // soundtrack. Pause the outgoing video after the opacity fade
+          // so we don't keep two decoders running.
+          setTimeout(() => {
+            try { outgoingEl?.pause(); } catch {}
+          }, fadeMs + 50);
+          return;
+        }
+
+        // Default path: rAF audio fade alongside the CSS opacity transition.
         const start = performance.now();
         function tick(now) {
           const t = Math.min(1, (now - start) / fadeMs);
@@ -176,6 +226,70 @@ export function LiveStage({
       b?.removeEventListener('ended', onEnded);
     };
   }, [tier1ActiveIsA, stream.tier1?.intent, stream.tier1?.url, stream.sendAck]);
+
+  // ── Audio-first playback ────────────────────────────────────────────────
+  // Single hidden <audio> element, mounted once, reused across plays. Driven
+  // by audioResponse (live comment responses) and pitchAudio (30s Veo pitch).
+  // Pitch wins ties — if both fire in the same render, we play the pitch
+  // (rare; pitch_audio also clears any in-flight responseAudio because the
+  // backend won't fire a comment response while a pitch is broadcasting).
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    // Pick whichever dispatch is newer by `seq`. Avoids the race where a
+    // pitch starts and a stale comment response from the same tick stomps it.
+    const respSeq = audioResponse?.seq || 0;
+    const pitchSeq = pitchAudio?.seq || 0;
+    const next =
+      pitchSeq > respSeq && pitchAudio
+        ? { kind: 'pitch', payload: pitchAudio }
+        : audioResponse
+          ? { kind: 'response', payload: audioResponse }
+          : null;
+
+    if (!next) {
+      // Nothing to play — pause + clear so a stale src doesn't auto-resume.
+      try { a.pause(); a.currentTime = 0; } catch {}
+      setAudioPlaying(null);
+      return;
+    }
+
+    // Identical seq → no-op (avoid restarting playback on every parent re-render).
+    if (audioPlaying && audioPlaying.payload.seq === next.payload.seq) return;
+
+    a.src = `${API_BASE_FOR_AUDIO}${next.payload.url}`;
+    a.preload = 'auto';
+    a.volume = 1;
+    setAudioPlaying(next);
+
+    const playPromise = a.play();
+    if (playPromise && typeof playPromise.catch === 'function') {
+      playPromise.catch((err) => {
+        // Most common cause: StartDemoOverlay wasn't completed before this
+        // fired (operator skipped the button or the persisted unlock flag
+        // is stale on a different machine). Log and continue — the user
+        // hears nothing this round but the rest of the demo still works.
+        console.warn('[LiveStage] audio-first play() rejected', err);
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioResponse?.seq, pitchAudio?.seq]);
+
+  // Audio ended → tell parent so it can clear the matching state slot.
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    function onEnded() {
+      const playing = audioPlaying;
+      if (!playing) return;
+      console.log('[LiveStage] audio-first ended', playing.kind, playing.payload.seq);
+      onAudioEnded?.(playing.kind);
+      setAudioPlaying(null);
+    }
+    a.addEventListener('ended', onEnded);
+    return () => a.removeEventListener('ended', onEnded);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audioPlaying?.payload?.seq]);
 
   // Unmute on first user gesture (mobile autoplay restriction). Tier 0 stays
   // muted always; Tier 1 gets the unmute.
@@ -309,6 +423,16 @@ export function LiveStage({
             </div>
           </div>
         )}
+
+        {/* Hidden audio element — drives the audio-first playback path AND
+            the 30s Veo pitch path. Kept hidden because we don't want
+            controls visible on stage; KaraokeCaptions reads currentTime
+            off audioRef.current to highlight words. */}
+        <audio
+          ref={audioRef}
+          playsInline
+          style={{ display: 'none' }}
+        />
 
         {/* Empty placeholder only shown if Tier 0 has nothing to play */}
         {!stream.tier0 && !lastTier0Url.current && (

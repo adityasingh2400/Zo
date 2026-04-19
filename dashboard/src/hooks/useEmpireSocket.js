@@ -18,6 +18,19 @@ export function useEmpireSocket() {
   const [transcript, setTranscript] = useState(null);
   const [pitchVideoUrl, setPitchVideoUrl] = useState(null);
   const [responseVideo, setResponseVideo] = useState(null); // {url, comment, response, total_ms, ...}
+  // Audio-first dispatch payload: {url, comment, response, word_timings,
+  // expected_duration_ms, intent, ts, seq}. seq monotonically increases so
+  // LiveStage can swap the playing <audio> when a fresh dispatch arrives
+  // mid-playback (e.g. operator fires a new comment while one is playing).
+  // Cleared by the matching comment_response_video or video_failed event so
+  // KaraokeCaptions stop tracking once the audio source is exhausted.
+  const [audioResponse, setAudioResponse] = useState(null);
+  // Pitch dispatch — fires when /api/pitch (or director.play_pitch_veo) is
+  // invoked. Same shape as audioResponse but tagged so LiveStage knows to
+  // mount the TranslationChip overlay (the audio is a 30s pre-rendered
+  // pitch, not a live response). Cleared after audio_duration_ms expires.
+  const [pitchAudio, setPitchAudio] = useState(null);
+  const audioSeqRef = useRef(0);
   const [liveStage, setLiveStage] = useState('INTRO');
   const [pendingComments, setPendingComments] = useState([]); // [{id, text, t0}]
   const [view3d, setView3d] = useState(null); // {kind, frames|url, ms, source}
@@ -103,6 +116,28 @@ export function useEmpireSocket() {
           setCommentResponse(msg);
           if (msg.audio) setLatestAudio({ audio: msg.audio, format: msg.format });
           break;
+        case 'comment_response_audio':
+          // Audio-first dispatch — TTS bytes are saved + ready to play. The
+          // visible video crossfades in later (comment_response_video below)
+          // with audio_already_playing=true so the dashboard mutes that
+          // video element and lets the standalone <audio> finish the audio
+          // track. KaraokeCaptions reads word_timings to highlight word-by-word.
+          if (msg.url) {
+            audioSeqRef.current += 1;
+            setAudioResponse({
+              ...msg,
+              seq: audioSeqRef.current,
+              receivedAt: Date.now(),
+            });
+            // We're in the middle of responding — pill goes responding so the
+            // LIVE indicator transitions correctly when video lands.
+            setVoiceStateSafe('responding');
+            // Drop the pending chip immediately on audio arrival so the
+            // floating "Reading..." overlay doesn't keep showing while we
+            // hear the answer (was previously cleared by the video event).
+            setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          }
+          break;
         case 'comment_response_video':
           setResponseVideo(msg);
           setCommentResponse(msg);
@@ -112,6 +147,38 @@ export function useEmpireSocket() {
           // Voice flow lands here if this response was triggered by voice.
           // Clearing voiceState lets the LIVE pill take over visually.
           setVoiceStateSafe(null);
+          // Audio-first: the audio session is owned by the audio element, but
+          // the comment_response_video event is the canonical "render done"
+          // signal that the audience-facing video is on stage. Don't clear
+          // audioResponse here — KaraokeCaptions need to keep tracking until
+          // audio actually ends (handled inside LiveStage on audio.ended).
+          break;
+        case 'comment_response_video_failed':
+          // Audio-first background Wav2Lip failed. Audio still plays out via
+          // the existing <audio> element; we just won't ever crossfade the
+          // visual layer. Clear pending chip so it doesn't hang.
+          setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          setVoiceStateSafe(null);
+          break;
+        case 'pitch_audio':
+          // 30s pre-rendered Veo pitch — audio + word_timings + chip should
+          // all start at once. Stored separately from audioResponse so a live
+          // comment that arrives mid-pitch doesn't preempt the pitch by
+          // overwriting the audio source.
+          if (msg.url) {
+            audioSeqRef.current += 1;
+            setPitchAudio({
+              ...msg,
+              seq: audioSeqRef.current,
+              receivedAt: Date.now(),
+            });
+            setLiveStage('PITCH');
+          }
+          break;
+        case 'pitch_audio_end':
+          // Pitch ended naturally (audio.ended on the dashboard) — backend
+          // can also broadcast this proactively to clear the chip if needed.
+          setPitchAudio(null);
           break;
         case 'voice_state':
           // Director-driven explicit voice state. Authoritative.
@@ -260,6 +327,8 @@ export function useEmpireSocket() {
     // Voice + routing surface
     voiceState, setVoiceState: setVoiceStateSafe,
     voiceTranscript, routingDecision, routingDecisions, routingStats,
+    // Audio-first surface
+    audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     sendComment, sendSell,
     wsRef, // exposed so useAvatarStream can attach an extra message listener
   };

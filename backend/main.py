@@ -186,7 +186,7 @@ async def broadcast_to_dashboards(msg: dict):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global director
-    print(f"EMPIRE backend running on {BACKEND_HOST}:{BACKEND_PORT}")
+    print(f"Zo backend running on {BACKEND_HOST}:{BACKEND_PORT}")
     # Bring up the Avatar Director early so the first dashboard connect can
     # immediately receive a Tier 0 idle clip.
     director = Director(broadcast_to_dashboards)
@@ -224,7 +224,7 @@ async def lifespan(app: FastAPI):
     _load_active_product()
     yield
 
-app = FastAPI(title="EMPIRE", lifespan=lifespan)
+app = FastAPI(title="Zo", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -507,7 +507,7 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     pipeline_state["status"] = "live"
     total_ms = int((time.time() - pipeline_start) * 1000)
-    log_event("SYSTEM", f"EMPIRE is LIVE. Total pipeline: {total_ms}ms")
+    log_event("SYSTEM", f"Zo is LIVE. Total pipeline: {total_ms}ms")
     logger.info("=" * 60)
     logger.info("SELL PIPELINE COMPLETE — %dms total", total_ms)
     logger.info("=" * 60)
@@ -795,7 +795,7 @@ _COMMENT_FORM_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>EMPIRE · Live Comment</title>
+  <title>Zo · Live Comment</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -874,7 +874,7 @@ _COMMENT_FORM_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <div class="logo">EMPIRE</div>
+  <div class="logo">Zo</div>
   <span class="pill">Live · Ask anything</span>
   <h1>Drop a question for the seller.</h1>
   <p class="sub">Your comment goes straight to the live chat. The avatar replies in under a second.</p>
@@ -1087,12 +1087,47 @@ LOCAL_ANSWERS_DIR = Path(__file__).resolve().parent / "local_answers"
 LOCAL_ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/local_answers", StaticFiles(directory=str(LOCAL_ANSWERS_DIR)), name="local_answers")
 
+# Audio-first playback (USE_AUDIO_FIRST). Each cloud-bound comment writes
+# the TTS bytes here and broadcasts a `comment_response_audio` event the
+# moment they're ready — the dashboard plays them immediately while
+# Wav2Lip renders video in the background and crossfades in under the
+# already-playing audio. Uses uuid filenames so concurrent requests can't
+# collide. The dir is gitignored along with backend/renders.
+RESPONSE_AUDIO_DIR = Path(__file__).resolve().parent / "response_audio"
+RESPONSE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/response_audio", StaticFiles(directory=str(RESPONSE_AUDIO_DIR)), name="response_audio")
+
+# Pitch assets (USE_PITCH_VEO). Pre-rendered Veo "pitching pose" mp4s and
+# their cached TTS mp3 + word_timings json live here, served as static so
+# the dashboard can preload them when a product is selected.
+PITCH_ASSETS_DIR = Path(__file__).resolve().parent / "pitch_assets"
+PITCH_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/pitch_assets", StaticFiles(directory=str(PITCH_ASSETS_DIR)), name="pitch_assets")
+
+# Static assets the dashboard preloads at boot (e.g. silent_unlock.mp3 for
+# StartDemoOverlay). Lives under backend/static so it can ship with the
+# backend deploy and not need a separate CDN.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 def _save_render(label: str, data: bytes) -> str:
     fname = f"{label}_{int(time.time())}.mp4"
     path = RENDER_DIR / fname
     path.write_bytes(data)
     return f"/renders/{fname}"
+
+
+def _save_response_audio(audio_bytes: bytes) -> str:
+    """Save TTS audio to /response_audio/<uuid>.mp3 and return the
+    served URL. Caller is responsible for measuring duration via ffprobe
+    before broadcasting if accurate timing is needed."""
+    import uuid as _uuid
+    fname = f"resp_{_uuid.uuid4().hex[:12]}.mp3"
+    path = RESPONSE_AUDIO_DIR / fname
+    path.write_bytes(audio_bytes)
+    return f"/response_audio/{fname}"
 
 
 def _probe_video_duration_ms(path: Path) -> int | None:
@@ -1258,7 +1293,12 @@ async def api_respond_to_comment(
         bridge_task = asyncio.create_task(director.play_bridge(comment_type))
 
     t0 = time.time()
-    audio_bytes = await text_to_speech(response_text)
+    # Always request word_timings — they're cheap (one ffprobe call) and
+    # Karaoke needs them on the audio-first path. With USE_KARAOKE off the
+    # dashboard ignores the field, so the cost is the ffprobe overhead only.
+    audio_bytes, word_timings = await text_to_speech(
+        response_text, return_word_timings=True,
+    )
     tts_ms = int((time.time() - t0) * 1000)
 
     # Best-effort: collect bridge result without blocking. If the manifest
@@ -1269,41 +1309,85 @@ async def api_respond_to_comment(
         except Exception:
             logger.exception("[director] play_bridge failed (non-fatal)")
 
-    # 5) Wav2Lip render — use the substrate of whichever Tier 0 idle is
-    #    currently visible so the response inherits the same body language.
-    #    Eliminates the "different person leaning forward" jump-cut when
-    #    Tier 1 fades in over the calm idle layer.
-    substrate = director.current_substrate_pod_path() if director else None
-    t0 = time.time()
-    try:
-        if substrate:
-            video_bytes, headers = await render_comment_response_wav2lip(
-                audio_bytes, source_path_on_pod=substrate, out_height=out_height,
-            )
-        else:
-            video_bytes, headers = await render_comment_response_wav2lip(
-                audio_bytes, out_height=out_height,
-            )
-    except Exception as e:
-        # If the configured substrate doesn't exist on the pod (400 / 404),
-        # mark it unavailable so future calls skip it, then retry with the
-        # default speaking-pose substrate. This keeps the live path alive
-        # when speaking variants haven't shipped yet.
-        if substrate and director:
-            err_str = str(e).lower()
-            if "404" in err_str or "400" in err_str or "not found" in err_str:
-                logger.warning("[lipsync] substrate %s unavailable, falling back: %s",
-                               substrate, e)
-                director.mark_substrate_status(substrate, False)
-                video_bytes, headers = await render_comment_response_wav2lip(
-                    audio_bytes, out_height=out_height,
-                )
-            else:
-                raise
-        else:
-            raise
-    lipsync_ms = int((time.time() - t0) * 1000)
+    # ── 4.5) Audio-first broadcast (USE_AUDIO_FIRST) ──────────────────────
+    # The biggest single perceived-latency win in this build. The moment TTS
+    # is ready (~400-700ms after mic release) we save the audio to a static
+    # mount and broadcast `comment_response_audio`. The dashboard creates a
+    # hidden <audio> element and plays it RIGHT NOW. Wav2Lip then renders
+    # in the background and the resulting video crossfades in under the
+    # already-playing audio (muted on the video element so we don't double
+    # the soundtrack).
+    audio_url: str | None = None
+    audio_duration_ms: int | None = None
+    if USE_AUDIO_FIRST and audio_bytes:
+        from agents.seller import _probe_audio_duration_ms
+        audio_url = _save_response_audio(audio_bytes)
+        audio_duration_ms = await asyncio.to_thread(
+            _probe_audio_duration_ms, audio_bytes,
+        )
+        await broadcast_to_dashboards({
+            "type": "comment_response_audio",
+            "comment": comment,
+            "response": response_text,
+            "url": audio_url,
+            "word_timings": word_timings,
+            "expected_duration_ms": audio_duration_ms,
+            "intent": "response",
+            "class_ms": class_ms,
+            "llm_ms": resp_ms,
+            "tts_ms": tts_ms,
+            "ts": time.time_ns(),
+        })
+        log_event("SELLER", f"audio-first dispatched ({tts_ms}ms TTS, "
+                  f"{audio_duration_ms}ms audio)",
+                  {"audio_url": audio_url, "words": len(word_timings)})
 
+    # ── 5) Wav2Lip render path ─────────────────────────────────────────────
+    # When USE_AUDIO_FIRST is on, kick the render as a background task and
+    # return immediately so the HTTP caller (api_voice_comment) doesn't hang
+    # on the 3-5s lip-sync. The dashboard already has audio + word timings;
+    # the video lands later via the comment_response_video WS event.
+    #
+    # When USE_AUDIO_FIRST is off, run the render inline so the existing
+    # serial behaviour is preserved (the caller still expects the full
+    # response dict including the video URL).
+    if USE_AUDIO_FIRST and audio_url:
+        asyncio.create_task(_render_and_broadcast_video(
+            audio_bytes=audio_bytes,
+            comment=comment,
+            response_text=response_text,
+            class_ms=class_ms,
+            llm_ms=resp_ms,
+            tts_ms=tts_ms,
+            audio_url=audio_url,
+            audio_duration_ms=audio_duration_ms,
+            out_height=out_height,
+            total_t0=total_t0,
+        ))
+        # Return early — the HTTP response just confirms the audio dispatched.
+        # The video lands on the dashboard via WS when the background task
+        # finishes.
+        return {
+            "comment": comment,
+            "response": response_text,
+            "url": None,
+            "total_ms": int((time.time() - total_t0) * 1000),
+            "audio_url": audio_url,
+            "audio_duration_ms": audio_duration_ms,
+            "audio_first": True,
+            "breakdown": {
+                "classify_ms": class_ms,
+                "llm_ms": resp_ms,
+                "tts_ms": tts_ms,
+            },
+        }
+
+    # Legacy serial path (USE_AUDIO_FIRST=0) — kept as the kill-switch
+    # rollback. Renders Wav2Lip inline, broadcasts the unified
+    # comment_response_video event with embedded audio, returns the full dict.
+    video_bytes, headers, lipsync_ms = await _render_response_video(
+        audio_bytes, out_height,
+    )
     url = _save_render("resp", video_bytes)
     pipeline_state["last_response_video_url"] = url
     total_ms = int((time.time() - total_t0) * 1000)
@@ -1313,13 +1397,8 @@ async def api_respond_to_comment(
         "tts_ms": tts_ms, "lipsync_ms": lipsync_ms,
     })
 
-    # 6) Crossfade in the live response, then release back to idle when done.
     if director:
         await director.play_response(url)
-        # Probe the actual rendered video duration so the idle release fires
-        # precisely as the avatar finishes speaking. Falls back to a word-count
-        # estimate if ffprobe fails. Adds a small tail (400ms) so the response
-        # gets a beat of post-speech facial relaxation before crossfade.
         rendered_path = RENDER_DIR / Path(url).name
         play_ms = _probe_video_duration_ms(rendered_path)
         if play_ms is None:
@@ -1342,12 +1421,14 @@ async def api_respond_to_comment(
         "llm_ms": resp_ms,
         "tts_ms": tts_ms,
         "lipsync_ms": lipsync_ms,
+        "audio_already_playing": False,
     })
     return {
         "comment": comment,
         "response": response_text,
         "url": url,
         "total_ms": total_ms,
+        "audio_first": False,
         "breakdown": {
             "classify_ms": class_ms,
             "llm_ms": resp_ms,
@@ -1360,6 +1441,131 @@ async def api_respond_to_comment(
             "predict_sec": headers.get("x-predict-sec"),
         },
     }
+
+
+async def _render_response_video(
+    audio_bytes: bytes,
+    out_height: int,
+) -> tuple[bytes, dict, int]:
+    """Wav2Lip render with the Director's substrate fallback. Returns
+    (video_bytes, headers, lipsync_ms). Shared between the audio-first
+    background path and the legacy inline path."""
+    substrate = director.current_substrate_pod_path() if director else None
+    t0 = time.time()
+    try:
+        if substrate:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=substrate, out_height=out_height,
+            )
+        else:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=out_height,
+            )
+    except Exception as e:
+        # Substrate doesn't exist on the pod → mark unavailable and retry
+        # with the default speaking-pose substrate. Keeps the live path
+        # alive when a speaking variant hasn't been uploaded yet.
+        err_str = str(e).lower()
+        if substrate and director and (
+            "404" in err_str or "400" in err_str or "not found" in err_str
+        ):
+            logger.warning("[lipsync] substrate %s unavailable, falling back: %s",
+                           substrate, e)
+            director.mark_substrate_status(substrate, False)
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=out_height,
+            )
+        else:
+            raise
+    lipsync_ms = int((time.time() - t0) * 1000)
+    return video_bytes, headers, lipsync_ms
+
+
+async def _render_and_broadcast_video(
+    *,
+    audio_bytes: bytes,
+    comment: str,
+    response_text: str,
+    class_ms: int,
+    llm_ms: int,
+    tts_ms: int,
+    audio_url: str,
+    audio_duration_ms: int | None,
+    out_height: int,
+    total_t0: float,
+) -> None:
+    """Audio-first background render. Wav2Lip the audio against the active
+    substrate, save the mp4, broadcast comment_response_video with
+    audio_already_playing=true so the dashboard mutes the incoming video
+    element and crossfades visual only. The standalone <audio> element
+    keeps playing the original audio without interruption.
+
+    Per REVISIONS §4 we render against the EXACT same audio bytes the
+    dashboard is playing — no re-encoding round-trip. Wav2Lip's mux pulls
+    audio length from the file we send, so any mismatch shows up as
+    duration drift. The duration handshake on the dashboard uses
+    expected_duration_ms (from the audio probe) to reject a video whose
+    duration drifted >150ms from the audio."""
+    try:
+        video_bytes, headers, lipsync_ms = await _render_response_video(
+            audio_bytes, out_height,
+        )
+    except Exception as e:
+        logger.exception("[audio-first] background Wav2Lip failed")
+        await broadcast_to_dashboards({
+            "type": "comment_response_video_failed",
+            "comment": comment,
+            "response": response_text,
+            "audio_url": audio_url,
+            "reason": str(e)[:200],
+        })
+        return
+
+    url = _save_render("resp", video_bytes)
+    pipeline_state["last_response_video_url"] = url
+    total_ms = int((time.time() - total_t0) * 1000)
+
+    log_event("SELLER", f"audio-first video ready in {total_ms}ms", {
+        "url": url, "tts_ms": tts_ms, "lipsync_ms": lipsync_ms,
+        "audio_url": audio_url,
+    })
+
+    # Schedule the Tier 1 fade-out to fire when the AUDIO ends — that's the
+    # canonical timing source for audio-first. We compute from audio
+    # duration (already measured), not video duration, because the audio is
+    # what the audience hears.
+    if director:
+        # Director.play_response emits a play_clip with muted=True so
+        # LiveStage knows not to start a second audio track.
+        await director.play_response(
+            url, muted=True, expected_duration_ms=audio_duration_ms,
+        )
+        if audio_duration_ms:
+            release_ms = audio_duration_ms + 400
+        else:
+            word_count = len(response_text.split())
+            release_ms = int(max(2500, word_count * 350)) + 400
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            if director:
+                await director.fade_to_idle()
+        asyncio.create_task(_release_after(release_ms))
+
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "total_ms": total_ms,
+        "class_ms": class_ms,
+        "llm_ms": llm_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+        "audio_already_playing": True,
+        "existing_audio_url": audio_url,
+        "expected_duration_ms": audio_duration_ms,
+    })
 
 
 async def _fire_speculative_bridge(comment: str) -> None:

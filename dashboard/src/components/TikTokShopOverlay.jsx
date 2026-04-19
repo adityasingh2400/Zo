@@ -6,7 +6,7 @@ import { LiveStage } from './LiveStage';
  *
  * Renders the existing LiveStage avatar inside a vertical 9:16 phone-screen
  * silhouette centered on a 16:9 black stage. Adds the visual conventions of
- * a live commerce stream so the audience's brain instantly maps EMPIRE to
+ * a live commerce stream so the audience's brain instantly maps Zo to
  * the $68B TikTok Shop / Whatnot / Instagram Live category, without
  * actually needing real platform integration.
  *
@@ -38,7 +38,10 @@ export function TikTokShopOverlay({
   pendingComments,
   liveStage,
   wsRef,
-  productHandle = '@empire_demo',
+  audioResponse,
+  pitchAudio,
+  onAudioEnded,
+  productHandle = '@zo_demo',
 }) {
   // Viewer count — pure visual, ticks up by 1-3 every 4-7s so the room
   // reads it as a real stream gathering traction. Seeded from a stable-feeling
@@ -151,6 +154,9 @@ export function TikTokShopOverlay({
             pendingComments={pendingComments}
             liveStage={liveStage}
             wsRef={wsRef}
+            audioResponse={audioResponse}
+            pitchAudio={pitchAudio}
+            onAudioEnded={onAudioEnded}
           />
         </div>
 
@@ -158,10 +164,10 @@ export function TikTokShopOverlay({
             Sits on a subtle gradient so text stays legible over the avatar. */}
         <div style={styles.topBar}>
           <div style={styles.hostStrip}>
-            <div style={styles.hostAvatar}>E</div>
+            <div style={styles.hostAvatar}>Z</div>
             <div style={styles.hostMeta}>
               <span style={styles.hostHandle}>{productHandle}</span>
-              <span style={styles.hostSub}>EMPIRE Live · selling now</span>
+              <span style={styles.hostSub}>Zo Live · selling now</span>
             </div>
             <button type="button" style={styles.followBtn}>+ Follow</button>
           </div>

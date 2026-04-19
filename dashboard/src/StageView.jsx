@@ -3,6 +3,7 @@ import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { TikTokShopOverlay } from './components/TikTokShopOverlay';
 import { CostTicker } from './components/CostTicker';
 import { RoutingPanel } from './components/RoutingPanel';
+import { StartDemoOverlay } from './components/StartDemoOverlay';
 
 /**
  * StageView — the demo's full-screen surface.
@@ -43,7 +44,15 @@ export default function StageView() {
   const {
     productData, pitchVideoUrl, responseVideo, pendingComments,
     liveStage, routingDecisions, routingStats, wsRef, connected,
+    audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
   } = useEmpireSocket();
+
+  // Same audio-end handler as the operator dashboard — clear the slot so
+  // the same payload won't auto-replay.
+  const handleAudioEnded = (kind) => {
+    if (kind === 'pitch') setPitchAudio(null);
+    else setAudioResponse(null);
+  };
 
   const [hintVisible, setHintVisible] = useState(true);
   const [goLiveAt, setGoLiveAt] = useState(null);
@@ -132,6 +141,11 @@ export default function StageView() {
 
   return (
     <div style={styles.root}>
+      {/* Autoplay-unlock — one-tap ceremony BEFORE any audio-first comment
+          fires (REVISIONS §3). Banks browser permission for <audio> elements
+          created later at WS-message time. */}
+      <StartDemoOverlay />
+
       {/* The phone screen — TikTokShopOverlay handles all the chrome inside
           its own 9:16 area. We just give it the full viewport to center in. */}
       <TikTokShopOverlay
@@ -141,6 +155,9 @@ export default function StageView() {
         pendingComments={pendingComments}
         liveStage={liveStage}
         wsRef={wsRef}
+        audioResponse={audioResponse}
+        pitchAudio={pitchAudio}
+        onAudioEnded={handleAudioEnded}
       />
 
       {/* Bezel chrome — lives in the black bars on either side of 9:16

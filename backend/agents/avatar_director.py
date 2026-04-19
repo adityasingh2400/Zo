@@ -163,8 +163,20 @@ class Director:
         fade_ms: int | None = None,
         ttl_ms: int | None = None,
         emitted_by: str = "director",
+        muted: bool = False,
+        expected_duration_ms: int | None = None,
     ) -> None:
-        """Send a single play_clip event. Updates last_intent for replay."""
+        """Send a single play_clip event. Updates last_intent for replay.
+
+        `muted=True` tells LiveStage to set incomingEl.muted=true and skip
+        the volume ramp — used on the audio-first path where the soundtrack
+        is coming from a separate <audio> element.
+
+        `expected_duration_ms` enables the dashboard's duration handshake on
+        canplaythrough (REVISIONS §4): if the video duration drifts >150ms
+        from this number, the dashboard rejects the video and lets audio
+        play alone.
+        """
         if fade_ms is None:
             fade_ms = TIER1_CROSSFADE_MS_DEFAULT if layer == "tier1" else TIER0_CROSSFADE_MS_DEFAULT
         msg = {
@@ -176,13 +188,15 @@ class Director:
             "mode": mode,
             "fade_ms": fade_ms,
             "ttl_ms": ttl_ms,
+            "muted": muted,
+            "expected_duration_ms": expected_duration_ms,
             "ts": time.time_ns(),
             "emitted_by": emitted_by,
         }
         self._last_intent[layer] = intent
         self._last_url[layer] = url
-        logger.info("[director] emit %s/%s -> %s (mode=%s fade=%dms)",
-                    layer, intent, url, mode, fade_ms)
+        logger.info("[director] emit %s/%s -> %s (mode=%s fade=%dms muted=%s dur=%s)",
+                    layer, intent, url, mode, fade_ms, muted, expected_duration_ms)
         try:
             await self._broadcast(msg)
         except Exception:
@@ -224,7 +238,17 @@ class Director:
         )
         return clip
 
-    async def play_response(self, url: str) -> None:
+    async def play_response(
+        self,
+        url: str,
+        *,
+        muted: bool = False,
+        expected_duration_ms: int | None = None,
+    ) -> None:
+        """Tier 1 response crossfade. `muted` + `expected_duration_ms` are
+        used by the audio-first path (USE_AUDIO_FIRST) where the audio is
+        already playing through a standalone <audio> element on the
+        dashboard and the video is mounted muted underneath."""
         await self.emit(
             "tier1",
             "response",
@@ -232,6 +256,8 @@ class Director:
             loop=False,
             mode="crossfade",
             emitted_by="play_response",
+            muted=muted,
+            expected_duration_ms=expected_duration_ms,
         )
 
     async def play_pitch(self, url: str) -> None:

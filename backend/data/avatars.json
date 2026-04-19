@@ -1,0 +1,54 @@
+{
+  "maya": {
+    "name": "Maya",
+    "language_tags": ["en", "es", "tl"],
+    "voice_id": "",
+    "state_videos": {
+      "idle":       "/states/state_idle_pose_silent_1080p.mp4",
+      "pitching":   "/states/state_pitching_pose_silent_1080p.mp4",
+      "explaining": "/states/state_explaining_pose_silent_1080p.mp4",
+      "reaching":   "/states/state_reaching_pose_silent_1080p.mp4",
+      "excited":    "/states/state_excited_pose_silent_1080p.mp4"
+    },
+    "notes": "Default avatar. Empty voice_id means the system uses ELEVENLABS_VOICE_ID from .env (backwards compatibility)."
+  },
+  "leo": {
+    "name": "Leo",
+    "language_tags": ["en", "es"],
+    "voice_id": "",
+    "state_videos": {
+      "idle":       "/states/state_idle_pose_silent_1080p.mp4",
+      "pitching":   "/states/state_pitching_pose_silent_1080p.mp4",
+      "explaining": "/states/state_explaining_pose_silent_1080p.mp4",
+      "reaching":   "/states/state_reaching_pose_silent_1080p.mp4",
+      "excited":    "/states/state_excited_pose_silent_1080p.mp4"
+    },
+    "notes": "Placeholder — state videos point at Maya's until Veo 3.1 renders land. Set voice_id to a distinct ElevenLabs voice (e.g. 'onwK4e9ZLuTAKqWW03F9' Daniel) for an audible voice swap."
+  },
+  "mei": {
+    "name": "Mei",
+    "language_tags": ["zh", "en"],
+    "voice_id": "",
+    "state_videos": {
+      "idle":       "/states/state_idle_pose_silent_1080p.mp4",
+      "pitching":   "/states/state_pitching_pose_silent_1080p.mp4",
+      "explaining": "/states/state_explaining_pose_silent_1080p.mp4",
+      "reaching":   "/states/state_reaching_pose_silent_1080p.mp4",
+      "excited":    "/states/state_excited_pose_silent_1080p.mp4"
+    },
+    "notes": "Placeholder — Mandarin/English bilingual. Requires eleven_multilingual_v2 model (currently locked to flash_v2_5 in seller.py:284)."
+  },
+  "jasper": {
+    "name": "Jasper",
+    "language_tags": ["en"],
+    "voice_id": "",
+    "state_videos": {
+      "idle":       "/states/state_idle_pose_silent_1080p.mp4",
+      "pitching":   "/states/state_pitching_pose_silent_1080p.mp4",
+      "explaining": "/states/state_explaining_pose_silent_1080p.mp4",
+      "reaching":   "/states/state_reaching_pose_silent_1080p.mp4",
+      "excited":    "/states/state_excited_pose_silent_1080p.mp4"
+    },
+    "notes": "Placeholder — English-only alternate persona. Same rendering caveat."
+  }
+}

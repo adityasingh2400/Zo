@@ -127,6 +127,7 @@ director: "Director | None" = None  # set in app startup, see below
 
 
 PRODUCTS_PATH = Path(__file__).resolve().parent / "data" / "products.json"
+AVATARS_PATH = Path(__file__).resolve().parent / "data" / "avatars.json"
 
 
 def _load_products() -> None:
@@ -164,6 +165,43 @@ def _load_products() -> None:
         initial = next(iter(products.keys()))
     _set_active_product(initial)
     logger.info("[products] Loaded %d products: %s", len(products), list(products.keys()))
+
+
+def _load_avatars() -> None:
+    """Load backend/data/avatars.json into pipeline_state['avatars_catalog'].
+    Analogous to _load_products. Missing file / bad JSON: log + skip; the
+    system falls back to the single-avatar path (Maya's state videos are
+    the current hardcoded defaults in avatar_director.py)."""
+    if not AVATARS_PATH.exists():
+        logger.info("No avatars.json at %s — skipping pre-load", AVATARS_PATH)
+        return
+    try:
+        with AVATARS_PATH.open() as f:
+            avatars = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to read avatars.json: %s", e)
+        return
+    if not isinstance(avatars, dict) or not avatars:
+        return
+
+    pipeline_state["avatars_catalog"] = avatars
+    initial = os.getenv("ACTIVE_AVATAR_ID") or next(iter(avatars.keys()))
+    if initial not in avatars:
+        initial = next(iter(avatars.keys()))
+    pipeline_state["active_avatar_id"] = initial
+    logger.info("[avatars] Loaded %d avatars: %s (active=%s)",
+                len(avatars), list(avatars.keys()), initial)
+
+
+def _active_avatar() -> dict:
+    """Resolve the currently-active avatar dict. Returns {} if the catalog
+    is empty (pre-lifespan or no avatars.json), signaling callers to fall
+    back to their legacy hardcoded paths."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    active_id = pipeline_state.get("active_avatar_id")
+    if active_id and active_id in catalog:
+        return catalog[active_id]
+    return {}
 
 
 def _set_active_product(product_id: str) -> dict | None:
@@ -256,6 +294,7 @@ async def lifespan(app: FastAPI):
     # key default if you want to swap between demo objects without editing
     # code on stage.
     _load_products()
+    _load_avatars()
     yield
 
 app = FastAPI(title="EMPIRE", lifespan=lifespan)
@@ -488,10 +527,13 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
 
     pitch_t0 = time.time()
     try:
-        # 2a. TTS
+        # 2a. TTS. If the active avatar declares a voice_id, use it;
+        # otherwise text_to_speech falls back to ELEVENLABS_VOICE_ID.
+        # Empty string → None so the fallback path engages.
         await _emit_pipeline_step(request_id, "eleven", "active")
         t0 = time.time()
-        audio_bytes = await text_to_speech(script)
+        active_voice = _active_avatar().get("voice_id") or None
+        audio_bytes = await text_to_speech(script, voice=active_voice)
         tts_ms = int((time.time() - t0) * 1000)
         if not audio_bytes:
             await _emit_pipeline_step(request_id, "eleven", "failed",
@@ -926,6 +968,53 @@ async def api_director_force_phase(phase: str = Form(...)):
     return {"status": "ok", "phase": p, "backend_status": new_status}
 
 
+@app.get("/api/avatars")
+async def api_avatars():
+    """Return the avatar catalog + currently active id. Used by the
+    dashboard's AvatarRail (Item 2) to render the rail + light up the
+    selected card."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    return {
+        "active_avatar_id": pipeline_state.get("active_avatar_id"),
+        "avatars": [
+            {
+                "id": aid,
+                "name": a.get("name", aid),
+                "language_tags": a.get("language_tags", []),
+                "voice_id": a.get("voice_id", ""),
+            }
+            for aid, a in catalog.items()
+        ],
+    }
+
+
+@app.post("/api/avatars/active")
+async def api_set_active_avatar(avatar_id: str = Form(...)):
+    """Switch the active avatar. Seller's TTS and (future) Director's
+    state-video lookups route through `pipeline_state['active_avatar_id']`
+    via `_active_avatar()` so the swap is live after this call.
+
+    v1: state_videos are identical across avatars until Veo 3.1 renders
+    land, so the visible impact today is the ElevenLabs voice swap (when
+    the avatar has a non-empty voice_id)."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    if avatar_id not in catalog:
+        raise HTTPException(404, f"avatar_id {avatar_id!r} not in catalog")
+    pipeline_state["active_avatar_id"] = avatar_id
+    avatar = catalog[avatar_id]
+    log_event("DIRECTOR", f"Avatar switched → {avatar.get('name', avatar_id)}")
+    await broadcast_to_dashboards({
+        "type": "avatar_changed",
+        "avatar_id": avatar_id,
+        "avatar_name": avatar.get("name", avatar_id),
+    })
+    return {
+        "active_avatar_id": avatar_id,
+        "avatar_name": avatar.get("name", avatar_id),
+        "voice_id": avatar.get("voice_id", ""),
+    }
+
+
 @app.post("/api/director/on_air")
 async def api_director_on_air(on: str = Form(...)):
     """Toggle the on-air flag. Soft v1 — doesn't gate the pipeline yet."""
@@ -943,6 +1032,7 @@ async def api_state():
         "status": pipeline_state["status"],
         "product_data": pipeline_state["product_data"],
         "active_product_id": pipeline_state.get("active_product_id"),
+        "active_avatar_id": pipeline_state.get("active_avatar_id"),
         # Lightweight catalog summary — id + name only, not full product_data.
         # Dashboard renders the dropdown from this; full data is available via
         # /api/state on demand for the active product.
@@ -954,6 +1044,7 @@ async def api_state():
         "has_photo": pipeline_state["product_clean_b64"] is not None,
         "has_3d": pipeline_state["model_3d"] is not None,
         "log_count": len(pipeline_state["agent_log"]),
+        "on_air": pipeline_state.get("on_air", True),
     }
 
 

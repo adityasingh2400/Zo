@@ -3,7 +3,10 @@ import asyncio
 import base64
 import os
 import sys
+import subprocess
 import tempfile
+import threading
+import time
 import logging
 import httpx
 import boto3
@@ -14,16 +17,28 @@ bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
 # ── Cactus SDK (primary, on-device) ─────────────────────────────────────────
 
-CACTUS_PYTHON_PATH = os.getenv("CACTUS_PYTHON_PATH", "/Users/aditya/Desktop/cactus/python/src")
-CACTUS_WEIGHTS_PATH = os.getenv("CACTUS_WEIGHTS_PATH", "/Users/aditya/Desktop/cactus/weights/gemma-4-e4b-it")
+CACTUS_PYTHON_PATH = os.path.expanduser(os.getenv("CACTUS_PYTHON_PATH", "~/cactus/python/src"))
+CACTUS_WEIGHTS_PATH = os.path.expanduser(os.getenv("CACTUS_WEIGHTS_PATH", "~/cactus/weights/gemma-4-e4b-it"))
+# Whisper-tiny used for on-device voice transcription. Gemma 4 E4B is the
+# multimodal flagship, but whisper-tiny's cactus_transcribe path is the
+# proven / fastest route for speech-to-text (62 MB vs 8 GB, sub-second).
+CACTUS_WHISPER_WEIGHTS_PATH = os.path.expanduser(os.getenv("CACTUS_WHISPER_WEIGHTS_PATH", "~/cactus/weights/whisper-tiny"))
 
 CACTUS_AVAILABLE = False
 _cactus_model = None
+_cactus_whisper_model = None
+# Cactus' C library is not re-entrant on a single handle. Concurrent calls
+# crash the whole Python process with no traceback. Serialize inference per
+# handle. These are threading.Locks (not asyncio) because the raw cactus
+# calls run inside asyncio.to_thread workers — the sync lock correctly
+# blocks across worker threads.
+_cactus_whisper_lock = threading.Lock()
+_cactus_model_lock = threading.Lock()
 
 if CACTUS_PYTHON_PATH and os.path.exists(CACTUS_PYTHON_PATH):
     sys.path.insert(0, CACTUS_PYTHON_PATH)
     try:
-        from cactus import cactus_init, cactus_complete, cactus_destroy
+        from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_transcribe
         CACTUS_AVAILABLE = True
         logger.info("Cactus SDK loaded from %s", CACTUS_PYTHON_PATH)
     except ImportError as e:
@@ -43,7 +58,10 @@ def _get_cactus_model():
 
 
 def _cactus_chat(messages: list, max_tokens: int = 256, images: list[str] | None = None) -> dict:
-    """Call Gemma 4 via Cactus SDK. Returns parsed response dict."""
+    """Call Gemma 4 via Cactus SDK. Returns parsed response dict.
+
+    Serialized on _cactus_model_lock because concurrent `cactus_complete`
+    calls on one handle crash the process."""
     model = _get_cactus_model()
     if model is None:
         return {"error": "Cactus model not loaded"}
@@ -53,7 +71,8 @@ def _cactus_chat(messages: list, max_tokens: int = 256, images: list[str] | None
 
     messages_json = json.dumps(messages)
     options_json = json.dumps({"max_tokens": max_tokens})
-    raw = cactus_complete(model, messages_json, options_json, None, None)
+    with _cactus_model_lock:
+        raw = cactus_complete(model, messages_json, options_json, None, None)
     return json.loads(raw)
 
 
@@ -348,3 +367,214 @@ Return ONLY valid JSON with these fields:
         parsed["source"] = "claude_cloud"
         return parsed
     return {"raw": text, "source": "claude_cloud"}
+
+
+# ── VOICE: Transcription (whisper-tiny on Cactus → Gemini 2.5 Flash cloud) ──
+#
+# Primary: whisper-tiny loaded as a second Cactus handle (62 MB). Uses
+# `cactus_transcribe` with the Whisper prompt template. ~200-400ms on M-series.
+#
+# Fallback: Gemini 2.5 Flash via google-genai. Hackathon credits cover this.
+#
+# Both return the same shape: {text, source, latency_ms}. The voice endpoint
+# in main.py broadcasts `voice_transcript` with this shape unchanged.
+
+
+def _get_cactus_whisper_model():
+    """Lazy-load whisper-tiny as a separate Cactus model handle. Kept
+    distinct from `_cactus_model` (Gemma 4) so neither blocks the other.
+    Returns None if weights aren't present — caller falls through to cloud."""
+    global _cactus_whisper_model
+    if _cactus_whisper_model is not None:
+        return _cactus_whisper_model
+    if not CACTUS_AVAILABLE:
+        return None
+    if not os.path.isdir(CACTUS_WHISPER_WEIGHTS_PATH):
+        logger.info("Whisper weights not found at %s — voice will use cloud", CACTUS_WHISPER_WEIGHTS_PATH)
+        return None
+    try:
+        _cactus_whisper_model = cactus_init(
+            CACTUS_WHISPER_WEIGHTS_PATH.encode() if isinstance(CACTUS_WHISPER_WEIGHTS_PATH, str) else CACTUS_WHISPER_WEIGHTS_PATH,
+            None, False,
+        )
+        logger.info("Cactus whisper model loaded from %s", CACTUS_WHISPER_WEIGHTS_PATH)
+    except Exception as e:
+        logger.warning("Cactus whisper init failed: %s", e)
+        _cactus_whisper_model = None
+    return _cactus_whisper_model
+
+
+class AudioDecodeError(RuntimeError):
+    """Raised when ffmpeg can't decode the uploaded bytes as audio."""
+
+
+# Filler utterances that whisper / Gemini commonly emit for silent or
+# near-silent inputs. We drop these rather than feeding them to the cloud
+# comment pipeline — silence is not a comment.
+_NOISE_TRANSCRIPTS = {
+    "", "mhm", "uh", "um", "ah", "oh", "hm", "huh", "hmm", "uhh", "umm",
+    "you", "thank you", "thanks", ".", "...", "[silence]", "[music]",
+    "[inaudible]",
+}
+
+
+def _is_noise_transcript(text: str) -> bool:
+    """Heuristic: treat trivially short / filler transcripts as silence.
+    Prevents hallucinated responses to empty mic input."""
+    t = (text or "").strip().lower().rstrip(".!?")
+    if len(t) < 3:
+        return True
+    return t in _NOISE_TRANSCRIPTS
+
+
+def _to_wav_16k_mono(audio_bytes: bytes) -> bytes:
+    """Convert any ffmpeg-decodable audio (webm/ogg/mp3/wav) to 16 kHz mono
+    PCM WAV — the format whisper expects. Returns WAV bytes.
+
+    Raises AudioDecodeError (with stderr snippet) if ffmpeg can't decode.
+    Runs synchronously; call via asyncio.to_thread from async contexts."""
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as in_f:
+        in_f.write(audio_bytes)
+        in_path = in_f.name
+    out_path = in_path + ".wav"
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-y", "-i", in_path,
+             "-ar", "16000", "-ac", "1", "-f", "wav", out_path],
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            # Sanitize: no temp paths or full argv in user-facing error.
+            stderr_snippet = (proc.stderr or b"").decode("utf-8", "ignore")[:200].strip()
+            raise AudioDecodeError(
+                f"ffmpeg could not decode audio (rc={proc.returncode}): {stderr_snippet}"
+            )
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        for p in (in_path, out_path):
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+
+
+async def _cactus_transcribe_audio(audio_bytes: bytes) -> dict:
+    """On-device transcription via whisper on Cactus. Returns
+    {text, source: 'cactus_on_device', latency_ms}. Raises on error so
+    the caller can fall through to Gemini.
+
+    Serialized on _cactus_whisper_lock because the Cactus C library is not
+    re-entrant on a single handle — concurrent calls crash the process."""
+    model = _get_cactus_whisper_model()
+    if model is None:
+        raise RuntimeError("Cactus whisper model not available")
+
+    wav_bytes = await asyncio.to_thread(_to_wav_16k_mono, audio_bytes)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(wav_bytes)
+        wav_path = f.name
+
+    try:
+        t0 = time.time()
+        prompt = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
+
+        def _locked_transcribe():
+            with _cactus_whisper_lock:
+                return cactus_transcribe(model, wav_path, prompt, None, None, None)
+
+        raw = await asyncio.to_thread(_locked_transcribe)
+        latency_ms = int((time.time() - t0) * 1000)
+        try:
+            result = json.loads(raw)
+            segments = result.get("segments") or []
+            text = " ".join((s.get("text") or "").strip() for s in segments).strip()
+        except json.JSONDecodeError:
+            # Some builds return bare text — accept it.
+            text = (raw or "").strip()
+        return {"text": text, "source": "cactus_on_device", "latency_ms": latency_ms}
+    finally:
+        try:
+            os.unlink(wav_path)
+        except FileNotFoundError:
+            pass
+
+
+async def _gemini_transcribe(audio_bytes: bytes) -> dict:
+    """Cloud fallback: Gemini 2.5 Flash. Uses the `google-genai` SDK.
+    Returns {text, source: 'gemini_cloud', latency_ms}."""
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    wav_bytes = await asyncio.to_thread(_to_wav_16k_mono, audio_bytes)
+
+    def _sync_call():
+        # Imported lazily so the backend starts even if google-genai isn't
+        # installed in a given environment.
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=api_key)
+        audio_part = genai_types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[
+                "Transcribe this audio verbatim. Return ONLY the transcribed "
+                "text, no quotes, no commentary, no labels.",
+                audio_part,
+            ],
+        )
+        return (resp.text or "").strip()
+
+    t0 = time.time()
+    text = await asyncio.to_thread(_sync_call)
+    latency_ms = int((time.time() - t0) * 1000)
+    return {"text": text, "source": "gemini_cloud", "latency_ms": latency_ms}
+
+
+async def transcribe_voice(audio_bytes: bytes) -> dict:
+    """Public entry point. Tries on-device Cactus whisper first; falls back
+    to Gemini 2.5 Flash. Always returns a dict with {text, source,
+    latency_ms}. On total failure, sets source='transcription_failed' with
+    a sanitized error string rather than raising. If the decoded speech is
+    silence / filler (see _is_noise_transcript), returns empty text with
+    source='no_speech' so the voice endpoint can bail cleanly."""
+    # Decode errors are typically user-audio problems, not service outages;
+    # surface a clean error rather than falling through to Gemini on bad
+    # bytes (Gemini will also fail, but noisily and after a network RTT).
+    cactus_err: str | None = None
+    try:
+        result = await _cactus_transcribe_audio(audio_bytes)
+        text = (result.get("text") or "").strip()
+        if _is_noise_transcript(text):
+            return {"text": "", "source": "no_speech",
+                    "latency_ms": result.get("latency_ms", 0),
+                    "reason": f"heard silence/filler (cactus: {text!r})"}
+        return result
+    except AudioDecodeError as e:
+        return {"text": "", "source": "transcription_failed",
+                "latency_ms": 0, "error": "bad_audio"}
+    except Exception as e:
+        cactus_err = str(e)
+        logger.warning("Cactus transcription failed: %s — falling back to Gemini", e)
+
+    try:
+        result = await _gemini_transcribe(audio_bytes)
+        text = (result.get("text") or "").strip()
+        if _is_noise_transcript(text):
+            return {"text": "", "source": "no_speech",
+                    "latency_ms": result.get("latency_ms", 0),
+                    "reason": f"heard silence/filler (gemini: {text!r})"}
+        return result
+    except AudioDecodeError:
+        return {"text": "", "source": "transcription_failed",
+                "latency_ms": 0, "error": "bad_audio"}
+    except Exception as e:
+        logger.exception("Gemini transcription failed")
+        return {
+            "text": "",
+            "source": "transcription_failed",
+            "latency_ms": 0,
+            "error": "transcription_unavailable",
+        }

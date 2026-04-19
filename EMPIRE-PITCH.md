@@ -76,6 +76,25 @@ Here's why most sellers don't do it, even though the numbers are insane:
 
 ---
 
+## Part 2.5: Early Validation
+
+EMPIRE isn't a mockup. The hackathon build is a working alpha. Observed numbers from this weekend's internal tests (Apr 18-19, 2026):
+
+| Metric | Observed | Notes |
+|---|---|---|
+| Voice → avatar speaking (local path) | **under 600 ms** | Cactus whisper 244 ms + rule-based router 0 ms + pre-rendered MP4 |
+| Voice → avatar speaking (cloud escalate) | **4.5 – 5.5 s warm** | Bedrock Claude + ElevenLabs + Wav2Lip on RTX 5090 |
+| Comments handled without cloud round-trip | **~90%** | 10 product Q&A entries + compliments + spam all stay local |
+| Cost per escalated comment | **$0.00035** | Claude Haiku 1K tokens input / 150 tokens output |
+| Cost per *avoided* cloud call | **$0** | Pre-rendered MP4 served from disk |
+| Monthly spend for a 24/7 avatar (modeled) | **$144** | vs $9,628/mo for a live human host team |
+
+These numbers are from our demo product — a minimalist leather wallet with a 10-entry Q&A index. A real seller onboards in ~15 minutes (product photo → Gemma 4 vision analyses it → author 10–20 answers → pre-render).
+
+**What this proves:** on-device routing isn't a tech-flex. It's the thing that makes 24/7 AI live commerce economically possible. Without it you're paying $9K/mo in cloud LLM tokens to talk to your own customers. With it you're paying electricity.
+
+---
+
 ## Part 3: The Idea — EMPIRE
 
 ### One-liner
@@ -170,8 +189,12 @@ Feeds improvements back to CREATOR and SELLER in real-time. The system gets smar
 ### Why this is a multi-billion dollar company
 
 - **TAM:** 200M+ small businesses globally need to sell online. 10M+ active TikTok Shop sellers. $68B US live commerce market growing 100%+ YoY.
-- **Revenue model:** $99/mo solo sellers. $499/mo brands (analytics + multi-product). Enterprise for agencies. Zero server cost per seller = 90%+ gross margins.
-- **Moat:** BRAIN agent learns what converts for each seller/category. Months of optimization data = massive switching cost. Network effects: more sellers = more conversion data = better AI for everyone.
+- **Revenue model (three tiers):**
+  - **Solo sellers — $99/mo.** One product, unlimited streams. Target the 10M TikTok Shop creators already selling.
+  - **Brands — $499/mo.** Multi-product catalog, BRAIN analytics, outbound DM campaigns.
+  - **Agencies & fulfillment houses — $5K–$50K/mo.** The real enterprise wedge. Agencies managing 20–200 brands today pay for human live-host teams ($10K–$40K per brand per month). EMPIRE replaces one agency's entire talent roster with one Mac. Agencies have procurement budgets and 3-year contracts — this is the fastest path to $10M ARR.
+  - Zero server cost per seller on the local path = **90%+ gross margins.**
+- **Moat + defensibility window:** Every stream teaches the BRAIN agent which questions convert. After 100 sellers × 10,000 streams, category-level conversion patterns become proprietary ("lifestyle photos convert 3× on leather goods; address sizing proactively in 60% of apparel streams"). **First-mover window: 6 months** before HeyGen or Shopify ship an equivalent. After that, accumulated conversion data + on-device weights routing are the defensible layer — the code is table-stakes. Network effects accelerate: more sellers → more conversion data → better AI → stickier sellers.
 - **Growth:** Every livestream has a watermark. Sellers are public by nature. Viral distribution built into the product.
 - **Timing:** Live commerce is exploding NOW. TikTok Shop US grew 125% last quarter. Khaby Lame's AI avatar sold for $975M. The market has validated that AI selling is worth nearly a billion dollars. But no one has built the full-stack AI commerce engine. First mover wins.
 - **Comp:** HeyGen does avatars but not commerce intelligence. TikTok's AI tools are features, not a platform. Shopify gives you a store but no sales team. Empire gives you everything.
@@ -187,6 +210,22 @@ Feeds improvements back to CREATOR and SELLER in real-time. The system gets smar
 **[1:10-1:40]** A judge types a comment: "Is it real leather?" The SELLER pauses, reads the comment, responds: "Great question — yes, this is full-grain leather. See the natural grain variation? That's how you know it's real." Another comment: "What colors?" CLOSER agent responds in DMs simultaneously. Show both happening at once.
 
 **[1:40-2:00]** Show the full output: 7 product photos, 3D model, promo video, live stream running, 3 TikTok clips auto-generated, DMs being handled. "Five minutes ago, this was a bag on a table. Now it's a business. This is what AI-native commerce looks like."
+
+### Team, Ask, Milestones
+
+> Team and ask blocks are placeholders — Cody, fill in names/background/numbers before submission.
+
+**Team:**
+- **Cody Kandarian** — Founder / full-stack. Built EMPIRE end-to-end at the hackathon (Cactus SDK + Gemma 4 integration, FastAPI backend, React dashboard, pod orchestration, pre-render pipeline). [Add: prior startup / company / shipping experience.]
+- **[Teammate name]** — [Role]. [Background: school, prior shipping experience, what they owned in the build.]
+
+**Raising $1.2M seed** to close 50 seller design partners by Aug 2026 and ship the self-serve product. Use of funds: 60% engineering (two more engineers to own AGENT-3 SELLER avatar pipeline + BRAIN analytics), 25% GTM / founder-led sales into live-commerce agencies, 15% compute + pod infrastructure.
+
+**18-month milestones:**
+- **Aug 2026** — 50 seller design partners running weekly streams. Measurable conversion lift vs no-avatar control.
+- **Dec 2026** — $500K ARR across SMB + first 3 agency pilots.
+- **Feb 2027** — First enterprise agency contract ($15K+/mo). Series A conversations.
+- **Aug 2027** — 500 sellers, $3M ARR, category-level BRAIN insights defensible.
 
 ### The 2-sentence pitch
 

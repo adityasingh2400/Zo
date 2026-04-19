@@ -8,6 +8,7 @@ import { VoiceMic } from './components/VoiceMic';
 import { RoutingPanel } from './components/RoutingPanel';
 import { BrainPanel } from './components/BrainPanel';
 import { ProductSelector } from './components/ProductSelector';
+import { CreatorPanel } from './components/CreatorPanel';
 
 export default function App() {
   const {
@@ -126,6 +127,7 @@ export default function App() {
         </div>
         <div style={styles.sideCol}>
           <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
+          <CreatorPanel />
           <ChatPanel
             onSendComment={sendComment}
             commentResponse={responseVideo}
@@ -216,9 +218,12 @@ const styles = {
   },
   stageCol: { display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, minWidth: 0 },
   sideCol: {
-    // Two rows: ProductPanel, ChatPanel. Telemetry (routing + agent log)
-    // lives in a separate overlay opened via the header button.
-    display: 'grid', gridTemplateRows: 'minmax(0, 1fr) minmax(0, 1.2fr)',
+    // Three rows: ProductPanel (product info), CreatorPanel (one-click demo),
+    // ChatPanel (comments). Telemetry overlay has Routing + BRAIN + AgentLog.
+    // CreatorPanel is compact when idle (~80px tall) and scrolls internally
+    // after a build, so ChatPanel gets the most room for comment history.
+    display: 'grid',
+    gridTemplateRows: 'minmax(0, 0.9fr) minmax(0, 0.8fr) minmax(0, 1.1fr)',
     gap: 12, minHeight: 0, minWidth: 0,
   },
   telemetryButton: {

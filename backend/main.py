@@ -20,13 +20,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("empire")
 
-from config import BACKEND_HOST, BACKEND_PORT
+from config import (
+    BACKEND_HOST, BACKEND_PORT,
+    USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO, USE_BACKCHANNEL,
+    USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
+)
 from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
 from agents.creator import remove_background, generate_3d_model
 from agents.seller import (
     generate_comment_response,
     make_avatar_speak,
     text_to_speech,
+    synthesize_word_timings,
     set_livetalking_session,
     render_comment_response_wav2lip,
     render_pitch_latentsync,
@@ -36,6 +41,14 @@ from agents.threed import carousel_from_video, glb_from_image
 from agents.bridge_clips import pick_bridge_clip, all_bridges
 from agents.avatar_director import Director
 from agents import router as comment_router
+from agents.router import _match_product_field  # used by speculative bridge
+
+logger.info(
+    "[flags] USE_AUDIO_FIRST=%s USE_KARAOKE=%s USE_PITCH_VEO=%s "
+    "USE_BACKCHANNEL=%s USE_SPECULATIVE_BRIDGE=%s LIPSYNC_PROVIDER=%s",
+    USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO,
+    USE_BACKCHANNEL, USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
+)
 
 # ── State ──────────────────────────────────────────────
 
@@ -1349,6 +1362,39 @@ async def api_respond_to_comment(
     }
 
 
+async def _fire_speculative_bridge(comment: str) -> None:
+    """Play a short label-agnostic ack on Tier 1 the moment a transcript
+    lands, BEFORE the router decides. Bought time fills the ~600-800ms
+    gap between transcript broadcast and the response Tier 1 emit on
+    cloud-escalate paths.
+
+    Skipped when:
+      • Director not yet ready (boot race)
+      • Comment likely matches a local qa_index entry → respond_locally
+        will fire in <100ms anyway and the bridge would only render
+        ~200ms of itself before being preempted
+      • No bridge clip available for the 'neutral' label
+    """
+    if director is None:
+        return
+    # Cheap pre-check: does this comment look like a local qa hit? Same
+    # matcher the router uses, so we agree with the routing decision that's
+    # about to fire 50-150ms from now.
+    product = pipeline_state.get("product_data") or {}
+    if _match_product_field(comment, product):
+        logger.debug("[bridge] speculative skip — likely local match")
+        return
+    try:
+        # 'neutral' pool is ~6 short utterances ("okay", "mhm", "right, so...")
+        # that are safe to play before any routing decision is final.
+        clip = await director.play_bridge("neutral")
+        if clip:
+            logger.info("[bridge] speculative bridge fired (clip=%s)",
+                        Path(clip.get("url", "?")).name)
+    except Exception:
+        logger.exception("[bridge] speculative bridge failed (non-fatal)")
+
+
 # ── Voice comment pipeline ─────────────────────────────────────────────────
 #
 # Hour 2-3 scaffolding: one new endpoint + a one-function stub router.
@@ -1582,6 +1628,15 @@ async def api_voice_comment(audio: UploadFile = File(...)):
             "dispatch": "no_speech",
             "total_ms": int((time.time() - t0) * 1000),
         }
+
+    # (1.5) Speculative bridge — fires the moment we have a transcript, BEFORE
+    #       the router decides. Reads as "she heard you and is responding"
+    #       which closes the gap between transcript landing and the actual
+    #       response Tier 1 emit. Skipped on likely-local matches because
+    #       respond_locally is already <100ms and the bridge would only get
+    #       cut off mid-frame.
+    if USE_SPECULATIVE_BRIDGE:
+        asyncio.create_task(_fire_speculative_bridge(text))
 
     # (2) Route + render. Today = always escalate. Hour 4-5 adds real routing.
     try:

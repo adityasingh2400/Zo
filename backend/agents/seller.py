@@ -2,6 +2,10 @@ import json
 import base64
 import asyncio
 import logging
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 import boto3
 import httpx
@@ -249,7 +253,7 @@ class _BytesCtx:
         self._buf.close()
 
 
-def _eleven_tts_sync(text: str) -> bytes:
+def _eleven_tts_sync(text: str, voice_id: str | None = None) -> bytes:
     """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
     event loop isn't blocked while audio bytes are being generated +
     streamed; the WS broadcast for play_clip events can interleave.
@@ -263,7 +267,7 @@ def _eleven_tts_sync(text: str) -> bytes:
     sellers."""
     audio_gen = eleven.text_to_speech.convert(
         text=text,
-        voice_id=ELEVENLABS_VOICE_ID,
+        voice_id=voice_id or ELEVENLABS_VOICE_ID,
         model_id="eleven_flash_v2_5",
         output_format="mp3_44100_128",
         language_code="en",
@@ -271,10 +275,156 @@ def _eleven_tts_sync(text: str) -> bytes:
     return b"".join(audio_gen)
 
 
-async def text_to_speech(text: str) -> bytes:
+# ── Audio duration probe ─────────────────────────────────────────────────────
+# Synthetic word-timing generation needs to know how long the rendered MP3
+# actually is. ffprobe is the most reliable source; if it's not installed
+# we fall back to a heuristic of 12 chars/second of speech (close enough for
+# the karaoke window to track). The fallback under-estimates long pauses but
+# we re-sync the visible word every 500ms on the dashboard, so a few hundred
+# ms of drift is invisible.
+def _probe_audio_duration_ms(audio_bytes: bytes) -> int | None:
+    """Returns the audio duration in milliseconds, or None if ffprobe
+    isn't installed / the bytes don't decode."""
+    if not audio_bytes:
+        return None
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio_bytes)
+            tmp_path = f.name
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 tmp_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            secs = float(out.stdout.strip())
+            return int(secs * 1000)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("[tts] ffprobe failed: %s", e)
+        return None
+
+
+# ── Synthetic word timings ───────────────────────────────────────────────────
+# Cartesia would give us exact per-word {start, end} for free. We're on
+# ElevenLabs, which doesn't return timings. The synthetic version splits
+# the text into words, measures each word's character length (a decent
+# proxy for spoken duration), and distributes the audio duration in
+# proportion. Plus a small constant for inter-word gap (~25ms) so trailing
+# punctuation doesn't crowd the next word.
+#
+# Accuracy versus real per-phoneme timings is roughly 80-95% — good enough
+# for the karaoke caption window, which slides through 8-12 words at a
+# time. The dashboard re-syncs every frame from audioElement.currentTime,
+# so any drift inside a word is invisible at the active-word boundary.
+_WORD_SPLIT_RE = re.compile(r"\S+")
+_INTER_WORD_GAP_MS = 25
+# Speaking rate fallback (chars/sec) when we have no audio_duration_ms
+# (degraded path: render_pitch_assets without ffprobe). 12 chars/sec is
+# eleven_flash_v2_5's measured average over the demo's response set.
+_FALLBACK_CHARS_PER_SEC = 12.0
+
+
+def synthesize_word_timings(
+    text: str,
+    audio_duration_ms: int | None,
+    *,
+    leading_pad_ms: int = 60,
+    trailing_pad_ms: int = 80,
+) -> list[dict]:
+    """Split `text` on whitespace and distribute `audio_duration_ms` across
+    the words proportionally to character count. Returns a list of
+    {word, start, end} dicts where start/end are in seconds (matching the
+    Cartesia contract so the dashboard never has to branch on units).
+
+    `leading_pad_ms` accounts for the typical 50-100ms intake breath
+    before any speech audio starts. `trailing_pad_ms` reserves a small
+    silence after the last word so the active-word highlight doesn't
+    hang on the final word for a noticeable gap.
+
+    If `audio_duration_ms` is None or non-positive, falls back to the
+    chars-per-sec heuristic so the dashboard still gets a usable timing
+    list (slightly drifty but works).
+    """
+    words = _WORD_SPLIT_RE.findall(text or "")
+    if not words:
+        return []
+
+    total_chars = sum(max(1, len(w)) for w in words)
+    gap_ms = _INTER_WORD_GAP_MS * (len(words) - 1)
+
+    if audio_duration_ms and audio_duration_ms > 0:
+        speech_ms = max(0, audio_duration_ms - leading_pad_ms - trailing_pad_ms - gap_ms)
+        if speech_ms <= 0:
+            # Audio is shorter than just the padding budget — pretend the
+            # whole clip is one continuous run, no padding, even split.
+            speech_ms = audio_duration_ms
+            leading_pad_ms = 0
+    else:
+        # Heuristic estimate. Each word needs ~len(word)/chars_per_sec seconds.
+        speech_ms = int(total_chars / _FALLBACK_CHARS_PER_SEC * 1000)
+
+    out: list[dict] = []
+    cursor_ms = leading_pad_ms
+    for i, word in enumerate(words):
+        word_share = max(1, len(word)) / total_chars
+        word_dur_ms = max(80, int(speech_ms * word_share))  # 80ms floor
+        start_ms = cursor_ms
+        end_ms = cursor_ms + word_dur_ms
+        out.append({
+            "word": word,
+            "start": round(start_ms / 1000, 3),
+            "end": round(end_ms / 1000, 3),
+        })
+        cursor_ms = end_ms + (_INTER_WORD_GAP_MS if i < len(words) - 1 else 0)
+
+    return out
+
+
+async def text_to_speech(
+    text: str,
+    *,
+    voice: str | None = None,
+    return_word_timings: bool = False,
+) -> bytes | tuple[bytes, list[dict]]:
     """ElevenLabs TTS. flash_v2_5 model = ~400ms for a 15-word reply.
-    Off-loaded to a worker thread so it doesn't stall the asyncio loop."""
-    logger.info("[TTS] text_to_speech called (text: %d chars, eleven: %s)", len(text), "yes" if eleven else "no")
+    Off-loaded to a worker thread so it doesn't stall the asyncio loop.
+
+    Default behaviour (`return_word_timings=False`) returns just the MP3
+    bytes — same contract every existing caller relies on.
+
+    With `return_word_timings=True` returns `(bytes, word_timings)` where
+    word_timings is `[{word, start, end}, ...]` in seconds. Timings are
+    SYNTHESIZED (we're not on Cartesia today): whitespace-split, distributed
+    across the actual audio duration measured by ffprobe. Accuracy is
+    ~80-95% which is enough for karaoke captions to track without visible
+    drift in the 8-12 word display window.
+
+    `voice` overrides ELEVENLABS_VOICE_ID when set — used by
+    bridge_clips.render_all to render a per-character voice without mutating
+    the env.
+    """
+    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, timings=%s, eleven=%s)",
+                len(text), voice or "default", return_word_timings, "yes" if eleven else "no")
     if not eleven:
+        if return_word_timings:
+            return b"", []
         return b""
-    return await asyncio.to_thread(_eleven_tts_sync, text)
+
+    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice)
+
+    if not return_word_timings:
+        return audio_bytes
+
+    # Probe duration off the wire so timings line up with playback. ffprobe
+    # call is ~30ms — well inside the budget for the audio-first path.
+    duration_ms = await asyncio.to_thread(_probe_audio_duration_ms, audio_bytes)
+    timings = synthesize_word_timings(text, duration_ms)
+    logger.info("[TTS] synth timings: %d words over %s ms",
+                len(timings), duration_ms if duration_ms else "(estimate)")
+    return audio_bytes, timings

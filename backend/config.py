@@ -31,3 +31,41 @@ GEMMA_MODEL_PATH = os.getenv("GEMMA_MODEL_PATH", "weights/gemma-4-E4B-it")
 
 BACKEND_HOST = os.getenv("BACKEND_HOST", "0.0.0.0")
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
+
+
+# ── Avatar realism feature flags (Apr 18 build) ──────────────────────────────
+# Every behavioural change for the YC submission demo lands behind a flag so
+# we can flip any single piece off at the eleventh hour and still ship the
+# rest. Defaults are ON because we want them on for the demo; setting any of
+# them to "0" reverts to the prior behaviour.
+def _flag(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Audio-first playback: broadcast a `comment_response_audio` event the moment
+# TTS finishes, kick Wav2Lip render in the background, dashboard plays audio
+# immediately and crossfades video underneath when ready.
+USE_AUDIO_FIRST = _flag("USE_AUDIO_FIRST", "1")
+
+# KaraokeCaptions component on the stage — word-by-word reveal synced to the
+# playing <audio> element. Synthetic word timings (whitespace-split, evenly
+# distributed across audio duration) since we're not on Cartesia today.
+USE_KARAOKE = _flag("USE_KARAOKE", "1")
+
+# Veo 30s pitch playback path — pre-rendered "pitching pose" clip + TTS
+# audio overlay + karaoke. Shaves the opening pitch from ~8-15s to ~600ms.
+USE_PITCH_VEO = _flag("USE_PITCH_VEO", "1")
+
+# Listening-attentive backchannel pose on mic press. Visual only (no "mhm"
+# audio per REVISIONS §8 — audio overlap risk during user speech isn't worth
+# the win).
+USE_BACKCHANNEL = _flag("USE_BACKCHANNEL", "1")
+
+# Speculative bridge clip immediately after voice_transcript lands, before
+# the router decides. Fills the gap between transcript and response.
+USE_SPECULATIVE_BRIDGE = _flag("USE_SPECULATIVE_BRIDGE", "1")
+
+# Lip-sync provider hook. Wav2Lip is the only path today; MuseTalk was cut
+# post-review (REVISIONS §6). Kept as a forward-compat env so post-submission
+# we can wire a second provider without touching call sites.
+LIPSYNC_PROVIDER = os.getenv("LIPSYNC_PROVIDER", "wav2lip").strip().lower()

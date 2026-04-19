@@ -80,55 +80,71 @@ export function TikTokShopOverlay({
     return () => clearInterval(id);
   }, []);
 
-  // Audience comments — driven by the audience_comment WS event coming
-  // from /api/audience_comment. Falls back to ChatPanel-style local
-  // sendComment events too so the operator can fire test comments from
-  // the home dashboard and watch them appear here in stage view.
+  // Chat rail comments. SINGLE source of truth: useEmpireSocket appends
+  // every inbound comment (audience_comment from /api/audience_comment,
+  // simulate_comment from ChatPanel, voice_transcript from VoiceMic) to
+  // pendingComments — the same list ChatPanel uses on the operator
+  // dashboard. We mirror new entries into our local rail with an 8s
+  // lifetime + guard against double-pushing the same id.
+  //
+  // Earlier revisions of this file ALSO subscribed to `audience_comment`
+  // directly here AND mirrored pendingComments. That double-counted every
+  // QR-submitted comment (one bubble from the WS listener, one from the
+  // pendingComments effect). Now there's exactly one path: pendingComments.
   const [comments, setComments] = useState([]);
-  useEffect(() => {
-    const ws = wsRef?.current;
-    if (!ws) return;
-    function onMessage(e) {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { return; }
-      if (msg.type === 'audience_comment') {
-        pushComment({
-          username: msg.username || 'guest',
-          text: msg.text || '',
-          ts: msg.ts || Date.now(),
-          source: 'audience',
-        });
-        // Each new comment also fires 1-2 hearts as a reaction.
-        spawnHeart();
-        if (Math.random() > 0.5) setTimeout(spawnHeart, 180);
-      }
-    }
-    ws.addEventListener('message', onMessage);
-    return () => ws.removeEventListener('message', onMessage);
-  }, [wsRef]);
 
   function pushComment(c) {
-    const id = `${c.ts}-${Math.random().toString(36).slice(2, 7)}`;
+    const id = c.id || `${c.ts}-${Math.random().toString(36).slice(2, 7)}`;
     setComments(prev => [...prev.slice(-30), { ...c, id }]);
     setTimeout(() => {
       setComments(prev => prev.filter(x => x.id !== id));
     }, COMMENT_LIFETIME_MS);
   }
 
-  // Pending comments coming through the existing pipeline (typed from the
-  // home dashboard via simulate_comment) also surface here so the operator
-  // can rehearse without QR. Watch for new entries appearing.
+  // Hearts react to a new audience_comment specifically — the QR audience
+  // is the demo's headline interaction, so each submission gets a 1-2 heart
+  // burst on top of the steady idle stream. We listen on the WS directly
+  // (not pendingComments) so the heart fires the instant the broadcast
+  // lands rather than after the React render cycle for pendingComments.
+  // Bubble rendering itself is owned by the pendingComments effect below
+  // so we don't double-add the comment to the chat rail.
+  useEffect(() => {
+    const ws = wsRef?.current;
+    if (!ws) return;
+    function onMessage(e) {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type !== 'audience_comment') return;
+      spawnHeart();
+      if (Math.random() > 0.5) setTimeout(spawnHeart, 180);
+    }
+    ws.addEventListener('message', onMessage);
+    return () => ws.removeEventListener('message', onMessage);
+  }, [wsRef]);
+
+  // Mirror new pendingComments into the rail. Three flavors land here:
+  //   - source: 'audience'  → @<username from QR form>, pink accent
+  //   - source: 'voice'     → @voice_user (operator's mic), purple accent
+  //   - (no source)         → @preview     (operator typed via ChatPanel)
+  // seenPendingRef is mount-scoped so a comment that already animated in
+  // doesn't re-push when the same id reappears (e.g. another effect re-fires).
   const seenPendingRef = useRef(new Set());
   useEffect(() => {
     if (!pendingComments) return;
     for (const p of pendingComments) {
       if (seenPendingRef.current.has(p.id)) continue;
       seenPendingRef.current.add(p.id);
+      const username = p.source === 'audience'
+        ? (p.username || 'guest')
+        : p.source === 'voice'
+          ? 'voice_user'
+          : 'preview';
       pushComment({
-        username: p.source === 'voice' ? 'voice_user' : 'preview',
+        id: `pc_${p.id}`,
+        username,
         text: p.text || '',
         ts: p.t0 || Date.now(),
-        source: 'preview',
+        source: p.source === 'audience' ? 'audience' : 'preview',
       });
     }
   }, [pendingComments]);

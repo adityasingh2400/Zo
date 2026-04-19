@@ -252,23 +252,41 @@ export function useEmpireSocket() {
           }
           break;
         case 'audience_comment':
-          // QR-submitted comment from a phone in the room. The backend has
-          // already (a) broadcast this informational event and (b) handed
-          // the text to run_routed_comment so the standard router + cost
-          // ticker + comment_response_video chain fires identically to a
-          // typed comment.
+          // QR-submitted comment from a phone in the room (username from
+          // the form), OR an operator-typed test comment echoed back from
+          // the simulate_comment WS handler (username='operator'). The
+          // backend has already (a) broadcast this informational event and
+          // (b) handed the text to run_routed_comment so the standard
+          // router + cost ticker + comment_response_video chain fires
+          // identically to a typed comment.
           //
-          // Surface it as pendingComments so the home dashboard's ChatPanel
+          // Surface as pendingComments so the home dashboard's ChatPanel
           // shows the same "AI Seller (rendering…) responding to '<text>'"
-          // placeholder that typed comments produce — gives the operator
-          // visibility into audience activity even when not on /stage.
-          // Cleared by the matching comment_response_video (same shape).
+          // placeholder that typed comments produce, AND so the /stage
+          // TikTokShopOverlay chat rail renders a bubble (single-source
+          // path — see TikTokShopOverlay.jsx). Cleared by the matching
+          // comment_response_video (filter by text).
+          //
+          // Dedup: when the operator types in ChatPanel, sendComment
+          // optimistically pushes pendingComments (so the pending pill
+          // appears instantly) AND fires simulate_comment over the WS.
+          // The backend echoes it back as audience_comment, which lands
+          // here a few ms later. Without dedup the originating window
+          // would render the comment twice in ChatPanel. We swallow the
+          // echo when a same-text pending entry exists from the last 5s.
           if (msg.text) {
             const audId = `aud_${msg.ts || Date.now()}`;
-            setPendingComments(prev => [...prev, {
-              id: audId, text: msg.text, t0: Date.now(),
-              source: 'audience', username: msg.username || 'guest',
-            }]);
+            setPendingComments(prev => {
+              const now = Date.now();
+              const echo = prev.some(p =>
+                p.text === msg.text && (now - (p.t0 || 0)) < 5000
+              );
+              if (echo) return prev;
+              return [...prev, {
+                id: audId, text: msg.text, t0: Date.now(),
+                source: 'audience', username: msg.username || 'guest',
+              }];
+            });
           }
           break;
         case 'voice_transcript':

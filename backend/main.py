@@ -461,6 +461,21 @@ async def dashboard_ws(ws: WebSocket):
                 # resolve in <300ms; cloud tool forwards to the no-Wav2Lip
                 # api_respond_to_comment audio + speaking-idle pipeline.
                 comment_text = msg.get("text", "")
+                # Echo to all dashboards as an audience_comment so the
+                # /stage TikTokShopOverlay chat rail surfaces operator-
+                # typed test comments (mission item 3 — operator can
+                # rehearse without a phone). Tagged username='operator'
+                # so it visually distinguishes from QR submissions.
+                # The originating client's useEmpireSocket dedups on
+                # text+t0 so its own ChatPanel pending pill (created
+                # optimistically by sendComment) doesn't double-up.
+                if comment_text.strip():
+                    await broadcast_to_dashboards({
+                        "type": "audience_comment",
+                        "username": "operator",
+                        "text": comment_text,
+                        "ts": int(time.time() * 1000),
+                    })
                 async def _run():
                     try:
                         await run_routed_comment(comment_text)

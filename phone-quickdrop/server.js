@@ -43,6 +43,8 @@ const OUTPUT_DIR =
   process.env.QUICKDROP_OUT ||
   path.join(os.homedir(), "Desktop", "PhoneCaptures");
 const RECENT_LIMIT = 50;
+const HEARTBEAT_MS = 20_000;
+const ORPHAN_RESUME_MS = 20_000;
 
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 fs.mkdirSync(CERT_DIR, { recursive: true });
@@ -148,6 +150,10 @@ function safeLabel(input) {
 const observers = new Set();
 const phones = new Set();
 const recentRecordings = []; // newest first
+// Sessions whose phone WS dropped mid-recording; a reconnect with the same
+// sessionId + resume:true re-attaches and keeps writing to the same file.
+// Key: sessionId → { session, timer }
+const orphanedSessions = new Map();
 
 function broadcastToObservers(obj) {
   const payload = JSON.stringify(obj);
@@ -243,12 +249,13 @@ async function start() {
   const phoneUrl = `https://${phoneHost}:${PORT}/phone`;
   const dashUrl = `https://localhost:${PORT}/`;
 
-  // Pre-render QR as inline SVG.
+  // Pre-render QR as inline SVG — standard black-on-white so any phone
+  // camera can read it against the white card background.
   const qrSvg = await QRCode.toString(phoneUrl, {
     type: "svg",
     errorCorrectionLevel: "M",
     margin: 1,
-    color: { dark: "#ffffff", light: "#00000000" },
+    color: { dark: "#000000", light: "#ffffff" },
   });
 
   // Read dashboard template once at boot, substitute.
@@ -359,6 +366,38 @@ async function start() {
           pushPhoneStatus();
           console.log(`[${peer}] phone connected`);
         }
+
+        // Resume path: phone reconnected mid-recording. Re-attach to the
+        // orphaned session so chunks keep landing in the same file.
+        if (msg.resume && msg.sessionId) {
+          const orphan = orphanedSessions.get(msg.sessionId);
+          if (orphan) {
+            clearTimeout(orphan.timer);
+            orphanedSessions.delete(msg.sessionId);
+            if (session && !session.closed && session !== orphan.session) {
+              await session.finish("abort");
+            }
+            session = orphan.session;
+            session.peerLabel = peer;
+            console.log(
+              `[${peer}] resume ${session.sessionId} → ${session.fileName} ` +
+                `(have ${session.bytes} bytes so far)`
+            );
+            ack({
+              type: "started",
+              resumed: true,
+              sessionId: session.sessionId,
+              fileName: session.fileName,
+              bytes: session.bytes,
+            });
+            return;
+          }
+          // Orphan expired or never existed — fall through to fresh start.
+          console.log(
+            `[${peer}] resume requested but session ${msg.sessionId} unknown; starting fresh`
+          );
+        }
+
         if (session && !session.closed) await session.finish("abort");
         session = new RecordingSession({
           sessionId: msg.sessionId || crypto.randomUUID(),
@@ -377,6 +416,13 @@ async function start() {
       if (msg.type === "end") {
         if (!session) { ack({ type: "error", reason: "end_without_start" }); return; }
         const expected = msg.totalBytes;
+        // If this session was previously orphaned and is now finishing, make
+        // sure we aren't leaving a dangling timer.
+        const orphanEntry = orphanedSessions.get(session.sessionId);
+        if (orphanEntry) {
+          clearTimeout(orphanEntry.timer);
+          orphanedSessions.delete(session.sessionId);
+        }
         await session.finish("ok");
         ack({
           type: "saved",
@@ -390,7 +436,15 @@ async function start() {
         return;
       }
       if (msg.type === "abort") {
-        if (session) { await session.finish("abort"); session = null; }
+        if (session) {
+          const orphanEntry = orphanedSessions.get(session.sessionId);
+          if (orphanEntry) {
+            clearTimeout(orphanEntry.timer);
+            orphanedSessions.delete(session.sessionId);
+          }
+          await session.finish("abort");
+          session = null;
+        }
         ack({ type: "aborted" });
         return;
       }
@@ -401,7 +455,20 @@ async function start() {
 
     ws.on("close", async () => {
       if (session && !session.closed) {
-        await session.finish("partial");
+        // Keep the file open for a window so a reconnect can resume. If the
+        // phone doesn't come back, finalize as partial and emit to observers.
+        const sid = session.sessionId;
+        const s = session;
+        const timer = setTimeout(async () => {
+          if (orphanedSessions.get(sid)?.session === s) {
+            orphanedSessions.delete(sid);
+            if (!s.closed) await s.finish("partial");
+          }
+        }, ORPHAN_RESUME_MS);
+        orphanedSessions.set(sid, { session: s, timer });
+        console.log(
+          `[${peer}] session ${sid} orphaned (resumable for ${ORPHAN_RESUME_MS}ms, ${s.bytes} bytes)`
+        );
         session = null;
       }
       if (role === "phone") {
@@ -417,8 +484,26 @@ async function start() {
       console.error(`[${peer}] ws error:`, err.message);
     });
 
+    // Heartbeat: ping every HEARTBEAT_MS; if a ping is unanswered by the next
+    // cycle, the socket is terminated and normal close handling kicks in
+    // (which orphans any active session so reconnect can resume).
+    ws.isAlive = true;
+    ws.on("pong", () => { ws.isAlive = true; });
+
     ack({ type: "hello", outputDir: OUTPUT_DIR, phoneUrl });
   });
+
+  const heartbeatTimer = setInterval(() => {
+    for (const client of wss.clients) {
+      if (client.isAlive === false) {
+        try { client.terminate(); } catch {}
+        continue;
+      }
+      client.isAlive = false;
+      try { client.ping(); } catch {}
+    }
+  }, HEARTBEAT_MS);
+  wss.on("close", () => clearInterval(heartbeatTimer));
 
   server.on("error", (err) => {
     if (err.code === "EADDRINUSE") {

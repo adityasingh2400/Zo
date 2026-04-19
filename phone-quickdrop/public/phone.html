@@ -276,6 +276,8 @@
     let recorder = null;
     let recording = false;
     let sessionId = null;
+    let sessionMime = null;
+    let sessionExt = null;
     let bytesSent = 0;
     let chunkCount = 0;
     let startedAt = 0;
@@ -284,6 +286,9 @@
     let micOn = true;
     let wakeLock = null;
     let pendingChunks = []; // queued while WS not ready (rare)
+    // Outstanding ev.data.arrayBuffer() promises. Must drain before we send
+    // "end", otherwise the final chunk races the end-marker and gets dropped.
+    const pendingSends = new Set();
 
     // ---------- mime negotiation ----------
     function pickMimeType() {
@@ -331,7 +336,21 @@
       ws.addEventListener("open", () => {
         wsReady = true;
         setConn("connected", "ready");
-        // flush anything queued (very rare path)
+        // If we died mid-recording, ask the server to resume this sessionId
+        // before we flush queued chunks. WebSocket preserves order within a
+        // single connection, so chunks sent next will land after the resume.
+        if (recording && sessionId) {
+          try {
+            ws.send(JSON.stringify({
+              type: "start",
+              sessionId,
+              mime: sessionMime || "application/octet-stream",
+              ext: sessionExt || "bin",
+              resume: true,
+              ts: startedAt,
+            }));
+          } catch { /* will close and reconnect */ }
+        }
         for (const buf of pendingChunks) ws.send(buf);
         pendingChunks = [];
       });
@@ -461,28 +480,39 @@
 
       sessionId = (crypto.randomUUID && crypto.randomUUID()) ||
         ("s" + Math.random().toString(36).slice(2) + Date.now().toString(36));
+      sessionMime = recorder.mimeType || mime || "application/octet-stream";
+      sessionExt = ext;
       bytesSent = 0;
       chunkCount = 0;
       startedAt = Date.now();
+      pendingSends.clear();
 
       // Tell server a recording is starting
       wsSend(JSON.stringify({
         type: "start",
         sessionId,
-        mime: recorder.mimeType || mime || "application/octet-stream",
-        ext,
+        mime: sessionMime,
+        ext: sessionExt,
         ts: startedAt,
       }));
 
-      recorder.ondataavailable = async (ev) => {
+      recorder.ondataavailable = (ev) => {
         if (!ev.data || ev.data.size === 0) return;
         chunkCount += 1;
         bytesSent += ev.data.size;
-        const buf = await ev.data.arrayBuffer();
-        wsSend(buf);
-        updateSizePill();
+        // Schedule the arrayBuffer conversion and remember the promise so
+        // onstop can drain it before sending "end".
+        const p = ev.data.arrayBuffer()
+          .then((buf) => { wsSend(buf); updateSizePill(); })
+          .catch(() => { /* ignore; recorder error handler reports */ });
+        pendingSends.add(p);
+        p.finally(() => pendingSends.delete(p));
       };
-      recorder.onstop = () => {
+      recorder.onstop = async () => {
+        // Drain any in-flight chunk conversions so the last chunk beats "end".
+        if (pendingSends.size) {
+          try { await Promise.allSettled([...pendingSends]); } catch {}
+        }
         wsSend(JSON.stringify({
           type: "end",
           sessionId,
@@ -490,6 +520,8 @@
           chunks: chunkCount,
         }));
         sessionId = null;
+        sessionMime = null;
+        sessionExt = null;
         recorder = null;
       };
       recorder.onerror = (ev) => {

@@ -9,9 +9,9 @@ import React, { useEffect, useState, useCallback } from 'react';
  * useEmpireSocket would re-pull state) — for v0 we just refetch our own
  * state after the POST so the dropdown reflects the change immediately.
  *
- * v0 limitation: doesn't reflect catalog changes pushed from another
+ * Limitation: doesn't reflect catalog changes pushed from another
  * dashboard tab. The intended use is a single operator at the demo
- * machine; this is fine until multi-operator (Sprint 5+).
+ * machine; this is fine until multi-operator (roadmap).
  */
 const API_BASE = `http://${window.location.hostname}:8000`;
 
@@ -55,7 +55,7 @@ export function ProductSelector() {
 
   // Hide the selector entirely if there's only one product (no decision
   // for the operator to make). Returns once multi-product onboarding lands
-  // (Sprint 3) and a real seller will have multiple products to choose from.
+  // (roadmap) and a real seller will have multiple products to choose from.
   if (products.length <= 1) return null;
 
   return (

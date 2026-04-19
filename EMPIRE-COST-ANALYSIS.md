@@ -1,10 +1,10 @@
 # EMPIRE Cost Analysis: Two Routes
 
-> **Honest framing (added Sprint 1):** The numbers below are *modeled at the
+> **Honest framing:** The numbers below are *modeled at the
 > assumed scale of 10 simultaneous streams × 50 products per seller*. As of
-> today's build, EMPIRE runs **single-tenant: one product, one stream, one
-> dashboard**. Multi-product is shipped (Sprint 1.3) but multi-stream
-> isolation is roadmap (Sprint 5+).
+> the current build, EMPIRE runs **single-tenant: one product, one stream, one
+> dashboard**. Multi-product is shipped; multi-stream isolation is on the
+> roadmap.
 >
 > Two known math errors in the original write-up below, kept inline for
 > transparency rather than silently fixed:
@@ -25,7 +25,7 @@
 > team ($5K-$12K/mo) but not the headline $144 figure.
 >
 > The 90%+ gross-margin claim and the local-first thesis hold up; the
-> specific dollars need a Sprint 2/3 rebuild against measured load.
+> specific dollars need a follow-up rebuild against measured load.
 
 ---
 

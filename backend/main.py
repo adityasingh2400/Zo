@@ -35,7 +35,7 @@ from agents import router as comment_router
 from agents import translator
 from agents.hands import Hands
 from agents.avatar_director import Director
-from agents.bridge_clips import all_bridges, pick_bridge_clip
+from agents.bridge_clips import all_bridges, pick_bridge_clip, pick_intent_substrate
 from agents.creator import build_all as creator_build_all
 from agents.creator import generate_3d_model, remove_background
 from agents.eyes import (
@@ -61,6 +61,7 @@ from config import (
     BACKEND_HOST,
     BACKEND_PORT,
     LIPSYNC_PROVIDER,
+    POD_SPEAKING_1080P,
     USE_AUDIO_FIRST,
     USE_BACKCHANNEL,
     USE_KARAOKE,
@@ -297,11 +298,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
 
-    # Load demo products + pre-select an active one for respond_locally. The
-    # Hour 5-6 scope: the router can answer routine questions without any
-    # prior /api/sell call. ACTIVE_PRODUCT_ID env var overrides the first-
-    # key default if you want to swap between demo objects without editing
-    # code on stage.
+    # Load demo products + pre-select an active one for respond_locally so
+    # the router can answer routine questions without any prior /api/sell
+    # call. ACTIVE_PRODUCT_ID env var overrides the first-key default if
+    # you want to swap between demo objects without editing code on stage.
     _load_products()
     _load_avatars()
     yield
@@ -676,9 +676,11 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
                                    ms=lipsync_ms + tts_ms + phase1_ms)
 
         if director:
-            await director.play_response(url)
-            # Probe rendered duration so the idle release fires precisely as
-            # she finishes the pitch. Falls back to a word-count estimate.
+            # Probe rendered duration BEFORE the emit so play_response can
+            # carry expected_duration_ms — without this the Director's
+            # busy_until horizon defaulted to 8 s and autonomous Tier 1
+            # interjections (sip / walk_off / glance) would fire over the
+            # pitch the moment busy expired (~+10 s into a 20 s pitch).
             rendered_path = RENDER_DIR / Path(url).name
             play_ms = _probe_video_duration_ms(rendered_path)
             if play_ms is None:
@@ -686,9 +688,28 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
                 play_ms = int(max(2500, word_count * 350))
             play_ms_with_tail = play_ms + 400
 
+            # PITCH LOCK — hard gate that prevents ANY autonomous Tier 1
+            # emit from firing for the duration of the pitch, regardless
+            # of timer drift. Cleared either by:
+            #   1. The dashboard's pitch_audio_end event (truth source —
+            #      handled in director.observe). Fires the moment the
+            #      <audio> element's ended event ticks.
+            #   2. The fallback _release_pitch_to_idle task below, in
+            #      case the dashboard's WS drops mid-pitch and the
+            #      pitch_audio_end never lands.
+            director.lock_tier1_for_pitch()
+            await director.play_response(url, expected_duration_ms=play_ms)
+
             async def _release_pitch_to_idle(delay_ms: int):
                 await asyncio.sleep(delay_ms / 1000)
                 if director:
+                    # Fallback unlock — pitch_audio_end usually beats us
+                    # to the punch but if the dashboard WS dropped or
+                    # the dashboard's <audio> errored, this guarantees
+                    # the lock releases. Idempotent: if already unlocked
+                    # by observe(), this is a no-op (settle_until just
+                    # gets refreshed).
+                    director.unlock_tier1_with_settle(settle_seconds=2.5)
                     await director.fade_to_idle()
                     await director.set_voice_state(None)
             asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
@@ -835,7 +856,23 @@ async def _play_upload_bridge() -> None:
     (Option A) — the pipelines no longer emit it, which means the chain
     fires exactly once per upload regardless of which pipeline runs.
     Wrapped non-fatal: a Director-broadcast failure should never block
-    the pipeline kickoff."""
+    the pipeline kickoff.
+
+    Also clears the previous upload's `product_data` so the dashboard
+    doesn't flash the prior product's name (e.g. "Minimal Leather
+    Wallet" — the seeded catalog default) for the 7-12 s between drop
+    and Gemma's analyze landing. Carousel updates faster than analyze
+    (~7 s vs ~12 s), so without this clear the operator sees the new
+    product's frames + the old product's name simultaneously.
+    """
+    pipeline_state["product_data"] = None
+    pipeline_state["pitch_video_url"] = None
+    pipeline_state["product_clean_b64"] = None
+    pipeline_state["last_response_text"] = None
+    try:
+        await broadcast_to_dashboards({"type": "product_data", "data": None})
+    except Exception:
+        logger.exception("[route] product_data clear broadcast failed (non-fatal)")
     if not director:
         return
     try:
@@ -964,6 +1001,12 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str,
 
     if transcript:
         log_event("EYES", f'Seller said: "{transcript[:200]}..."')
+        # Stash for comment dispatch — classify_comment_gemma reads this
+        # so the on-device Gemma draft can quote what the seller actually
+        # said in the pitch ("you mentioned same-day shipping…") instead
+        # of falling back to a generic "we're not sure what you're
+        # asking" reply when the comment is terse like "how much?".
+        pipeline_state["seller_transcript"] = transcript
         await broadcast_to_dashboards({"type": "transcript", "text": transcript})
 
     # NOTE: transcript_extract was firing here in parallel — a separate
@@ -1990,7 +2033,7 @@ async def _fire_speculative_bridge(comment: str) -> None:
 
 # ── Voice comment pipeline ─────────────────────────────────────────────────
 #
-# Hour 2-3 scaffolding: one new endpoint + a one-function stub router.
+# Two entry points:
 #
 #   POST /api/voice_comment
 #     accepts an audio blob (webm/opus from the dashboard MediaRecorder,
@@ -1999,9 +2042,8 @@ async def _fire_speculative_bridge(comment: str) -> None:
 #     the dashboard, then hands the transcript to run_routed_comment().
 #
 #   run_routed_comment(comment)
-#     STUB. Forwards every comment to the existing /api/respond_to_comment
-#     cloud pipeline. Hour 4-5 replaces this with a FunctionGemma-driven
-#     dispatcher that picks among four tools (respond_locally,
+#     The four-tool dispatcher: rule-based router fed by Gemma's classify
+#     output picks among (respond_locally,
 #     escalate_to_cloud, play_canned_clip, block_comment). Keeping the
 #     signature stable means /api/voice_comment never needs to change.
 
@@ -2021,12 +2063,29 @@ async def run_routed_comment(comment: str) -> dict:
 
     # 1. Classify (on-device Gemma 4). Never raises — returns a dict with
     #    at least {type, source} even on fallback. Safe to await here.
-    classify = await classify_comment_gemma(comment)
+    # Pass product + transcript context so Gemma's draft is grounded in
+    # what the seller actually said + what the product actually is.
+    # Without these the prompt is just the comment string in isolation
+    # and Gemma defaults to generic fallbacks for anything it doesn't
+    # recognise. Both are pulled from pipeline_state — set by the sell
+    # video pipeline and the catalog default loader respectively.
+    classify = await classify_comment_gemma(
+        comment,
+        product=pipeline_state.get("product_data"),
+        transcript=pipeline_state.get("seller_transcript"),
+    )
 
     # 2. Decide.
     decision = await comment_router.decide(comment, classify, product)
 
-    # 3. Broadcast so RoutingPanel (Hour 7) can tick counters.
+    # 3. Broadcast so RoutingPanel + the Gemma-decision HUD on
+    #    the operator stage can render the early signal — fires within
+    #    ~300 ms of the comment landing, ~5-7 s before the rendered
+    #    comment_response_video shows up. `intent` is the raw classifier
+    #    bucket (compliment / objection / question / spam); `intent_hint`
+    #    in args is what the dispatcher actually uses to pick the bridge
+    #    substrate (resolved from cue lists when classify is "question"
+    #    but the comment scans as a compliment, etc.).
     await broadcast_to_dashboards({
         "type": "routing_decision",
         "comment": comment,
@@ -2035,14 +2094,17 @@ async def run_routed_comment(comment: str) -> dict:
         "ms": decision["ms"],
         "was_local": decision["was_local"],
         "cost_saved_usd": decision["cost_saved_usd"],
+        "intent": classify.get("type"),
+        "intent_hint": decision.get("args", {}).get("intent_hint"),
+        "classify_ms": int(classify.get("latency_ms", 0)),
+        "draft_response": (classify.get("draft_response") or "")[:140],
     })
     log_event("ROUTER", f'{decision["tool"]} — {decision["reason"]} ({decision["ms"]}ms)',
               {"classify": classify.get("type"), "was_local": decision["was_local"]})
 
     # 3b. Persist for BRAIN aggregation. Hardcoded stream_id="default" until
-    #     multi-stream isolation lands (Sprint 5+); active_product_id mirrors
-    #     pipeline_state which the dashboard sets via /api/state/active_product
-    #     once multi-product (S1.3) ships.
+    #     multi-stream isolation lands (roadmap); active_product_id mirrors
+    #     pipeline_state which the dashboard sets via /api/state/active_product.
     brain.record_event(
         stream_id="default",
         product_id=pipeline_state.get("active_product_id") or "unknown",
@@ -2060,10 +2122,193 @@ async def run_routed_comment(comment: str) -> dict:
         return await _run_play_canned_clip(comment, args, decision)
     if tool == "block_comment":
         return await _run_block_comment(comment, args, decision)
-    # Default: escalate_to_cloud. Same pattern as the old stub — forward to
-    # the existing api_respond_to_comment, and on failure fade + broadcast
-    # comment_failed with any drafted text.
-    return await _run_escalate_to_cloud(comment, args, decision)
+    # Default (escalate_to_cloud bucket): the new bridge+wav2lip path.
+    # Uses Gemma's draft_response (already on-device, no extra LLM call)
+    # and lip-syncs onto the intent-specific bridge clip as substrate.
+    # Falls back to the legacy _run_escalate_to_cloud (Claude + default
+    # substrate) on any failure so the demo never shows dead air.
+    return await _run_bridge_with_wav2lip(comment, classify, decision)
+
+
+async def _run_bridge_with_wav2lip(comment: str, classify: dict, decision: dict) -> dict:
+    """The intent-aware comment dispatch path.
+
+    Architecture (per the user's spec):
+      1. Gemma already classified upstream (in run_routed_comment) and
+         returned `{type, draft_response}` — both fields used directly
+         here. NO additional LLM call.
+      2. reading_chat fires immediately as the visual mask while we work.
+      3. Pick a random raw bridge clip from /workspace/bridges/<intent>/
+         on the pod (intent ∈ {compliment, objection, question}).
+         Falls back to the default speaking-pose substrate when the
+         intent has no clips (or classifier returned an unknown type).
+      4. ElevenLabs TTS the draft_response.
+      5. Wav2Lip /lipsync_fast renders the audio onto the bridge clip
+         as substrate. Bridge clips are 8 s — comfortably longer than
+         a typical 5 s response. First render per substrate is COLD
+         (~12 s, builds face-detect cache); subsequent are warm (~5-6 s).
+      6. Director.play_response crossfades from reading_chat to the
+         rendered output. fade_to_idle releases Tier 1 after the audio
+         finishes.
+
+    The avatar visibly does an intent-appropriate gesture (warm smile
+    for compliments, thoughtful nod for questions, "actually..." beat
+    for objections) WHILE speaking the response. Mouth alignment isn't
+    perfect (Wav2Lip on a non-purpose-built substrate warbles a bit)
+    but the body language coherence is the point.
+
+    Failure mode: if Wav2Lip errors (404 substrate, pod down, bad
+    audio), fall back to _run_escalate_to_cloud which uses the default
+    speaking-pose substrate via Claude. This guarantees a response
+    even when the bridge upload is stale or the pod's face cache is
+    inaccessible.
+    """
+    intent = (classify.get("type") or "").lower().strip() or "question"
+    draft = (classify.get("draft_response") or "").strip()
+
+    # 1. Pick substrate. None ⇒ default speaking pose (safe path).
+    substrate = pick_intent_substrate(intent)
+    pod_path = substrate["pod_path"] if substrate else POD_SPEAKING_1080P
+    substrate_label = substrate["url"] if substrate else "default"
+    log_event("ROUTER", f'bridge+wav2lip intent={intent} substrate={substrate_label}',
+              {"pod_path": pod_path, "draft": draft[:80] if draft else None})
+
+    # Broadcast the substrate pick IMMEDIATELY so the operator HUD shows
+    # which bridge clip Gemma's intent mapped to — visible within ~300 ms
+    # of the comment landing, ~5-15 s before the rendered comment_response_video
+    # closes the loop. Without this the substrate is invisible until the
+    # full Wav2Lip render lands, and the operator can't tell why a
+    # particular bridge gesture is about to play.
+    await broadcast_to_dashboards({
+        "type": "comment_substrate_picked",
+        "comment": comment,
+        "intent": intent,
+        "substrate": substrate_label,
+        "draft_response": (draft or "")[:140],
+    })
+
+    # 2. Reading-chat as the visual mask while we render. Background
+    #    task — emit_reading_chat returns immediately after the WS
+    #    broadcast; the Tier 1 busy_until horizon set by emit() keeps
+    #    the idle rotation suppressed for the loop's full ttl.
+    if director:
+        asyncio.create_task(director.emit_reading_chat())
+
+    # 3. Pick the response text. Gemma's draft is the light path;
+    #    fall back to Claude only when the draft is empty/too short.
+    text_t0 = time.time()
+    if draft and len(draft) >= 6:
+        response_text = draft
+        text_source = "gemma_draft"
+        text_ms = 0
+    else:
+        try:
+            response_text = await generate_comment_response(
+                comment, pipeline_state.get("product_data") or {}, intent)
+            text_source = "claude_fallback"
+        except Exception as e:
+            logger.warning("[bridge_wav2lip] Claude fallback failed: %s — using stock", e)
+            response_text = "Let me come back to that one."
+            text_source = "stock"
+        text_ms = int((time.time() - text_t0) * 1000)
+    pipeline_state["last_response_text"] = {"comment": comment, "response": response_text}
+
+    # 4. TTS — translate first if active language ≠ en (mirrors pitch path).
+    active_lang = pipeline_state.get("active_language", "en")
+    tts_text = response_text
+    if active_lang != "en":
+        try:
+            tts_text = await translator.translate(response_text, active_lang)
+        except Exception as e:
+            logger.warning("[bridge_wav2lip] translate failed: %s — using English", e)
+    tts_t0 = time.time()
+    audio_bytes = await text_to_speech(tts_text, language_code=active_lang)
+    tts_ms = int((time.time() - tts_t0) * 1000)
+    if not audio_bytes:
+        logger.error("[bridge_wav2lip] empty TTS — escalating to legacy cloud path")
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    # 5. Wav2Lip render. First call per substrate is cold (~12 s);
+    #    subsequent calls hit the pod's face-detect cache and run
+    #    in ~5-6 s. On HARD failure (404 / pod down / exhausted retries)
+    #    fall back to the default substrate via the legacy path so the
+    #    audience always sees something.
+    lipsync_t0 = time.time()
+    try:
+        video_bytes, _hdrs = await render_comment_response_wav2lip(
+            audio_bytes, source_path_on_pod=pod_path, out_height=1920)
+    except Exception as e:
+        logger.warning("[bridge_wav2lip] Wav2Lip on substrate %s failed (%s) — "
+                       "retrying with default substrate", pod_path, e)
+        try:
+            video_bytes, _hdrs = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=POD_SPEAKING_1080P, out_height=1920)
+            substrate_label = f"{substrate_label} → default (fallback)"
+        except Exception as e2:
+            logger.error("[bridge_wav2lip] default substrate fallback also failed: %s", e2)
+            if director:
+                try:
+                    await director.fade_to_idle()
+                except Exception:
+                    pass
+            await broadcast_to_dashboards({
+                "type": "comment_failed",
+                "comment": comment, "response": response_text,
+                "reason": f"wav2lip: {str(e2)[:120]}",
+            })
+            raise
+    lipsync_ms = int((time.time() - lipsync_t0) * 1000)
+
+    # 6. Persist + emit via Director. Probe the rendered duration so
+    #    fade-to-idle fires at the right moment (Wav2Lip output length
+    #    matches the audio length, not the substrate length).
+    rid = uuid.uuid4().hex[:12]
+    out_path = RENDER_DIR / f"comment_{rid}.mp4"
+    out_path.write_bytes(video_bytes)
+    url = f"/renders/{out_path.name}"
+    audio_dur_ms = _probe_video_duration_ms(out_path) or \
+                   int(max(2500, len(response_text.split()) * 350))
+
+    if director:
+        await director.play_response(url, expected_duration_ms=audio_dur_ms)
+
+        async def _release_after_audio():
+            await asyncio.sleep(audio_dur_ms / 1000 + 0.4)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after_audio())
+
+    total_ms = decision["ms"] + text_ms + tts_ms + lipsync_ms
+    await broadcast_to_dashboards({
+        "type": "comment_response_video",
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "intent": intent,
+        "substrate": substrate_label,
+        "text_source": text_source,
+        "total_ms": total_ms,
+        "class_ms": int(classify.get("latency_ms", 0)),
+        "text_ms": text_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+    })
+    log_event("LIPSYNC", f"comment response rendered ({lipsync_ms}ms, "
+              f"intent={intent}, substrate={substrate_label})")
+    return {
+        "dispatch": "bridge_wav2lip",
+        "routing": decision,
+        "comment": comment,
+        "response": response_text,
+        "url": url,
+        "intent": intent,
+        "substrate": substrate_label,
+        "text_source": text_source,
+        "total_ms": total_ms,
+        "class_ms": int(classify.get("latency_ms", 0)),
+        "text_ms": text_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
+    }
 
 
 async def _run_escalate_to_cloud(comment: str, args: dict, decision: dict) -> dict:
@@ -2243,7 +2488,7 @@ async def api_voice_comment(audio: UploadFile = File(...)):
     if USE_SPECULATIVE_BRIDGE:
         asyncio.create_task(_fire_speculative_bridge(text))
 
-    # (2) Route + render. Today = always escalate. Hour 4-5 adds real routing.
+    # (2) Route + render through the rule-based + Gemma-classify dispatcher.
     try:
         routed = await run_routed_comment(text)
     except Exception as e:

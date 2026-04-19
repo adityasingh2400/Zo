@@ -150,7 +150,7 @@ t=0.20    Director.play_response("/local_answers/wallet_real_leather.mp4")
 t=0.55    Avatar is ON SCREEN speaking the answer.
 
   Total: < 600 ms. Zero cloud spend. Zero render. The clip was rendered once,
-  weeks ago, when the seller authored that Q&A entry.
+  at product onboarding, when the seller authored that Q&A entry.
 ```
 
 Compare a comment that doesn't match the local index — Gemma still drives every step, it just stitches a fresh lip-sync onto a pre-rendered intent substrate:

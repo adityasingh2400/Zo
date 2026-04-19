@@ -14,7 +14,7 @@ import React, { useEffect, useState } from 'react';
  *   - Top misses (tokens that recur in escalate_to_cloud comments — what the
  *     local index is missing; feeds the next round of Q/A authoring)
  *
- * Future (Sprint 4): conversion-aware ranking will surface here too — which
+ * Roadmap: conversion-aware ranking will surface here too — which
  * answers correlate with add-to-cart, etc.
  */
 const API_BASE = `http://${window.location.hostname}:8000`;

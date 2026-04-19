@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 // Backend's /ws/dashboard requires `?token=<value>` when WS_SHARED_SECRET
-// is set in backend .env (Sprint 2.6). We forward VITE_WS_TOKEN if defined;
+// is set in backend .env. We forward VITE_WS_TOKEN if defined;
 // blank token is fine in dev mode (backend default-allows when secret unset).
 const WS_TOKEN = import.meta.env?.VITE_WS_TOKEN || '';
 const WS_URL = `ws://${window.location.hostname}:8000/ws/dashboard`
@@ -129,6 +129,31 @@ export function useEmpireSocket() {
           break;
         case 'status':
           setStatus(msg.status);
+          break;
+        case 'comment_substrate_picked':
+          // Fired by _run_bridge_with_wav2lip the moment Gemma's intent
+          // is mapped to a substrate clip — well before the Wav2Lip
+          // render lands. Surfaced in the operator's GemmaDecisionHud
+          // so the picked bridge filename is visible within ~300 ms
+          // of the comment POST instead of being invisible until the
+          // full comment_response_video event fires 5-15 s later.
+          // Stored as a partial decision dict that the HUD merges with
+          // the existing routingDecision (same comment string).
+          setRoutingDecision(prev => {
+            // Augment the in-flight routing decision for this comment;
+            // if the comment string differs we replace (newer wins).
+            if (prev && prev.comment === msg.comment) {
+              return { ...prev, substrate: msg.substrate, intent_hint: msg.intent };
+            }
+            return {
+              comment: msg.comment,
+              substrate: msg.substrate,
+              intent_hint: msg.intent,
+              draft_response: msg.draft_response,
+              tool: 'escalate_to_cloud',
+              ms: 0,
+            };
+          });
           break;
         case 'play_clip':
           // Director crossfade event. Stash per-layer for the debug HUD.

@@ -7,11 +7,11 @@
 
 To set expectations cleanly:
 
-- **No live platform integration.** No actual TikTok Shop / Instagram Live / WhatsApp connection. The dashboard chat panel simulates comments. The router + response pipeline is identical to what would feed a real platform integration; the integration adapter itself (planned Sprint 4 for TikTok Shop) is not yet built.
-- **Single-tenant.** One product, one stream, one operator at a time. Multi-product is shipped (Sprint 1.3) but multi-stream isolation is roadmap (Sprint 5+).
-- **English only.** ElevenLabs `language_code="en"` is hardcoded today. Multi-language is roadmap (Sprint 3).
-- **CLOSER agent is not built.** The pitched DM auto-responder is planned for Sprint 4.
-- **Cloud generative photo variants** (Vertex AI Imagen / Stability AI) not integrated. CREATOR v0 ships rembg + PIL + ffmpeg variants only.
+- **No live platform integration.** No actual TikTok Shop / Instagram Live / WhatsApp connection. The dashboard chat panel simulates comments. The router + response pipeline is identical to what would feed a real platform integration; the integration adapter itself (TikTok Shop) is on the roadmap, not yet built.
+- **Single-tenant.** One product, one stream, one operator at a time. Multi-product is shipped; multi-stream isolation is on the roadmap.
+- **English by default.** ElevenLabs `language_code="en"` is the default; multi-language path is wired (6 supported today, architecture supports 140+) and is being expanded.
+- **CLOSER agent is not built.** The pitched DM auto-responder is on the roadmap.
+- **Cloud generative photo variants** (Vertex AI Imagen / Stability AI) not integrated. CREATOR ships rembg + PIL + ffmpeg variants only.
 
 Everything else in this doc is shipped and runnable.
 
@@ -81,7 +81,7 @@ We probed Cactus tool-calling on Gemma 4 E4B with our exact `TOOL_SCHEMA` (`back
 
 ## The pre-rendered local answer layer
 
-The `respond_locally` path isn't a fast LLM — it's *no LLM at all*. Per product we pre-render 10–20 MP4s at alpha time (one per Q&A entry) using the same Wav2Lip + ElevenLabs pipeline we use for live escalates.
+The `respond_locally` path isn't a fast LLM — it's *no LLM at all*. Per product we pre-render 10–20 MP4s at onboarding time (one per Q&A entry) using the same Wav2Lip + ElevenLabs pipeline we use for live escalates.
 
 - **Source:** `backend/data/products.json` — per-product `qa_index` with keyword arrays + answer text + URL.
 - **Match:** `backend/agents/router.py:_match_product_field` — best-hit keyword scoring, multi-word keys as substrings, single-word as tokens.

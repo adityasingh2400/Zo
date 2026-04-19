@@ -9,6 +9,12 @@ import { RoutingPanel } from './components/RoutingPanel';
 import { BrainPanel } from './components/BrainPanel';
 import { ProductSelector } from './components/ProductSelector';
 import { CreatorPanel } from './components/CreatorPanel';
+import { StudioSidebar } from './components/StudioSidebar';
+import { MetricsStrip } from './components/MetricsStrip';
+import { TransportControls } from './components/TransportControls';
+import { AvatarRail } from './components/AvatarRail';
+import { PipelineStrip } from './components/PipelineStrip';
+import { DistributionToggles } from './components/DistributionToggles';
 
 export default function App() {
   const {
@@ -23,6 +29,21 @@ export default function App() {
   const [sellInput, setSellInput] = useState('sell this for $49');
   const [dragging, setDragging] = useState(false);
   const [showTelemetry, setShowTelemetry] = useState(false);
+
+  // Control Room mode — Item 2. Flag-gated layout rebuild to match the
+  // empire-mac.jsx mockup. localStorage default is 'off' so everyone who
+  // doesn't opt in gets the existing cinema grid. Flip via the top-right
+  // toggle button (added below).
+  const [controlRoomMode, setControlRoomMode] = useState(() => {
+    return localStorage.getItem('CONTROL_ROOM_MODE') === 'on';
+  });
+  const [sidebarSelection, setSidebarSelection] = useState('live');
+
+  function toggleControlRoom() {
+    const next = !controlRoomMode;
+    localStorage.setItem('CONTROL_ROOM_MODE', next ? 'on' : 'off');
+    setControlRoomMode(next);
+  }
 
   async function uploadFile(file) {
     const formData = new FormData();
@@ -62,8 +83,19 @@ export default function App() {
         </div>
       </header>
 
-      {/* Floating top-right: telemetry button + connection status */}
+      {/* Floating top-right: layout toggle + telemetry button + connection status */}
       <div style={styles.floatingTopRight}>
+        <button
+          type="button"
+          onClick={toggleControlRoom}
+          style={{
+            ...styles.telemetryButton,
+            ...(controlRoomMode ? styles.telemetryButtonActive : {}),
+          }}
+          title="Toggle Control Room layout (mockup-driven)"
+        >
+          {controlRoomMode ? '↩︎ Legacy' : '⚙ Control Room'}
+        </button>
         <button
           type="button"
           onClick={() => setShowTelemetry(true)}
@@ -113,28 +145,79 @@ export default function App() {
         </label>
       </div>
 
-      {/* Cinema Layout: big stage on the left, sidebar on the right */}
-      <div style={styles.cinemaGrid}>
-        <div style={styles.stageCol}>
-          <LiveStage
-            productData={productData}
-            pitchVideoUrl={pitchVideoUrl}
-            responseVideo={responseVideo}
-            pendingComments={pendingComments}
-            liveStage={liveStage}
-            wsRef={wsRef}
+      {controlRoomMode ? (
+        // ── Control Room layout (Item 2, mockup-driven) ─────────────────
+        <div style={styles.controlRoomShell}>
+          <StudioSidebar
+            selectedId={sidebarSelection}
+            onSelect={setSidebarSelection}
           />
+          <main style={styles.controlRoomMain}>
+            <MetricsStrip
+              stage={liveStage}
+              routingStats={routingStats}
+              agentLog={agentLog}
+            />
+            <TransportControls stage={liveStage} />
+            <div style={styles.controlRoomStageRow}>
+              <AvatarRail />
+              <div style={styles.controlRoomStage}>
+                <LiveStage
+                  productData={productData}
+                  pitchVideoUrl={pitchVideoUrl}
+                  responseVideo={responseVideo}
+                  pendingComments={pendingComments}
+                  liveStage={liveStage}
+                  wsRef={wsRef}
+                />
+              </div>
+              <div style={styles.controlRoomOps}>
+                <ProductPanel
+                  productData={productData}
+                  productPhoto={productPhoto}
+                  transcript={transcript}
+                  view3d={view3d}
+                  transcriptExtract={transcriptExtract}
+                  wsRef={wsRef}
+                />
+                <PipelineStrip agentLog={agentLog} />
+                <DistributionToggles />
+              </div>
+            </div>
+            <div style={styles.controlRoomBottomRow}>
+              <ChatPanel
+                onSendComment={sendComment}
+                commentResponse={responseVideo}
+                pendingComments={pendingComments}
+              />
+              <AgentLog log={agentLog} />
+            </div>
+          </main>
         </div>
-        <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
-          <CreatorPanel />
-          <ChatPanel
-            onSendComment={sendComment}
-            commentResponse={responseVideo}
-            pendingComments={pendingComments}
-          />
+      ) : (
+        // ── Legacy cinema grid ─────────────────────────────────────────
+        <div style={styles.cinemaGrid}>
+          <div style={styles.stageCol}>
+            <LiveStage
+              productData={productData}
+              pitchVideoUrl={pitchVideoUrl}
+              responseVideo={responseVideo}
+              pendingComments={pendingComments}
+              liveStage={liveStage}
+              wsRef={wsRef}
+            />
+          </div>
+          <div style={styles.sideCol}>
+            <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
+            <CreatorPanel />
+            <ChatPanel
+              onSendComment={sendComment}
+              commentResponse={responseVideo}
+              pendingComments={pendingComments}
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Telemetry overlay — click "◎ Telemetry" to open */}
       {showTelemetry && (
@@ -233,6 +316,42 @@ const styles = {
     padding: '6px 12px', fontSize: 12, fontWeight: 700,
     letterSpacing: 1, cursor: 'pointer',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  },
+  telemetryButtonActive: {
+    background: '#22c55e', color: '#09090b',
+    borderColor: '#22c55e',
+  },
+  // Control Room layout (Item 2)
+  controlRoomShell: {
+    flex: 1, display: 'flex',
+    minHeight: 0, gap: 0,
+    background: '#fbfbfd',
+    borderRadius: 12, overflow: 'hidden',
+    border: '1px solid #18181b',
+  },
+  controlRoomMain: {
+    flex: 1, display: 'flex', flexDirection: 'column',
+    padding: '14px 16px 16px', gap: 12,
+    minWidth: 0, minHeight: 0,
+    fontFamily: '-apple-system, "SF Pro Text", "Inter", system-ui, sans-serif',
+    color: '#1d1d1f',
+  },
+  controlRoomStageRow: {
+    display: 'grid',
+    gridTemplateColumns: '128px 1fr minmax(0, 360px)',
+    gap: 12, minHeight: 0, flex: 1,
+  },
+  controlRoomStage: {
+    minHeight: 0, minWidth: 0,
+    display: 'flex', alignItems: 'stretch', justifyContent: 'center',
+  },
+  controlRoomOps: {
+    display: 'flex', flexDirection: 'column', gap: 12,
+    minHeight: 0, minWidth: 0, overflowY: 'auto',
+  },
+  controlRoomBottomRow: {
+    display: 'grid', gridTemplateColumns: '1fr 1.5fr',
+    gap: 12, height: 240,
   },
   telemetryBadge: {
     background: '#22c55e', color: '#09090b', borderRadius: 999,

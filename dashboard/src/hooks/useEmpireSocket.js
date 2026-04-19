@@ -206,6 +206,21 @@ export function useEmpireSocket() {
             }]);
           }
           break;
+        case 'force_phase':
+          // TransportControls fired POST /api/director/force_phase. Backend
+          // broadcasts this event with the target phase so every connected
+          // dashboard updates in sync (not just the one that clicked).
+          if (msg.phase && LIVE_STAGES.includes(msg.phase)) {
+            setLiveStage(msg.phase);
+          }
+          break;
+        case 'on_air':
+          // Operator pressed On Air. Currently soft (doesn't gate pipeline)
+          // — Item 5 wires distribution fanout to this flag.
+          if (typeof msg.on === 'boolean') {
+            setStatus(msg.on ? 'live' : 'idle');
+          }
+          break;
         case 'voice_transcript':
           // Fires within ~200ms of push-to-talk release. Drop empty
           // transcripts (no_speech / transcription_failed) — the endpoint

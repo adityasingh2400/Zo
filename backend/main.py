@@ -880,6 +880,62 @@ async def api_comment(text: str = Form(...)):
     return {"status": "processing"}
 
 
+# ── Director transport — used by the dashboard's Control Room layout ──────
+#
+# POST /api/director/force_phase — manually advance the stage machine.
+#   Body (form): phase = INTRO | BRIDGE | PITCH | LIVE
+# POST /api/director/on_air — pause/resume broadcasts.
+#   Body (form): on = true | false
+#
+# These are operator affordances: during rehearsal or between takes we want
+# to drop out of LIVE without tearing down the backend. For v1, on_air is a
+# soft flag that the dashboard reads but doesn't gate the response pipeline —
+# Item 5 (Hands agent) will tighten this when real distribution fanout
+# can be paused.
+
+_PHASE_TO_STATUS = {
+    "INTRO": "idle",
+    "BRIDGE": "creating",  # useEmpireSocket derives 'BRIDGE' only from
+                           # comment_response_video; we broadcast an explicit
+                           # force_phase event so the dashboard lands correctly.
+    "PITCH": "selling",
+    "LIVE": "live",
+}
+pipeline_state["on_air"] = True  # default ON so live flow works without toggling
+
+
+@app.post("/api/director/force_phase")
+async def api_director_force_phase(phase: str = Form(...)):
+    """Manually advance the stage machine. Operator use."""
+    p = phase.upper().strip()
+    if p not in _PHASE_TO_STATUS:
+        raise HTTPException(400, f"unknown phase {phase!r}, expected one of "
+                                 f"{list(_PHASE_TO_STATUS)}")
+    new_status = _PHASE_TO_STATUS[p]
+    pipeline_state["status"] = new_status
+    log_event("DIRECTOR", f"Phase forced → {p}")
+    await broadcast_to_dashboards({
+        "type": "force_phase",
+        "phase": p,
+        "status": new_status,
+    })
+    # Also broadcast a status event so the dashboard's useEffect-driven
+    # liveStage derivation updates even without the explicit force_phase
+    # handler (backward-compat; handler ships in Item 2).
+    await broadcast_to_dashboards({"type": "status", "status": new_status})
+    return {"status": "ok", "phase": p, "backend_status": new_status}
+
+
+@app.post("/api/director/on_air")
+async def api_director_on_air(on: str = Form(...)):
+    """Toggle the on-air flag. Soft v1 — doesn't gate the pipeline yet."""
+    flag = on.strip().lower() in ("true", "1", "yes", "on")
+    pipeline_state["on_air"] = flag
+    log_event("DIRECTOR", f"On Air → {flag}")
+    await broadcast_to_dashboards({"type": "on_air", "on": flag})
+    return {"status": "ok", "on_air": flag}
+
+
 @app.get("/api/state")
 async def api_state():
     catalog = pipeline_state.get("products_catalog") or {}

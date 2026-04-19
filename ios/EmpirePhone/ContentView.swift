@@ -4,10 +4,13 @@
 //    it takes what the user says (what the product is exactly)"
 //
 // Launch logic:
-//   1. Fetch /api/state from the Mac backend to see if a product is loaded.
-//   2. If no product_data yet: open SellerCaptureView full-screen (film flow).
-//   3. If product_data exists: show StreamView directly (pitched state).
-//   4. After SellerCaptureView.onComplete: flip to StreamView and refresh.
+//   1. Cold launch → always open SellerCaptureView full-screen.
+//   2. After a successful sell (SellerCaptureView onComplete with a
+//      non-nil requestID), phase flips to .hasProduct → StreamView.
+//   3. StreamView's refilm button re-opens the capture sheet.
+//   4. Backend state is intentionally NOT probed — products.json
+//      auto-seeds a default on Mac boot and we don't want that to
+//      override the user's intent to film a new product every open.
 //
 // The seller's narration becomes voice_text on the /api/sell-video upload;
 // the Mac's run_sell_pipeline routes through analyze_and_script_gemma first
@@ -94,37 +97,17 @@ struct ContentView: View {
         await resolveLaunchPhase()
     }
 
-    /// Ask the Mac if there's a product loaded. If yes → StreamView.
-    /// If no (or if the host isn't reachable) → camera path.
-    /// This is a plain HTTP call so it works regardless of WS state.
+    /// Camera-first launch: always land on the capture flow on cold start
+    /// or after a host change. Phase moves to .hasProduct only after a
+    /// successful sell in the current session (SellerCaptureView's
+    /// onComplete sets it). We deliberately don't probe /api/state —
+    /// backend-seeded defaults (e.g. the wallet auto-loaded from
+    /// products.json at boot) shouldn't override the user's intent to
+    /// film a new product every time they open the app.
     private func resolveLaunchPhase() async {
-        guard let base = GemmaClient.backendBaseURL else {
-            await MainActor.run {
-                phase = .needsProduct
-                showingCapture = true
-            }
-            return
-        }
-        let url = base.appendingPathComponent("api/state")
-        do {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 3
-            let (data, _) = try await URLSession.shared.data(for: req)
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let hasProduct = (obj?["product_data"] as? [String: Any])?["name"] != nil
-            await MainActor.run {
-                if hasProduct {
-                    phase = .hasProduct
-                } else {
-                    phase = .needsProduct
-                    showingCapture = true
-                }
-            }
-        } catch {
-            await MainActor.run {
-                phase = .needsProduct
-                showingCapture = true
-            }
+        await MainActor.run {
+            phase = .needsProduct
+            showingCapture = true
         }
     }
 

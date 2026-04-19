@@ -98,6 +98,17 @@ export default function StageView() {
     }
   }
 
+  // Auto-clear the INTRO FIRED pulse after 1.4s. The previous version did
+  // `Date.now() - goLiveAt < 1400` in render, which only worked while
+  // something else triggered re-renders during the window — so the green
+  // pulse could stick on screen indefinitely until the next state change
+  // unrelated to it. setTimeout + setState guarantees the disappear.
+  useEffect(() => {
+    if (!goLiveAt) return;
+    const id = setTimeout(() => setGoLiveAt(null), 1400);
+    return () => clearTimeout(id);
+  }, [goLiveAt]);
+
   async function toggleFullscreen() {
     try {
       if (document.fullscreenElement) {
@@ -201,9 +212,9 @@ export default function StageView() {
         </div>
       )}
 
-      {/* Brief Go Live ping so the operator gets visual confirmation the
-          intro clip request hit the backend. Disappears after 1.4s. */}
-      {goLiveAt && Date.now() - goLiveAt < 1400 && (
+      {/* Brief Go Live ping — visible while goLiveAt is set; cleared by
+          the setTimeout in the useEffect above (1.4s after press). */}
+      {goLiveAt && (
         <div style={styles.goLivePing}>
           <span style={styles.goLivePingDot} />
           INTRO FIRED

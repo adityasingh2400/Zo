@@ -77,8 +77,11 @@ export function useAvatarStream({ wsRef } = {}) {
       // Audio-first metadata. `muted` tells LiveStage to set incomingEl.muted=true
       // and skip the volume ramp (audio is coming from a separate <audio>
       // element). `expectedDurationMs` enables the duration handshake on
-      // canplaythrough — if the video duration drifts >150ms from this,
+      // canplaythrough — if the video duration drifts >250ms from this,
       // LiveStage rejects the video and lets the standalone audio play alone.
+      // (Bumped from 150ms in commit b56324a — both audio and video derive
+      // from the same audio_bytes now, so genuine drift is 30-80ms; 250ms
+      // gives ~3x headroom while still catching real bugs at 1000ms+.)
       muted: !!msg.muted,
       expectedDurationMs: msg.expected_duration_ms ?? null,
     };

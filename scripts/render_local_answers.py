@@ -38,9 +38,8 @@ load_dotenv(ROOT / ".env")
 
 from agents.seller import (  # noqa: E402
     text_to_speech,
-    render_comment_response_wav2lip,
+    render_pitch_latentsync,
     trim_audio_silence,
-    pad_wav2lip_video_to_audio,
 )
 from config import POD_SPEAKING_1080P  # noqa: E402
 
@@ -55,25 +54,31 @@ def url_to_path(url: str) -> Path:
 
 
 async def render_one(slug: str, text: str, out_path: Path, substrate: str) -> tuple[float, int]:
-    """TTS → trim → Wav2Lip → pad → write. Returns (elapsed_s, bytes).
+    """TTS → trim → LatentSync → write. Returns (elapsed_s, bytes).
 
-    Mirrors the alignment pipeline in scripts/render_generic_clips.py so
-    every per-product Q&A clip gets the same drift fix the bridges got:
+    Switched from Wav2Lip to LatentSync (Apr 2026) per quality directive:
+    Wav2Lip's 96px-patch + paste-back architecture produces visible mouth
+    and face artifacts even with GFPGAN at maximum settings (weight=0.9,
+    mouth-only, post-sharpen). LatentSync's latent-diffusion pipeline
+    produces clean lip-sync with no patch boundaries or mouth-region
+    glitches. Trade-off is render time: ~6-8 minutes per 10-second clip
+    on the 5090 vs ~5-10 seconds for Wav2Lip. Acceptable here because
+    these are PRE-RENDERED ONCE per qa_index entry, then played from
+    disk at runtime via the respond_locally path with sub-second latency.
 
-      - trim_audio_silence (BEFORE wav2lip): crops head/tail silence from
-        the TTS output so wav2lip's mouth predictor only runs on speech
-        frames. Avoids the random mouth-flap on silent edges.
+    The trim step still runs (silence removal at head/tail) — same
+    rationale as before, applies regardless of lip-sync provider.
 
-      - pad_wav2lip_video_to_audio (AFTER wav2lip): re-mux locally with
-        the FULL trimmed audio + video padded by holding the last frame
-        for the structural ~120-180ms wav2lip mel-chunking shortfall.
-        Without this, the pod's `-shortest` ffmpeg mux truncates the
-        audio tail (the trailing word-end / breath gets cut).
+    No more pad_wav2lip_video_to_audio call: LatentSync renders against
+    the full audio length natively (no mel-chunking shortfall) so the
+    audio + video lengths match within a few ms straight out of the
+    server. Drift typical is <30ms.
 
-    These clips are played from disk at runtime via the respond_locally
-    path with their muxed audio. Drift here = audience-perceived drift,
-    full stop. With the fix: ±50ms typical (well under the dashboard's
-    250ms handshake and well below human-perceptible lipsync mismatch)."""
+    Tune render speed/quality via inference_steps:
+      10 (default) — ~6-8 min/10s, top quality
+      6           — ~4 min/10s, slightly softer mouth
+      4           — ~3 min/10s, noticeably softer (don't go below this)
+    """
     t0 = time.perf_counter()
     audio_raw = await text_to_speech(text)
     if not audio_raw:
@@ -86,29 +91,25 @@ async def render_one(slug: str, text: str, out_path: Path, substrate: str) -> tu
     trim_pct = (1 - len(audio) / len(audio_raw)) * 100 if audio_raw else 0
 
     t1 = time.perf_counter()
-    mp4_raw, _headers = await render_comment_response_wav2lip(
+    mp4_raw, _headers = await render_pitch_latentsync(
         audio_bytes=audio,
         source_path_on_pod=substrate,
+        inference_steps=10,
         out_height=1920,
     )
     t_lip = time.perf_counter() - t1
 
-    t_pad_start = time.perf_counter()
-    mp4, pad_diag = pad_wav2lip_video_to_audio(mp4_raw, audio)
-    t_pad = time.perf_counter() - t_pad_start
+    # No pad step: LatentSync renders against the full audio length
+    # natively (no Wav2Lip mel-chunking shortfall to compensate for).
+    mp4 = mp4_raw
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(mp4)
     total = time.perf_counter() - t0
-    drift_after = (
-        pad_diag.get("audio_ms", 0) - pad_diag.get("video_ms_after", 0)
-        if pad_diag.get("padded") else None
-    )
-    drift_str = f" drift={drift_after:+d}ms" if drift_after is not None else ""
     print(
         f"  ✓ {slug}: tts={t_tts:.1f}s trim={t_trim:.2f}s({trim_pct:.0f}%) "
-        f"lip={t_lip:.1f}s pad={t_pad:.2f}s{drift_str} "
-        f"total={total:.1f}s size={len(mp4) / 1024:.0f}KB → {out_path.relative_to(ROOT)}",
+        f"lip={t_lip:.1f}s total={total:.1f}s size={len(mp4) / 1024:.0f}KB "
+        f"→ {out_path.relative_to(ROOT)}",
         flush=True,
     )
     return total, len(mp4)

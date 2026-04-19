@@ -42,46 +42,57 @@ def _flag(name: str, default: str = "1") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Audio-first playback: broadcast a `comment_response_audio` event the moment
-# TTS finishes, kick Wav2Lip render in the background, dashboard plays audio
-# immediately and crossfades video underneath when ready.
+# ── Feature flags — actual gating status as of Apr 2026 ─────────────────────
+# Each flag's status (FUNCTIONAL / COSMETIC) reflects whether toggling it to
+# "0" actually changes runtime behavior in the current code paths. Cosmetic
+# flags are kept for forward-compat / observability and may be removed if
+# they're still cosmetic by the next sweep.
+
+# COSMETIC. The cloud-escalate path always uses audio-first dispatch
+# (standalone <audio> + KaraokeCaptions over a speaking-pose loop on Tier 1)
+# regardless of this flag. The "no-Wav2Lip" decision is hard-coded in
+# api_respond_to_comment for pristine quality. To restore a pre-Wav2Lip
+# kill-switch fallback path, gate the new flow on this flag and fall back
+# to a synchronous render in the else branch — currently no else branch
+# exists. Logged at boot for visibility.
 USE_AUDIO_FIRST = _flag("USE_AUDIO_FIRST", "1")
 
-# KaraokeCaptions component on the stage — word-by-word reveal synced to the
-# playing <audio> element. Synthetic word timings (whitespace-split, evenly
-# distributed across audio duration) since we're not on Cartesia today.
+# COSMETIC. KaraokeCaptions always renders when audioPlaying is set on the
+# dashboard (it's the standard response visual now). To make this a real
+# kill-switch, gate the <KaraokeCaptions /> mount in LiveStage.jsx behind
+# the flag.
 USE_KARAOKE = _flag("USE_KARAOKE", "1")
 
-# Veo 30s pitch playback path — pre-rendered "pitching pose" clip + TTS
-# audio overlay + karaoke. Shaves the opening pitch from ~8-15s to ~600ms.
+# FUNCTIONAL. Read in run_sell_pipeline (main.py): when ON, the sell
+# pipeline uses _run_audio_first_pitch (cached pitch MP3 + word timings +
+# muted Veo speaking-pose loop). When OFF, falls back to _run_wav2lip_pitch
+# (synchronous Wav2Lip render of the script audio against the active
+# substrate). 8-15s render vs ~600ms audio dispatch.
 USE_PITCH_VEO = _flag("USE_PITCH_VEO", "1")
 
-# Listening-attentive backchannel pose on mic press. Visual only (no "mhm"
-# audio per REVISIONS §8 — audio overlap risk during user speech isn't worth
-# the win).
+# FUNCTIONAL. Read in dashboard_ws (main.py) when handling mic_pressed:
+# when ON, fires director.play_listening_attentive() to crossfade in the
+# attentive-listening pose on Tier 1 within ~50ms of the mic press.
 USE_BACKCHANNEL = _flag("USE_BACKCHANNEL", "1")
 
-# Speculative bridge clip immediately after voice_transcript lands, before
-# the router decides. Fills the gap between transcript and response.
+# FUNCTIONAL. Read in api_voice_comment (main.py) after the transcript
+# broadcast: when ON, fires _fire_speculative_bridge() in parallel with
+# run_routed_comment to play a "neutral" bridge clip on Tier 1 while
+# classify+router decide. Mostly redundant now that reading_chat fires
+# instantly inside run_routed_comment — leaving the flag wired so it can
+# be A/B tested.
 USE_SPECULATIVE_BRIDGE = _flag("USE_SPECULATIVE_BRIDGE", "1")
 
-# Lip-sync provider hook. Wav2Lip is the only path today; MuseTalk was cut
-# post-review (REVISIONS §6). Kept as a forward-compat env so post-submission
-# we can wire a second provider without touching call sites.
+# COSMETIC. No call sites branch on this value today. Both Wav2Lip (legacy
+# pitch path via _run_wav2lip_pitch) and LatentSync (pre-render scripts)
+# are addressed by their own dedicated render functions in agents/seller.py.
+# Kept as a forward-compat env so post-submission we can wire a second
+# provider without touching call sites.
 LIPSYNC_PROVIDER = os.getenv("LIPSYNC_PROVIDER", "wav2lip").strip().lower()
 
-# Pad live wav2lip output so the video duration matches the audio. Wav2Lip's
-# mel-chunking always produces a video ~120-180ms shorter than the audio
-# (MEL_STEP=16 windowing artifact, structural — same drift on flash, v3,
-# every length, every fps). The pod's `-shortest` ffmpeg mux then truncates
-# the audio tail and the dashboard's 150ms duration handshake (LiveStage.jsx)
-# either skips the video or shows a silent video tail after the audio cuts.
-#
-# When ON (default): re-mux the wav2lip output locally with the FULL audio +
-# video padded by holding the last frame for the gap. Drift drops to ±20ms;
-# audio plays in full; handshake never fires. Cost: +300-500ms ffmpeg re-mux
-# per live escalate (on a 5-7s warm budget).
-#
-# When OFF: original behavior. ~140ms drift, occasional handshake skip on
-# v3 audio. Set USE_LIVE_PAD=0 if pad is interfering with a live demo.
+# COSMETIC. _render_response_video and _render_and_broadcast_video (the
+# helpers that read this flag) were deleted when api_respond_to_comment
+# switched to no-Wav2Lip. The flag remains to avoid breaking .env files in
+# the wild. _run_wav2lip_pitch (the only remaining Wav2Lip caller) calls
+# render_comment_response_wav2lip directly without padding.
 USE_LIVE_PAD = _flag("USE_LIVE_PAD", "1")

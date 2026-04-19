@@ -10,9 +10,9 @@ import { StartDemoOverlay } from './components/StartDemoOverlay';
 
 export default function App() {
   const {
-    connected, status, productData, productPhoto,
+    connected, productData, productPhoto,
     agentLog, transcript, sendComment,
-    pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
+    pitchVideoUrl, responseVideo, liveStage, pendingComments,
     view3d, transcriptExtract, voiceTranscript,
     routingDecisions, routingStats,
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,

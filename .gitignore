@@ -19,4 +19,8 @@ phase0/renders_e2e/
 # Per-request outputs in backend/renders/ are derived from substrates + audio.
 backend/renders/
 backend/local_answers/
+# Per-request audio-first dispatches (TTS mp3s for the dashboard to play
+# immediately while Wav2Lip catches up). Regenerated on every comment +
+# every pitch (pitches reuse this same dir with a `pitch_dispatch_` prefix).
+backend/response_audio/
 *.log

@@ -18,6 +18,22 @@ export function useEmpireSocket() {
   const [transcript, setTranscript] = useState(null);
   const [pitchVideoUrl, setPitchVideoUrl] = useState(null);
   const [responseVideo, setResponseVideo] = useState(null); // {url, comment, response, total_ms, ...}
+  // Audio-first dispatch payload: {url, comment, response, word_timings,
+  // expected_duration_ms, intent, ts, seq}. seq monotonically increases so
+  // LiveStage can swap the playing <audio> when a fresh dispatch arrives
+  // mid-playback (e.g. operator fires a new comment while one is playing).
+  // Cleared by the matching comment_response_video or video_failed event so
+  // KaraokeCaptions stop tracking once the audio source is exhausted.
+  const [audioResponse, setAudioResponse] = useState(null);
+  // Pitch dispatch — fires when run_sell_pipeline → _run_audio_first_pitch
+  // → Director.dispatch_audio_first_pitch broadcasts pitch_audio. Driven
+  // exclusively by the video-upload pipeline (chat doesn't trigger pitches).
+  // Same shape as audioResponse but tagged so LiveStage knows to mount the
+  // TranslationChip overlay's pitch variant (the audio is the freshly-
+  // generated ~30s pitch, not a live response). Cleared after the audio
+  // ends or pitch_audio_end fires.
+  const [pitchAudio, setPitchAudio] = useState(null);
+  const audioSeqRef = useRef(0);
   const [liveStage, setLiveStage] = useState('INTRO');
   const [pendingComments, setPendingComments] = useState([]); // [{id, text, t0}]
   const [view3d, setView3d] = useState(null); // {kind, frames|url, ms, source}
@@ -103,6 +119,28 @@ export function useEmpireSocket() {
           setCommentResponse(msg);
           if (msg.audio) setLatestAudio({ audio: msg.audio, format: msg.format });
           break;
+        case 'comment_response_audio':
+          // Audio-first dispatch — TTS bytes are saved + ready to play. The
+          // visible video crossfades in later (comment_response_video below)
+          // with audio_already_playing=true so the dashboard mutes that
+          // video element and lets the standalone <audio> finish the audio
+          // track. KaraokeCaptions reads word_timings to highlight word-by-word.
+          if (msg.url) {
+            audioSeqRef.current += 1;
+            setAudioResponse({
+              ...msg,
+              seq: audioSeqRef.current,
+              receivedAt: Date.now(),
+            });
+            // We're in the middle of responding — pill goes responding so the
+            // LIVE indicator transitions correctly when video lands.
+            setVoiceStateSafe('responding');
+            // Drop the pending chip immediately on audio arrival so the
+            // floating "Reading..." overlay doesn't keep showing while we
+            // hear the answer (was previously cleared by the video event).
+            setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          }
+          break;
         case 'comment_response_video':
           setResponseVideo(msg);
           setCommentResponse(msg);
@@ -112,6 +150,38 @@ export function useEmpireSocket() {
           // Voice flow lands here if this response was triggered by voice.
           // Clearing voiceState lets the LIVE pill take over visually.
           setVoiceStateSafe(null);
+          // Audio-first: the audio session is owned by the audio element, but
+          // the comment_response_video event is the canonical "render done"
+          // signal that the audience-facing video is on stage. Don't clear
+          // audioResponse here — KaraokeCaptions need to keep tracking until
+          // audio actually ends (handled inside LiveStage on audio.ended).
+          break;
+        case 'comment_response_video_failed':
+          // Audio-first background Wav2Lip failed. Audio still plays out via
+          // the existing <audio> element; we just won't ever crossfade the
+          // visual layer. Clear pending chip so it doesn't hang.
+          setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          setVoiceStateSafe(null);
+          break;
+        case 'pitch_audio':
+          // 30s pre-rendered Veo pitch — audio + word_timings + chip should
+          // all start at once. Stored separately from audioResponse so a live
+          // comment that arrives mid-pitch doesn't preempt the pitch by
+          // overwriting the audio source.
+          if (msg.url) {
+            audioSeqRef.current += 1;
+            setPitchAudio({
+              ...msg,
+              seq: audioSeqRef.current,
+              receivedAt: Date.now(),
+            });
+            setLiveStage('PITCH');
+          }
+          break;
+        case 'pitch_audio_end':
+          // Pitch ended naturally (audio.ended on the dashboard) — backend
+          // can also broadcast this proactively to clear the chip if needed.
+          setPitchAudio(null);
           break;
         case 'voice_state':
           // Director-driven explicit voice state. Authoritative.
@@ -182,23 +252,41 @@ export function useEmpireSocket() {
           }
           break;
         case 'audience_comment':
-          // QR-submitted comment from a phone in the room. The backend has
-          // already (a) broadcast this informational event and (b) handed
-          // the text to run_routed_comment so the standard router + cost
-          // ticker + comment_response_video chain fires identically to a
-          // typed comment.
+          // QR-submitted comment from a phone in the room (username from
+          // the form), OR an operator-typed test comment echoed back from
+          // the simulate_comment WS handler (username='operator'). The
+          // backend has already (a) broadcast this informational event and
+          // (b) handed the text to run_routed_comment so the standard
+          // router + cost ticker + comment_response_video chain fires
+          // identically to a typed comment.
           //
-          // Surface it as pendingComments so the home dashboard's ChatPanel
+          // Surface as pendingComments so the home dashboard's ChatPanel
           // shows the same "AI Seller (rendering…) responding to '<text>'"
-          // placeholder that typed comments produce — gives the operator
-          // visibility into audience activity even when not on /stage.
-          // Cleared by the matching comment_response_video (same shape).
+          // placeholder that typed comments produce, AND so the /stage
+          // TikTokShopOverlay chat rail renders a bubble (single-source
+          // path — see TikTokShopOverlay.jsx). Cleared by the matching
+          // comment_response_video (filter by text).
+          //
+          // Dedup: when the operator types in ChatPanel, sendComment
+          // optimistically pushes pendingComments (so the pending pill
+          // appears instantly) AND fires simulate_comment over the WS.
+          // The backend echoes it back as audience_comment with the same
+          // client_id. We swallow the echo when its client_id matches a
+          // local optimistic pending entry. This is targeted on client_id
+          // (not text), so two different audience phones submitting the
+          // same text within a few seconds each get their own bubble —
+          // they have no client_id and hit the normal append path.
           if (msg.text) {
             const audId = `aud_${msg.ts || Date.now()}`;
-            setPendingComments(prev => [...prev, {
-              id: audId, text: msg.text, t0: Date.now(),
-              source: 'audience', username: msg.username || 'guest',
-            }]);
+            setPendingComments(prev => {
+              if (msg.client_id && prev.some(p => p.id === msg.client_id)) {
+                return prev;
+              }
+              return [...prev, {
+                id: audId, text: msg.text, t0: Date.now(),
+                source: 'audience', username: msg.username || 'guest',
+              }];
+            });
           }
           break;
         case 'voice_transcript':
@@ -243,9 +331,17 @@ export function useEmpireSocket() {
 
   const sendComment = useCallback((text) => {
     if (!text?.trim()) return;
-    const id = `c_${Date.now()}`;
+    const id = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     setPendingComments(prev => [...prev, { id, text: text.trim(), t0: Date.now() }]);
-    wsRef.current?.send(JSON.stringify({ type: 'simulate_comment', text: text.trim() }));
+    // client_id round-trips through the backend so the audience_comment
+    // echo handler can dedup THIS optimistic entry without false-positiving
+    // on a real audience phone that happened to type the same text within
+    // a few seconds. See the audience_comment case below for the dedup.
+    wsRef.current?.send(JSON.stringify({
+      type: 'simulate_comment',
+      text: text.trim(),
+      client_id: id,
+    }));
   }, []);
 
   const sendSell = useCallback((voiceText) => {
@@ -260,6 +356,8 @@ export function useEmpireSocket() {
     // Voice + routing surface
     voiceState, setVoiceState: setVoiceStateSafe,
     voiceTranscript, routingDecision, routingDecisions, routingStats,
+    // Audio-first surface
+    audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     sendComment, sendSell,
     wsRef, // exposed so useAvatarStream can attach an extra message listener
   };

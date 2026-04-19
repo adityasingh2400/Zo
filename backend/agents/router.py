@@ -107,6 +107,11 @@ TOOL_SCHEMA: list[dict[str, Any]] = [
         },
     },
 ]
+# Note: there is intentionally no `pitch_product` tool here. The 30s pitch
+# fires from the video-upload pipeline (run_sell_pipeline → _run_audio_first_
+# pitch → Director.dispatch_audio_first_pitch) where the script is
+# generated dynamically from the seller's recorded video transcript +
+# Claude vision. Comments are audience reactions only — never pitches.
 
 
 # ── Product index matcher ────────────────────────────────────────────────────
@@ -196,7 +201,13 @@ _SPAM_CUES = ("http://", "https://", ".com/", ".net/", "www.",
 def _rule_based_decide(comment: str, classify: dict, product: dict | None) -> dict:
     """Decision logic when Cactus FunctionGemma isn't available (Hour 4-5
     default; Hour 6-7 promotes FunctionGemma to primary and keeps this as
-    the fallback). Returns {tool, args, reason}."""
+    the fallback). Returns {tool, args, reason}.
+
+    Note: pitch detection used to live here for chat-typed "sell this"
+    triggers — removed entirely. Pitches fire from the video-upload
+    pipeline (run_sell_pipeline) where the script is generated dynamically
+    from the seller's recorded transcript. Comments are audience reactions
+    only, never pitch commands."""
     t = (classify or {}).get("type", "question")
     c_lower = (comment or "").lower()
     c_tokens = _tokens(comment)

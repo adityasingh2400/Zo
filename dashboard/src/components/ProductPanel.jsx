@@ -3,7 +3,15 @@ import { Spin3D } from './Spin3D';
 
 // Subscribe to voice_state events directly so the Spin3D rim light + speed
 // react in lockstep with the voice pipeline, without prop-drilling through App.
-function useSpin3DVoiceState({ wsRef }) {
+//
+// Dep includes `connected`, not just `wsRef`. wsRef is a stable ref object
+// whose identity never changes, and useEmpireSocket assigns wsRef.current
+// inside its OWN useEffect — which fires AFTER child effects (effects run
+// bottom-up). On first mount this effect would see wsRef.current=null,
+// bail, and never re-trigger; the Spin3D rim light would silently never
+// react to voice events. `connected` flips false→true via ws.onopen so
+// the effect re-runs once the socket is live.
+function useSpin3DVoiceState({ wsRef, connected }) {
   const [state, setState] = useState('idle');
   const clearTimerRef = useRef(null);
   useEffect(() => {
@@ -40,12 +48,12 @@ function useSpin3DVoiceState({ wsRef }) {
       ws.removeEventListener('message', onMessage);
       if (clearTimerRef.current) clearTimeout(clearTimerRef.current);
     };
-  }, [wsRef]);
+  }, [wsRef, connected]);
   return state;
 }
 
-export function ProductPanel({ productData, productPhoto, transcript, view3d, transcriptExtract, wsRef }) {
-  const spinState = useSpin3DVoiceState({ wsRef });
+export function ProductPanel({ productData, productPhoto, transcript, view3d, transcriptExtract, wsRef, connected }) {
+  const spinState = useSpin3DVoiceState({ wsRef, connected });
   if (!productData && !productPhoto && !view3d && !transcriptExtract) {
     return (
       <div style={styles.container}>

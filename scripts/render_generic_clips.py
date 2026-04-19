@@ -34,7 +34,9 @@ import argparse
 import asyncio
 import hashlib
 import json
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -47,12 +49,27 @@ sys.path.insert(0, str(BACKEND))
 from dotenv import load_dotenv  # type: ignore
 load_dotenv(ROOT / ".env")
 
-from agents.seller import text_to_speech, render_comment_response_wav2lip  # noqa: E402
+from agents.seller import (  # noqa: E402
+    text_to_speech,
+    render_comment_response_wav2lip,
+    trim_audio_silence,
+    pad_wav2lip_video_to_audio,
+)
 from agents.bridge_clips import BRIDGE_SCRIPTS  # noqa: E402
 from config import POD_SPEAKING_1080P  # noqa: E402
 
 OUT_DIR = BACKEND / "local_answers" / "_generic"
 MANIFEST_PATH = OUT_DIR / "manifest.json"
+
+
+# Local thin wrapper that adapts the new (bytes, diag) return shape from
+# pad_wav2lip_video_to_audio() back to the just-bytes contract render_one
+# expects. The diag dict from seller.py is dropped here because the bridge
+# render loop already prints its own per-clip stats; for the live path in
+# main.py we DO consume the diag dict via trace.phase("video_padded", ...).
+def pad_video_to_audio(mp4_bytes: bytes, audio_bytes: bytes) -> bytes:
+    out, _diag = pad_wav2lip_video_to_audio(mp4_bytes, audio_bytes)
+    return out
 
 
 def _slug(text: str) -> str:
@@ -79,28 +96,64 @@ def save_manifest(manifest: dict[str, list[dict]]) -> None:
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
 
-async def render_one(label: str, text: str, out_path: Path, substrate: str) -> tuple[float, int]:
-    """TTS → Wav2Lip → write. Returns (elapsed_s, bytes). Raises on failure
-    so the caller can record + continue with the next clip."""
+async def render_one(
+    label: str, text: str, out_path: Path, substrate: str,
+    *, model_id: str = "eleven_flash_v2_5",
+) -> tuple[float, int]:
+    """TTS → trim → Wav2Lip → pad → write. Returns (elapsed_s, bytes).
+    Raises on failure so the caller can record + continue with the next clip.
+
+    `model_id` defaults to eleven_flash_v2_5 to match the avatar voice on
+    the rest of the audio surfaces (pitch + Q&A). v3 was trialed and
+    sounded technically more expressive but the timbre drift made the
+    bridges feel like a different person — see BRIDGE_SCRIPTS docstring
+    in backend/agents/bridge_clips.py for the full reasoning.
+
+    Two post-processing steps wrap the wav2lip call (apply on both flash
+    and v3 paths):
+      1. trim_audio_silence BEFORE wav2lip — crops head/tail silence so
+         wav2lip's mouth predictor only runs on speech frames. Helps on
+         flash too (~50ms head, ~100ms tail typical) though less than v3.
+      2. pad_video_to_audio AFTER wav2lip — wav2lip's mel-chunking always
+         produces a video ~120-150ms shorter than the audio (structural,
+         not model-specific). The server's `-shortest` mux cuts the audio
+         tail; we re-mux locally with the FULL trimmed audio + video
+         padded by holding the last frame. Drift drops from ~140ms to
+         ±20ms regardless of TTS model."""
     t0 = time.perf_counter()
-    audio = await text_to_speech(text)
-    if not audio:
+    audio_raw = await text_to_speech(text, model_id=model_id)
+    if not audio_raw:
         raise RuntimeError("TTS returned empty audio (ElevenLabs not configured?)")
     t_tts = time.perf_counter() - t0
 
+    # Trim head/tail silence from the v3 audio before sending to wav2lip.
+    # Synchronous + fast (~80-150ms wall via ffmpeg) so we just call inline.
+    t_trim_start = time.perf_counter()
+    audio = trim_audio_silence(audio_raw)
+    t_trim = time.perf_counter() - t_trim_start
+    trim_pct = (1 - len(audio) / len(audio_raw)) * 100 if audio_raw else 0
+
     t1 = time.perf_counter()
-    mp4, _headers = await render_comment_response_wav2lip(
+    mp4_raw, _headers = await render_comment_response_wav2lip(
         audio_bytes=audio,
         source_path_on_pod=substrate,
         out_height=1920,
     )
     t_lip = time.perf_counter() - t1
 
+    # Pad video so durations align within ±20ms. Local ffmpeg re-mux
+    # using the trimmed audio (not the wav2lip-cut version inside mp4_raw).
+    t_pad_start = time.perf_counter()
+    mp4 = pad_video_to_audio(mp4_raw, audio)
+    t_pad = time.perf_counter() - t_pad_start
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(mp4)
     total = time.perf_counter() - t0
     print(
-        f"  ✓ {label}/{out_path.stem}: tts={t_tts:.1f}s lip={t_lip:.1f}s "
+        f"  ✓ {label}/{out_path.stem} [{model_id}]: "
+        f"tts={t_tts:.1f}s trim={t_trim:.2f}s({trim_pct:.0f}%) "
+        f"lip={t_lip:.1f}s pad={t_pad:.2f}s "
         f"total={total:.1f}s size={len(mp4) / 1024:.0f}KB",
         flush=True,
     )
@@ -120,7 +173,36 @@ async def main() -> None:
         default=POD_SPEAKING_1080P,
         help="pod-side path to source speaking video",
     )
+    ap.add_argument(
+        "--model",
+        default="eleven_flash_v2_5",
+        help="ElevenLabs model id. Default eleven_flash_v2_5 keeps bridges "
+             "voice-matched to the rest of the avatar audio. Pass eleven_v3 "
+             "(and re-add audio tags to BRIDGE_SCRIPTS) to test the more-"
+             "expressive but voice-drifting path.",
+    )
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="wipe existing _generic dir + manifest before rendering. "
+             "Use after BRIDGE_SCRIPTS text changes (sha256 slugs change → "
+             "old MP4s become orphans the runtime picker still sees).",
+    )
     args = ap.parse_args()
+
+    # --reset: clear stale clips/manifest. Critical when BRIDGE_SCRIPTS
+    # text changes — slugs are sha256-of-text, so any edit produces new
+    # filenames and leaves the old ones behind. Without --reset, the
+    # runtime random.choice() picker would mix new (tagged) clips with
+    # stale (untagged) ones and the demo voice would feel inconsistent.
+    if args.reset and OUT_DIR.exists():
+        import shutil as _shutil
+        for child in OUT_DIR.iterdir():
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                _shutil.rmtree(child)
+        print(f"[reset] cleared {OUT_DIR.relative_to(ROOT)}/")
 
     only_set = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
 
@@ -152,13 +234,14 @@ async def main() -> None:
         return
 
     print(f"Rendering {len(jobs)} generic clips via substrate={args.substrate}")
-    print(f"Output: {OUT_DIR.relative_to(ROOT)}/")
+    print(f"  model={args.model}  output={OUT_DIR.relative_to(ROOT)}/")
     total_t = 0.0
     total_bytes = 0
     failures: list[tuple[str, str, str]] = []
     for label, text, out_path in jobs:
         try:
-            t, n = await render_one(label, text, out_path, args.substrate)
+            t, n = await render_one(label, text, out_path, args.substrate,
+                                    model_id=args.model)
             total_t += t
             total_bytes += n
             # Add to manifest under its label, dedup by file name so reruns

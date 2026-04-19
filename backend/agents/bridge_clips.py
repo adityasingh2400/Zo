@@ -59,6 +59,24 @@ GENERIC_MANIFEST_PATH = GENERIC_DIR / "manifest.json"
 # Each entry: (label, text). Labels match the Gemma classifier output:
 # "question" | "compliment" | "objection" | "neutral".
 # Keep utterances 1.5-3s long — they buy us time, not full responses.
+#
+# Voice + tagging rationale (Apr 2026, after v3 trial):
+#   We tried eleven_v3 with audio tags ([curious], [warmly], [excited],
+#   etc.) on these bridges and the per-clip expressiveness was technically
+#   better — the model honors the directives and the prosody is more
+#   varied. BUT the timbre and cadence v3 produces with our voice ID
+#   drifts noticeably from the avatar voice the audience knows from the
+#   pitch + Q&A clips (which are flash_v2_5). Hearing v3 bridges between
+#   flash pitch + flash Q&A reads as "two different people speaking" —
+#   the realism upgrade got cancelled out by an identity break.
+#
+#   Reverted to plain text + flash_v2_5 in render_all/render_generic_clips
+#   so the avatar voice is consistent across every audible surface.
+#
+#   v3 path is preserved (just pass model_id="eleven_v3" to text_to_speech
+#   or `--model eleven_v3` to the render scripts). If you re-enable v3,
+#   re-add the audio tags and re-run the render — the v3 path defaults
+#   for tag handling are still wired correctly.
 BRIDGE_SCRIPTS: list[tuple[str, str]] = [
     # questions
     ("question", "Great question — let me think about that."),
@@ -221,10 +239,21 @@ async def render_all(
     elevenlabs_voice: str = "Rachel",
     avatar_video: str = "/workspace/state_pitching_pose_speaking_1080p.mp4",
     overwrite: bool = False,
+    model_id: str = "eleven_flash_v2_5",
 ):
     """Generate TTS for each script, send through LatentSync, save to disk,
     write/update manifest. Idempotent — skips already-rendered clips by
-    matching the (script, sha256) slug."""
+    matching the (script, sha256) slug.
+
+    `model_id` defaults to eleven_flash_v2_5 to keep the bridge voice
+    matching the rest of the avatar's audio (pitch + Q&A also flash). Tried
+    eleven_v3 with audio tags — better per-clip prosody but the timbre
+    drifted from the established avatar voice and read as "two different
+    people speaking" between bridges and the surrounding flash content.
+    See BRIDGE_SCRIPTS docstring above for the full rationale.
+
+    Pass model_id="eleven_v3" + re-add audio tags to BRIDGE_SCRIPTS if
+    you want to test the v3 path again. Both paths are wired correctly."""
     from agents.seller import text_to_speech, render_pitch_latentsync
 
     manifest = load_manifest()
@@ -250,8 +279,8 @@ async def render_all(
 
         t0 = time.time()
         try:
-            logger.info("[tts ] %s/%s — %s", label, slug, text)
-            audio_b64 = await text_to_speech(text, voice=elevenlabs_voice)
+            logger.info("[tts ] %s/%s [%s] — %s", label, slug, model_id, text)
+            audio_b64 = await text_to_speech(text, voice=elevenlabs_voice, model_id=model_id)
             if not audio_b64:
                 logger.warning("[fail] no audio for %s", text)
                 failed += 1
@@ -308,6 +337,11 @@ def main():
     r.add_argument("--avatar", default="/workspace/state_pitching_pose_speaking_1080p.mp4",
                    help="path to avatar source video on the RunPod")
     r.add_argument("--overwrite", action="store_true")
+    r.add_argument("--model", default="eleven_flash_v2_5",
+                   help="ElevenLabs model id. Default eleven_flash_v2_5 keeps bridges "
+                        "voice-matched to the rest of the avatar audio. Pass "
+                        "eleven_v3 (and re-add audio tags to BRIDGE_SCRIPTS) to test "
+                        "the more-expressive but voice-drifting path.")
 
     sub.add_parser("manifest", help="print current manifest")
 
@@ -333,6 +367,7 @@ def main():
             elevenlabs_voice=args.voice,
             avatar_video=args.avatar,
             overwrite=args.overwrite,
+            model_id=args.model,
         ))
         sys.exit(0 if result["failed"] == 0 else 1)
 

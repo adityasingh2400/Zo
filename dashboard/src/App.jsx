@@ -6,16 +6,25 @@ import { AgentLog } from './components/AgentLog';
 import { ChatPanel } from './components/ChatPanel';
 import { VoiceMic } from './components/VoiceMic';
 import { RoutingPanel } from './components/RoutingPanel';
+import { StartDemoOverlay } from './components/StartDemoOverlay';
 
 export default function App() {
   const {
-    connected, status, productData, productPhoto,
+    connected, productData, productPhoto,
     agentLog, transcript, sendComment,
-    pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
+    pitchVideoUrl, responseVideo, liveStage, pendingComments,
     view3d, transcriptExtract, voiceTranscript,
     routingDecisions, routingStats,
+    audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     wsRef,
   } = useEmpireSocket();
+
+  // When audio playback ends, parent clears the matching slot so a stale
+  // payload doesn't auto-replay if the same audio element is reused.
+  const handleAudioEnded = (kind) => {
+    if (kind === 'pitch') setPitchAudio(null);
+    else setAudioResponse(null);
+  };
 
   const [sellInput, setSellInput] = useState('sell this for $49');
   const [dragging, setDragging] = useState(false);
@@ -45,6 +54,11 @@ export default function App() {
       onDragLeave={() => setDragging(false)}
       onDrop={handleDrop}
     >
+      {/* One-time autoplay-unlock ceremony so audio-first <audio> elements
+          created at WS-message time can play without browser policy blocking.
+          See REVISIONS §3 in the design doc. */}
+      <StartDemoOverlay />
+
       {dragging && (
         <div style={styles.dropOverlay}>
           <span style={{ fontSize: 64 }}>🎬</span>
@@ -55,7 +69,7 @@ export default function App() {
       {/* Header */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
-          <h1 style={styles.logo}>EMPIRE</h1>
+          <h1 style={styles.logo}>Zo</h1>
         </div>
       </header>
 
@@ -92,7 +106,7 @@ export default function App() {
           style={styles.sellInput}
           placeholder='e.g. "sell this for $49 targeting young professionals"'
         />
-        <VoiceMic voiceTranscript={voiceTranscript} />
+        <VoiceMic voiceTranscript={voiceTranscript} wsRef={wsRef} />
         <label style={styles.uploadLabel}>
           🎬 Upload Video
           <input
@@ -119,10 +133,14 @@ export default function App() {
             pendingComments={pendingComments}
             liveStage={liveStage}
             wsRef={wsRef}
+            connected={connected}
+            audioResponse={audioResponse}
+            pitchAudio={pitchAudio}
+            onAudioEnded={handleAudioEnded}
           />
         </div>
         <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
+          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} connected={connected} />
           <ChatPanel
             onSendComment={sendComment}
             commentResponse={responseVideo}

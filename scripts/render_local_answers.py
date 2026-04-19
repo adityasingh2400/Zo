@@ -36,7 +36,11 @@ sys.path.insert(0, str(BACKEND))
 from dotenv import load_dotenv  # type: ignore
 load_dotenv(ROOT / ".env")
 
-from agents.seller import text_to_speech, render_comment_response_wav2lip  # noqa: E402
+from agents.seller import (  # noqa: E402
+    text_to_speech,
+    render_pitch_latentsync,
+    trim_audio_silence,
+)
 from config import POD_SPEAKING_1080P  # noqa: E402
 
 PRODUCTS_PATH = BACKEND / "data" / "products.json"
@@ -50,27 +54,62 @@ def url_to_path(url: str) -> Path:
 
 
 async def render_one(slug: str, text: str, out_path: Path, substrate: str) -> tuple[float, int]:
-    """TTS → Wav2Lip → write. Returns (elapsed_s, bytes)."""
+    """TTS → trim → LatentSync → write. Returns (elapsed_s, bytes).
+
+    Switched from Wav2Lip to LatentSync (Apr 2026) per quality directive:
+    Wav2Lip's 96px-patch + paste-back architecture produces visible mouth
+    and face artifacts even with GFPGAN at maximum settings (weight=0.9,
+    mouth-only, post-sharpen). LatentSync's latent-diffusion pipeline
+    produces clean lip-sync with no patch boundaries or mouth-region
+    glitches. Trade-off is render time: ~6-8 minutes per 10-second clip
+    on the 5090 vs ~5-10 seconds for Wav2Lip. Acceptable here because
+    these are PRE-RENDERED ONCE per qa_index entry, then played from
+    disk at runtime via the respond_locally path with sub-second latency.
+
+    The trim step still runs (silence removal at head/tail) — same
+    rationale as before, applies regardless of lip-sync provider.
+
+    No more pad_wav2lip_video_to_audio call: LatentSync renders against
+    the full audio length natively (no mel-chunking shortfall) so the
+    audio + video lengths match within a few ms straight out of the
+    server. Drift typical is <30ms.
+
+    Tune render speed/quality via inference_steps:
+      10 (default) — ~6-8 min/10s, top quality
+      6           — ~4 min/10s, slightly softer mouth
+      4           — ~3 min/10s, noticeably softer (don't go below this)
+    """
     t0 = time.perf_counter()
-    audio = await text_to_speech(text)
-    if not audio:
+    audio_raw = await text_to_speech(text)
+    if not audio_raw:
         raise RuntimeError("TTS returned empty audio (ElevenLabs not configured?)")
     t_tts = time.perf_counter() - t0
 
+    t_trim_start = time.perf_counter()
+    audio = trim_audio_silence(audio_raw)
+    t_trim = time.perf_counter() - t_trim_start
+    trim_pct = (1 - len(audio) / len(audio_raw)) * 100 if audio_raw else 0
+
     t1 = time.perf_counter()
-    mp4, _headers = await render_comment_response_wav2lip(
+    mp4_raw, _headers = await render_pitch_latentsync(
         audio_bytes=audio,
         source_path_on_pod=substrate,
+        inference_steps=10,
         out_height=1920,
     )
     t_lip = time.perf_counter() - t1
+
+    # No pad step: LatentSync renders against the full audio length
+    # natively (no Wav2Lip mel-chunking shortfall to compensate for).
+    mp4 = mp4_raw
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(mp4)
     total = time.perf_counter() - t0
     print(
-        f"  ✓ {slug}: tts={t_tts:.1f}s lip={t_lip:.1f}s total={total:.1f}s "
-        f"size={len(mp4) / 1024:.0f}KB → {out_path.relative_to(ROOT)}",
+        f"  ✓ {slug}: tts={t_tts:.1f}s trim={t_trim:.2f}s({trim_pct:.0f}%) "
+        f"lip={t_lip:.1f}s total={total:.1f}s size={len(mp4) / 1024:.0f}KB "
+        f"→ {out_path.relative_to(ROOT)}",
         flush=True,
     )
     return total, len(mp4)

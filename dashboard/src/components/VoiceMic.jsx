@@ -6,6 +6,11 @@ import React, { useEffect, useRef, useState } from 'react';
  * whisper on Cactus (<200ms) and fires a voice_transcript WS event that
  * the dashboard consumes through useEmpireSocket.
  *
+ * On mic-press (pointer-down, BEFORE recording starts), fires a
+ * `mic_pressed` WS event so the backend Director can swap Tier 1 to a
+ * listening-attentive pose ~50ms after the user starts talking
+ * (USE_BACKCHANNEL). Visual only per REVISIONS §8 — no "mhm" audio.
+ *
  * Four local states: idle | recording | transcribing | error.
  * We don't render the transcript here — the ChatPanel picks it up via
  * pendingComments so voice and typed comments look identical.
@@ -14,8 +19,10 @@ import React, { useEffect, useRef, useState } from 'react';
  *   voiceTranscript: the latest {text, source, ms} from the hook. Used
  *     to show a small "heard: ..." chip for a beat after release so the
  *     user sees what the backend heard in case they need to retry.
+ *   wsRef: shared WebSocket ref so we can fire mic_pressed without an
+ *     HTTP round-trip (the visual swap should beat the mic upload).
  */
-export function VoiceMic({ voiceTranscript }) {
+export function VoiceMic({ voiceTranscript, wsRef }) {
   const [state, setState] = useState('idle');
   const [elapsedMs, setElapsedMs] = useState(0);
   const [lastError, setLastError] = useState(null);
@@ -48,6 +55,19 @@ export function VoiceMic({ voiceTranscript }) {
   async function beginRecording() {
     if (state !== 'idle') return;
     setLastError(null);
+    // Fire mic_pressed BEFORE the getUserMedia await — the WS round-trip
+    // back to the Director is faster than mic permission prompt + first
+    // audio chunk, so the listening-attentive pose appears within ~50ms
+    // of pointer-down on a primed mic. The backend gates this behind
+    // USE_BACKCHANNEL; if off the message is a no-op.
+    try {
+      const ws = wsRef?.current;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'mic_pressed', client_ts: Date.now() }));
+      }
+    } catch (e) {
+      console.warn('[voicemic] mic_pressed send failed (non-fatal)', e);
+    }
     console.log('[voicemic] requesting mic…');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });

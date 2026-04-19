@@ -19,18 +19,50 @@ import asyncio
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
 from agents.bridge_clips import pick_bridge_clip
 
 logger = logging.getLogger("empire.director")
 
+# Listening-attentive substrate for the backchannel. Reuses the existing
+# `idle_reading_comments` pose (eyes scanning chat panel, head turned slightly
+# toward camera-left, micro-nods) — closer to "I'm listening to you" than
+# any other rendered idle. We loop it as a Tier 1 emit on mic press so it
+# stays on stage until the actual response (or pitch) crossfades over.
+_LISTENING_ATTENTIVE_URL = "/states/idle/idle_reading_comments.mp4"
+
+# Default pitch video — looped 8s "pitching pose, speaking motion" Veo
+# clip already on disk. Used by dispatch_audio_first_pitch (the only
+# remaining pitch entry point — driven by the video-upload pipeline,
+# not by chat). Karaoke captions divert eye gaze from the 8s loop so
+# the 30s audio overlay reads as continuous live speech.
+_DEFAULT_PITCH_VIDEO_URL = "/states/state_pitching_pose_speaking_1080p.mp4"
+
 # ── Tunables ────────────────────────────────────────────────────────────────
 # Mirrored on the dashboard side (LiveStage.jsx). Keep these in sync.
-TIER1_CROSSFADE_MS_DEFAULT = 350
+# Tier 1 transitions (bridge → response, idle → reading_chat, etc.) shortened
+# from 350ms → 120ms because Tier 1 clips have very different facial poses
+# (looking down, looking aside, speaking) and the long crossfade exposed both
+# faces simultaneously — two mouths in different positions overlapping at
+# 50% opacity each, which read as crystalline/diamond mouth artifacts.
+# 120ms is fast enough that the overlap window is barely perceptible while
+# still feeling like a smooth transition rather than a hard cut. Tier 0 idle
+# rotation stays at 600ms (idle poses have similar face positions, so the
+# longer fade is graceful, not ghosting). Fade-out stays at 500ms — the
+# avatar releasing back to idle reads better as a deliberate fade.
+TIER1_CROSSFADE_MS_DEFAULT = 120
 TIER0_CROSSFADE_MS_DEFAULT = 600
 TIER1_FADEOUT_MS_DEFAULT = 500
-READING_CHAT_HOLD_MS = 800   # how long the attentive idle plays before bridge replaces it
+READING_CHAT_HOLD_MS = 3500  # how long the avatar visibly "reads the comment"
+                             # before responding. 3.5s sells the human beat
+                             # ("she's actually reading what I typed") and
+                             # absorbs LLM + TTS latency so the audio drop
+                             # feels like she just finished thinking, not
+                             # like she pre-cached the response. Bridge
+                             # clips were removed from the comment pipeline
+                             # — this hold replaces them as the latency mask.
 IDLE_ROTATE_MIN_MS = 8_000   # tighter cadence so demo viewer sees variety quickly
 IDLE_ROTATE_MAX_MS = 18_000
 
@@ -64,10 +96,15 @@ IDLE_ROTATE_MAX_MS = 18_000
 # the eyes-down or hand-on-hair pose mid-response. Fewer assets to render +
 # upload, identical product behaviour.
 TIER0_LIBRARY: list[tuple[str, str, float, str]] = [
-    ("idle_calm",            "/states/idle/idle_calm.mp4",            0.70, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
-    ("idle_reading_comments","/states/idle/idle_reading_comments.mp4",0.15, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
-    ("idle_thinking",        "/states/idle/idle_thinking.mp4",        0.05, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
-    ("misc_hair_touch",      "/states/idle/misc_hair_touch.mp4",      0.10, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
+    # idle_reading_comments deliberately REMOVED from rotation. It's the
+    # exclusive reading_chat clip on Tier 1 — having it also rotate on Tier 0
+    # made the avatar look like she was reading another comment 5-15s after
+    # a real response, even when no comment had arrived. Keep the
+    # eyes-down-scanning pose semantically reserved for "I am reading the
+    # incoming chat right now" and nothing else.
+    ("idle_calm",       "/states/idle/idle_calm.mp4",       0.75, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
+    ("idle_thinking",   "/states/idle/idle_thinking.mp4",   0.10, "/workspace/idle_speaking/idle_thinking_speaking.mp4"),
+    ("misc_hair_touch", "/states/idle/misc_hair_touch.mp4", 0.15, "/workspace/idle_speaking/idle_calm_speaking.mp4"),
 ]
 
 # Tier 1 one-shot interjections. Director picks one occasionally and plays
@@ -120,6 +157,11 @@ class Director:
         self._substrate_available: dict[str, bool] = {
             self.DEFAULT_SUBSTRATE_POD_PATH: True,
         }
+        # Motivated idle rotation state (REVISIONS §12). Event-driven
+        # triggers fed by observe(); the random idle_loop is the fallback.
+        self._voice_state: str | None = None
+        self._thinking_task: asyncio.Task | None = None
+        self._last_sip_at: float = 0.0
 
     def current_substrate_pod_path(self) -> str:
         """The Wav2Lip server-side path that matches the visible Tier 0 clip,
@@ -163,8 +205,20 @@ class Director:
         fade_ms: int | None = None,
         ttl_ms: int | None = None,
         emitted_by: str = "director",
+        muted: bool = False,
+        expected_duration_ms: int | None = None,
     ) -> None:
-        """Send a single play_clip event. Updates last_intent for replay."""
+        """Send a single play_clip event. Updates last_intent for replay.
+
+        `muted=True` tells LiveStage to set incomingEl.muted=true and skip
+        the volume ramp — used on the audio-first path where the soundtrack
+        is coming from a separate <audio> element.
+
+        `expected_duration_ms` enables the dashboard's duration handshake on
+        canplaythrough (REVISIONS §4): if the video duration drifts >150ms
+        from this number, the dashboard rejects the video and lets audio
+        play alone.
+        """
         if fade_ms is None:
             fade_ms = TIER1_CROSSFADE_MS_DEFAULT if layer == "tier1" else TIER0_CROSSFADE_MS_DEFAULT
         msg = {
@@ -176,19 +230,42 @@ class Director:
             "mode": mode,
             "fade_ms": fade_ms,
             "ttl_ms": ttl_ms,
+            "muted": muted,
+            "expected_duration_ms": expected_duration_ms,
             "ts": time.time_ns(),
             "emitted_by": emitted_by,
         }
         self._last_intent[layer] = intent
         self._last_url[layer] = url
-        logger.info("[director] emit %s/%s -> %s (mode=%s fade=%dms)",
-                    layer, intent, url, mode, fade_ms)
+        logger.info("[director] emit %s/%s -> %s (mode=%s fade=%dms muted=%s dur=%s)",
+                    layer, intent, url, mode, fade_ms, muted, expected_duration_ms)
         try:
             await self._broadcast(msg)
         except Exception:
             logger.exception("[director] broadcast failed")
 
     # ── Convenience ───────────────────────────────────────────────────────
+    async def emit_reading_chat(self) -> None:
+        """Emit the reading_chat Tier 1 clip with NO internal hold. Caller
+        owns the timing — used by run_routed_comment to fire reading visuals
+        within ~50ms of comment arrival, then keep them visible for the
+        natural duration of classify+LLM+TTS+Wav2Lip rendering. The clip
+        loops, so it stays visible until the caller fades it out via
+        fade_to_idle().
+
+        Use this when you want responsive visual feedback without a fixed
+        timer. Use reading_chat() (below) when you want the legacy fixed
+        hold for backwards compatibility (e.g. direct REST hits)."""
+        await self.emit(
+            "tier1",
+            "reading_chat",
+            READING_CHAT_FALLBACK_URL,
+            loop=True,
+            mode="crossfade",
+            ttl_ms=None,
+            emitted_by="emit_reading_chat",
+        )
+
     async def reading_chat(self) -> None:
         """Show the avatar reading the incoming comment. Held briefly before
         the bridge crossfades over it. Uses the polished
@@ -224,7 +301,17 @@ class Director:
         )
         return clip
 
-    async def play_response(self, url: str) -> None:
+    async def play_response(
+        self,
+        url: str,
+        *,
+        muted: bool = False,
+        expected_duration_ms: int | None = None,
+    ) -> None:
+        """Tier 1 response crossfade. `muted` + `expected_duration_ms` are
+        used by the audio-first path (USE_AUDIO_FIRST) where the audio is
+        already playing through a standalone <audio> element on the
+        dashboard and the video is mounted muted underneath."""
         await self.emit(
             "tier1",
             "response",
@@ -232,6 +319,8 @@ class Director:
             loop=False,
             mode="crossfade",
             emitted_by="play_response",
+            muted=muted,
+            expected_duration_ms=expected_duration_ms,
         )
 
     async def play_pitch(self, url: str) -> None:
@@ -243,6 +332,117 @@ class Director:
             mode="crossfade",
             emitted_by="play_pitch",
         )
+
+    # ── Pitch dispatch (audio-first, ephemeral) ────────────────────────────
+    # The opening 30s of the demo. Driven exclusively by the video-upload
+    # pipeline (run_sell_pipeline → _run_audio_first_pitch in main.py).
+    # Caller has already TTS'd the freshly-Claude-generated pitch script,
+    # saved the audio to a static URL, and produced per-word timings — we
+    # just emit the muted looping speaking-pose video on Tier 1 + broadcast
+    # the pitch_audio WS event the dashboard plays through its standalone
+    # <audio> element with karaoke captions on top.
+    #
+    # Note: there's intentionally no slug→manifest lookup path. Pre-rendered
+    # cached pitches existed for the chat-trigger flow ("sell this for $X");
+    # that flow was removed because production never gets a typed pitch
+    # command. Every pitch is dynamically generated from the recorded
+    # video transcript.
+    async def dispatch_audio_first_pitch(
+        self,
+        *,
+        audio_url: str,
+        word_timings: list[dict],
+        audio_ms: int,
+        script: str = "",
+        video_url: str | None = None,
+        slug: str | None = None,
+    ) -> None:
+        """Pitch dispatch driven by the video-upload pipeline. Caller has
+        already saved the audio bytes to a static-served URL and produced
+        word timings.
+
+        `video_url` defaults to the universal speaking-pose clip; pass a
+        product-specific Veo render here if one exists.
+        `slug` is informational (logged + included in the pitch_audio
+        event) — useful for telemetry / dashboard chip variants.
+        """
+        url = video_url or _DEFAULT_PITCH_VIDEO_URL
+
+        # Tier 1 muted looping pose. Dashboard mutes the video element
+        # (audio is owned by the standalone <audio>) and skips the
+        # duration handshake because loop=True (no natural end).
+        await self.emit(
+            "tier1",
+            "pitch_veo",
+            url,
+            loop=True,
+            mode="crossfade",
+            emitted_by="dispatch_audio_first_pitch",
+            muted=True,
+        )
+
+        # pitch_audio WS event — the dashboard's <audio> element plays this
+        # immediately and KaraokeCaptions tracks word-by-word. Same shape
+        # as the cached path so the dashboard handler is one code path.
+        pitch_audio_msg = {
+            "type": "pitch_audio",
+            "slug": slug or "ephemeral",
+            "url": audio_url,
+            "word_timings": word_timings or [],
+            "expected_duration_ms": audio_ms or None,
+            "script": script,
+            "ts": time.time_ns(),
+        }
+        try:
+            await self._broadcast(pitch_audio_msg)
+        except Exception:
+            logger.exception("[director] dispatch_audio_first_pitch broadcast failed")
+
+        # Schedule the fade-to-idle when audio ends (+500ms tail). We use
+        # the audio duration as the canonical timing source — the looping
+        # video has no inherent end.
+        if audio_ms and audio_ms > 0:
+            release_ms = audio_ms + 500
+
+            async def _release():
+                await asyncio.sleep(release_ms / 1000)
+                try:
+                    await self._broadcast({
+                        "type": "pitch_audio_end",
+                        "slug": slug or "ephemeral",
+                        "ts": time.time_ns(),
+                    })
+                except Exception:
+                    pass
+                await self.fade_to_idle()
+                await self.set_voice_state(None)
+
+            asyncio.create_task(_release())
+
+        logger.info("[director] dispatch_audio_first_pitch slug=%s "
+                    "video=%s audio=%s words=%d dur=%dms",
+                    slug or "ephemeral", Path(url).name,
+                    Path(audio_url).name, len(word_timings or []), audio_ms)
+
+    # ── Listening backchannel (USE_BACKCHANNEL) ─────────────────────────────
+    # Mic press → instantly swap Tier 1 to a "listening attentive" loop.
+    # Reads as the avatar visibly registering the input ~50ms after the
+    # operator starts speaking. Visual only per REVISIONS §8 — no "mhm"
+    # audio (overlap risk during user speech isn't worth the win).
+    async def play_listening_attentive(self) -> None:
+        """Snap to a listening-attentive idle on Tier 1. Looped so it
+        stays on stage until the actual response or pitch crossfades over."""
+        await self.emit(
+            "tier1",
+            "listening_attentive",
+            _LISTENING_ATTENTIVE_URL,
+            loop=True,
+            mode="crossfade",
+            ttl_ms=10_000,
+            emitted_by="play_listening_attentive",
+            muted=True,
+        )
+        await self.set_voice_state("transcribing")
 
     async def fade_to_idle(self) -> None:
         """Tell the dashboard to fade Tier 1 out so Tier 0 takes over."""
@@ -407,6 +607,128 @@ class Director:
             if r <= acc:
                 return c
         return candidates[-1]
+
+    # ── Motivated idle observer (REVISIONS §12) ────────────────────────────
+    # The doc downscoped to two triggers:
+    #   1. comment_complete (>3s audio) → schedule a sip_drink interjection
+    #      AFTER the response finishes (debounced; once per 30s max).
+    #   2. voice_state="thinking" >2s → swap Tier 0 to idle_thinking pose.
+    # Event-listener pattern: broadcast_to_dashboards() calls observe(msg)
+    # so we don't sprinkle notify() calls through main.py.
+    _SIP_INTERJECTION_URL = "/states/idle/misc_sip_drink.mp4"
+    _IDLE_THINKING_URL = "/states/idle/idle_thinking.mp4"
+    _IDLE_THINKING_SUBSTRATE = "/workspace/idle_speaking/idle_thinking_speaking.mp4"
+    _SIP_DEBOUNCE_SEC = 30.0
+    _SIP_AUDIO_FLOOR_MS = 3000   # only fire on responses ≥3s
+    _THINKING_DELAY_SEC = 2.0    # wait this long before flipping to idle_thinking
+
+    async def observe(self, msg: dict) -> None:
+        """Inspect outgoing broadcasts and drive event-triggered idle
+        behaviour. Hooked into broadcast_to_dashboards() so every dashboard
+        message also informs the Director's choreography state machine."""
+        try:
+            mtype = msg.get("type")
+            if mtype == "voice_state":
+                await self._handle_voice_state(msg.get("state"))
+            elif mtype == "comment_response_audio":
+                # Schedule a sip-drink interjection after the response audio
+                # finishes IF it's long enough to "earn" the gesture (a 1s
+                # one-liner doesn't motivate sipping; a 4-5s answer does).
+                dur_ms = int(msg.get("expected_duration_ms") or 0)
+                if dur_ms >= self._SIP_AUDIO_FLOOR_MS:
+                    self._schedule_sip_after(dur_ms + 600)
+            elif mtype == "comment_response_video" and not msg.get("audio_already_playing"):
+                # Legacy serial path — schedule sip after video duration since
+                # there's no audio_already_playing flag carrying duration info.
+                # We use a coarse estimate from total_ms (TTS+render+lipsync).
+                # Conservative floor since total_ms includes render time.
+                resp_text = msg.get("response", "")
+                est_audio_ms = int(max(2500, len(resp_text.split()) * 350))
+                if est_audio_ms >= self._SIP_AUDIO_FLOOR_MS:
+                    self._schedule_sip_after(est_audio_ms + 600)
+            elif mtype == "pitch_audio_end":
+                # Pitch ended — schedule sip 1.5s after fade-to-idle settles
+                # so the avatar reads as "phew, that was a lot, taking a sip".
+                self._schedule_sip_after(2000)
+        except Exception:
+            logger.exception("[director] observe failed (non-fatal)")
+
+    async def _handle_voice_state(self, state: str | None) -> None:
+        """Cancel any pending thinking timer; start a fresh one if entering
+        thinking. If still thinking after _THINKING_DELAY_SEC, swap Tier 0."""
+        prev = self._voice_state
+        self._voice_state = state
+        if state == "thinking" and prev != "thinking":
+            if self._thinking_task and not self._thinking_task.done():
+                self._thinking_task.cancel()
+            self._thinking_task = asyncio.create_task(self._fire_thinking_after_delay())
+        elif state != "thinking" and self._thinking_task:
+            # Left the thinking state before the timer expired — cancel it
+            # so we don't end up swapping idle clips unnecessarily.
+            self._thinking_task.cancel()
+            self._thinking_task = None
+
+    async def _fire_thinking_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(self._THINKING_DELAY_SEC)
+        except asyncio.CancelledError:
+            return
+        if self._voice_state != "thinking":
+            return
+        # Only swap if Tier 0 isn't already on the thinking pose; we don't
+        # want to retrigger the crossfade for no visual change.
+        if self._last_intent.get("tier0") == "idle_thinking":
+            return
+        logger.info("[director] motivated idle: voice_state=thinking >2s → idle_thinking")
+        self._current_substrate_pod_path = self._IDLE_THINKING_SUBSTRATE
+        try:
+            await self.emit(
+                "tier0",
+                "idle_thinking",
+                self._IDLE_THINKING_URL,
+                loop=True,
+                mode="crossfade",
+                emitted_by="motivated_idle.thinking",
+            )
+        except Exception:
+            logger.exception("[director] motivated thinking emit failed")
+
+    def _schedule_sip_after(self, delay_ms: int) -> None:
+        """Schedule a sip-drink Tier 1 interjection delay_ms from now,
+        debounced so we don't queue multiple sips on rapid-fire responses."""
+        now = time.time()
+        if now - self._last_sip_at < self._SIP_DEBOUNCE_SEC:
+            return
+        self._last_sip_at = now  # claim the slot pre-fire to prevent double-schedule
+
+        async def _fire():
+            try:
+                await asyncio.sleep(delay_ms / 1000)
+                # Only sip if Tier 1 is currently idle (Tier 0 painting).
+                # If a new response is in flight we don't want to interrupt.
+                if self._last_intent.get("tier1") not in (
+                    "", "idle_release", "idle_init", "reading_chat",
+                    "judge_object_engage", "listening_attentive", None,
+                ):
+                    # Keep the timestamp but skip the sip; another response
+                    # is on stage.
+                    logger.debug("[director] motivated sip skipped — tier1 active")
+                    return
+                logger.info("[director] motivated idle: sip_drink after %dms", delay_ms)
+                await self.emit(
+                    "tier1",
+                    "misc_sip_drink",
+                    self._SIP_INTERJECTION_URL,
+                    loop=False,
+                    mode="crossfade",
+                    emitted_by="motivated_idle.sip",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[director] motivated sip fire failed")
+
+        asyncio.create_task(_fire())
 
     # ── Replay state for newly connected dashboards ───────────────────────
     def replay_state(self) -> dict[str, dict[str, str]]:

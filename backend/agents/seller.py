@@ -253,26 +253,148 @@ class _BytesCtx:
         self._buf.close()
 
 
-def _eleven_tts_sync(text: str, voice_id: str | None = None) -> bytes:
+def _eleven_tts_sync(
+    text: str,
+    voice_id: str | None = None,
+    *,
+    model_id: str | None = None,
+) -> bytes:
     """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
     event loop isn't blocked while audio bytes are being generated +
     streamed; the WS broadcast for play_clip events can interleave.
 
-    language_code='en' is locked because eleven_flash_v2_5 is multilingual
-    and will auto-detect from the input text. Edge cases (mostly-numeric
-    scripts, brand names, ASCII art in product descriptions) can flip the
-    detection to a different language and produce phonetically-warped
-    output that reads as gibberish to English listeners. Locking en is
-    the safe default; we only revisit this when we add multi-language
-    sellers."""
-    audio_gen = eleven.text_to_speech.convert(
-        text=text,
-        voice_id=voice_id or ELEVENLABS_VOICE_ID,
-        model_id="eleven_flash_v2_5",
-        output_format="mp3_44100_128",
-        language_code="en",
-    )
+    Default model is eleven_flash_v2_5 (~75ms inference, ~400ms TTFB).
+    That's the right pick for the live escalate path where every ms of
+    latency between mic-release and audio-out is felt by the viewer.
+
+    Pass `model_id="eleven_v3"` for pre-rendered tiers (bridge clips,
+    pre-rendered Q&A, pitch). v3 has >1s inference but honours inline
+    audio tags ([curious], [pauses], [laughs softly], [excited], etc.)
+    that make the voice read as a person reacting, not a chatbot. The
+    extra latency is paid offline at render time, so viewers never feel
+    it. See backend/agents/bridge_clips.BRIDGE_SCRIPTS for tag usage.
+
+    Per-model parameter shaping:
+      - language_code='en' locks Flash to English. Flash is multilingual
+        and auto-detects, but edge cases (mostly-numeric scripts, brand
+        names, ASCII art in product descriptions) flip detection and
+        produce phonetically-warped output that reads as gibberish.
+      - v3 deliberately drops language_code so the model can interpret
+        accent tags ([British accent], etc.) and multi-language inserts
+        without a hard lock fighting the script.
+      - v3 outputs at 192kbps (Creator+ tier; we have the grant) since
+        the render is already slow and the bitrate cost is invisible
+        on disk.
+    """
+    chosen_model = model_id or "eleven_flash_v2_5"
+    kwargs: dict = {
+        "text": text,
+        "voice_id": voice_id or ELEVENLABS_VOICE_ID,
+        "model_id": chosen_model,
+    }
+    if chosen_model == "eleven_v3":
+        kwargs["output_format"] = "mp3_44100_192"
+    else:
+        kwargs["output_format"] = "mp3_44100_128"
+        kwargs["language_code"] = "en"
+    audio_gen = eleven.text_to_speech.convert(**kwargs)
     return b"".join(audio_gen)
+
+
+def _eleven_tts_with_timestamps_sync(
+    text: str,
+    voice_id: str | None = None,
+    *,
+    model_id: str | None = None,
+) -> tuple[bytes, list[dict]]:
+    """ElevenLabs TTS via the /with-timestamps endpoint. Returns
+    (audio_bytes, word_timings) where word_timings is the same shape
+    synthesize_word_timings produces — [{word, start, end}, ...] in
+    seconds — but derived from the real per-character alignment the
+    API returns alongside the audio.
+
+    Aggregation: walk the character stream, collect runs of non-whitespace
+    chars into words, take word.start = first char start, word.end =
+    last char end. Punctuation stays glued to the preceding word so
+    karaoke renders 'forty-nine,' as one highlighted unit.
+
+    Same model + output format + language lock as _eleven_tts_sync so
+    the audio character is identical to the legacy path; only the API
+    surface changes. Latency is ~50-100ms higher than convert() because
+    the response is a single JSON blob (not a streaming generator) — the
+    caller pays this cost only when timings are needed (return_word_timings=True).
+
+    Raises on any API/network error so the caller can fall back to
+    convert() + synthesize_word_timings cleanly.
+    """
+    chosen_model = model_id or "eleven_flash_v2_5"
+    kwargs: dict = {
+        "text": text,
+        "voice_id": voice_id or ELEVENLABS_VOICE_ID,
+        "model_id": chosen_model,
+    }
+    if chosen_model == "eleven_v3":
+        kwargs["output_format"] = "mp3_44100_192"
+    else:
+        kwargs["output_format"] = "mp3_44100_128"
+        kwargs["language_code"] = "en"
+
+    resp = eleven.text_to_speech.convert_with_timestamps(**kwargs)
+    audio_bytes = base64.b64decode(resp.audio_base_64) if resp.audio_base_64 else b""
+
+    alignment = getattr(resp, "alignment", None)
+    if (not alignment
+            or not alignment.characters
+            or not alignment.character_start_times_seconds
+            or not alignment.character_end_times_seconds):
+        # API returned audio but no alignment — caller will handle by
+        # falling back to synthesize_word_timings.
+        return audio_bytes, []
+
+    return audio_bytes, _aggregate_chars_to_words(
+        alignment.characters,
+        alignment.character_start_times_seconds,
+        alignment.character_end_times_seconds,
+    )
+
+
+def _aggregate_chars_to_words(
+    chars: list[str],
+    starts: list[float],
+    ends: list[float],
+) -> list[dict]:
+    """Walk a character timeline and group runs of non-whitespace chars
+    into words. Whitespace is treated as a separator; punctuation
+    glued to a word stays attached. Pure function for easy testing."""
+    words: list[dict] = []
+    cur_chars: list[str] = []
+    cur_start: float | None = None
+    cur_end: float | None = None
+
+    for ch, start, end in zip(chars, starts, ends):
+        if ch.isspace():
+            if cur_chars and cur_start is not None and cur_end is not None:
+                words.append({
+                    "word": "".join(cur_chars),
+                    "start": round(cur_start, 3),
+                    "end": round(cur_end, 3),
+                })
+            cur_chars = []
+            cur_start = None
+            cur_end = None
+            continue
+        if cur_start is None:
+            cur_start = start
+        cur_chars.append(ch)
+        cur_end = end
+
+    if cur_chars and cur_start is not None and cur_end is not None:
+        words.append({
+            "word": "".join(cur_chars),
+            "start": round(cur_start, 3),
+            "end": round(cur_end, 3),
+        })
+    return words
 
 
 # ── Audio duration probe ─────────────────────────────────────────────────────
@@ -310,6 +432,171 @@ def _probe_audio_duration_ms(audio_bytes: bytes) -> int | None:
         return None
 
 
+# ── Wav2Lip audio + video alignment helpers ──────────────────────────────
+# Two structural problems show up when running v3 (or any) audio through
+# Wav2Lip and need fixing for both pre-rendered bridges and live escalates.
+#
+# 1. Wav2Lip's mel-chunking algorithm computes video frame count as
+#    `int(audio_seconds * fps)` truncated to the last full mel chunk window
+#    (MEL_STEP=16). That always produces a video ~120-180ms shorter than
+#    the audio (a structural artifact, not a bug — same drift on Flash, on
+#    v3, with tags, without tags, every length, every fps). The wav2lip
+#    server then mux's with `-shortest` and silently truncates the audio
+#    tail; the dashboard's duration handshake (LiveStage.jsx, 150ms
+#    threshold) sees the gap and either skips the video entirely (no lip
+#    movement on stage) or accepts it but plays a silent video tail after
+#    the audio cuts.
+#
+# 2. v3 specifically adds ~50-100ms of "intake breath" silence at the head
+#    and ~100-300ms of trailing silence at the end. Wav2Lip generates
+#    mouth shapes for ALL audio frames including silence and produces
+#    semi-random shapes during quiet moments — visible as a mouth-flap on
+#    what should be a still frame at the start/end.
+#
+# pad_wav2lip_video_to_audio() fixes #1 — re-mux the wav2lip output with
+# the FULL original audio + video padded by holding the last frame for the
+# gap. Drift drops from ~140ms to ±20ms; the handshake never fires.
+#
+# trim_audio_silence() fixes #2 — crop head/tail silence from the audio
+# BEFORE sending to wav2lip. Used by the offline bridge render pipeline
+# (scripts/render_generic_clips.py); not used on the live escalate path
+# because trimming changes user-perceived audio character (the broadcast
+# audio_bytes drives KaraokeCaptions and we don't want it to drift from
+# what TTS produced).
+
+def trim_audio_silence(
+    audio_bytes: bytes,
+    *,
+    head_threshold_db: int = -40,
+    head_min_silence: float = 0.03,
+    tail_threshold_db: int = -35,
+    tail_min_silence: float = 0.05,
+) -> bytes:
+    """Trim leading + trailing silence from MP3 bytes via ffmpeg's
+    silenceremove. Internal pauses (commas, ellipses) are preserved —
+    the filter only triggers on a contiguous silent run at the start
+    (and, after a reverse, at the end).
+
+    Thresholds default conservative on the tail (-35dB / 50ms) so faint
+    trailing punctuation (the soft 't' at the end of 'about that') is
+    kept; only pure breath/silence crops."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fi:
+        fi.write(audio_bytes)
+        in_path = fi.name
+    out_path = in_path.replace(".mp3", "_trimmed.mp3")
+    af = (
+        f"silenceremove=start_periods=1:start_silence={head_min_silence}:"
+        f"start_threshold={head_threshold_db}dB:detection=peak,"
+        f"areverse,"
+        f"silenceremove=start_periods=1:start_silence={tail_min_silence}:"
+        f"start_threshold={tail_threshold_db}dB:detection=peak,"
+        f"areverse"
+    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", in_path, "-af", af,
+             "-loglevel", "error", out_path],
+            check=True, timeout=15,
+        )
+        result = Path(out_path).read_bytes()
+    finally:
+        Path(in_path).unlink(missing_ok=True)
+        Path(out_path).unlink(missing_ok=True)
+    return result
+
+
+def pad_wav2lip_video_to_audio(
+    video_bytes: bytes,
+    audio_bytes: bytes,
+) -> tuple[bytes, dict]:
+    """Re-mux video so it plays the FULL audio with last frame held for any
+    structural shortfall. Returns (padded_video_bytes, diag_dict).
+
+    diag_dict carries the four numbers callers want for trace logging:
+      - audio_ms          duration of the source audio (the truth)
+      - video_ms_before   duration of the wav2lip output (what we got)
+      - pad_ms            how much we padded (usually ~120-180ms)
+      - video_ms_after    duration of the padded output (≈ audio_ms)
+      - padded            true if pad happened, false if already aligned
+
+    On any ffmpeg / probe failure the function returns the ORIGINAL
+    video_bytes unmodified with diag={"padded": False, "error": "..."}.
+    Padding is a quality bonus, not load-bearing — callers can safely
+    treat it as "best effort": worst case, behavior is identical to
+    the un-patched pipeline (the 150ms drift the user noticed)."""
+    diag: dict = {"padded": False}
+    if not video_bytes or not audio_bytes:
+        diag["error"] = "empty_input"
+        return video_bytes, diag
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        mp4_in = td_path / "in.mp4"
+        mp3_in = td_path / "audio.mp3"
+        mp4_out = td_path / "out.mp4"
+        mp4_in.write_bytes(video_bytes)
+        mp3_in.write_bytes(audio_bytes)
+
+        try:
+            audio_dur = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries",
+                 "format=duration", "-of", "default=nw=1:nk=1",
+                 str(mp3_in)], timeout=10,
+            ).strip())
+            video_dur = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v",
+                 "-show_entries", "stream=duration", "-of",
+                 "default=nw=1:nk=1", str(mp4_in)], timeout=10,
+            ).strip())
+        except Exception as e:
+            diag["error"] = f"probe_failed:{type(e).__name__}"
+            return video_bytes, diag
+
+        diag["audio_ms"] = int(audio_dur * 1000)
+        diag["video_ms_before"] = int(video_dur * 1000)
+        pad = max(0.0, audio_dur - video_dur)
+        diag["pad_ms"] = int(pad * 1000)
+
+        if pad < 0.02:
+            # Already within 20ms — handshake won't fire, nothing to do.
+            diag["video_ms_after"] = diag["video_ms_before"]
+            return video_bytes, diag
+
+        # tpad stop_mode=clone freezes the last frame for stop_duration sec.
+        # Re-encoding video here is fine — bridges are 2-5s, live responses
+        # are <8s, and libx264 ultrafast preset chews through it in <500ms
+        # on a modern Mac. The output's audio comes straight from the
+        # ORIGINAL audio_bytes (not the wav2lip-cut version inside mp4_in),
+        # so trailing breath/word-end plays in full.
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(mp4_in), "-i", str(mp3_in),
+                "-filter_complex",
+                f"[0:v]tpad=stop_mode=clone:stop_duration={pad:.3f}[v]",
+                "-map", "[v]", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-loglevel", "error", str(mp4_out),
+            ], check=True, timeout=30)
+        except Exception as e:
+            diag["error"] = f"ffmpeg_failed:{type(e).__name__}"
+            return video_bytes, diag
+
+        try:
+            video_dur_after = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v",
+                 "-show_entries", "stream=duration", "-of",
+                 "default=nw=1:nk=1", str(mp4_out)], timeout=10,
+            ).strip())
+            diag["video_ms_after"] = int(video_dur_after * 1000)
+        except Exception:
+            # Non-fatal — pad worked, we just can't measure it.
+            diag["video_ms_after"] = diag["audio_ms"]
+
+        diag["padded"] = True
+        return mp4_out.read_bytes(), diag
+
+
 # ── Synthetic word timings ───────────────────────────────────────────────────
 # Cartesia would give us exact per-word {start, end} for free. We're on
 # ElevenLabs, which doesn't return timings. The synthetic version splits
@@ -325,7 +612,8 @@ def _probe_audio_duration_ms(audio_bytes: bytes) -> int | None:
 _WORD_SPLIT_RE = re.compile(r"\S+")
 _INTER_WORD_GAP_MS = 25
 # Speaking rate fallback (chars/sec) when we have no audio_duration_ms
-# (degraded path: render_pitch_assets without ffprobe). 12 chars/sec is
+# (degraded path: any caller that hits text_to_speech without ffprobe).
+# 12 chars/sec is
 # eleven_flash_v2_5's measured average over the demo's response set.
 _FALLBACK_CHARS_PER_SEC = 12.0
 
@@ -390,33 +678,73 @@ async def text_to_speech(
     text: str,
     *,
     voice: str | None = None,
+    model_id: str | None = None,
     return_word_timings: bool = False,
 ) -> bytes | tuple[bytes, list[dict]]:
-    """ElevenLabs TTS. flash_v2_5 model = ~400ms for a 15-word reply.
-    Off-loaded to a worker thread so it doesn't stall the asyncio loop.
+    """ElevenLabs TTS. Default model flash_v2_5 = ~400ms TTFB for a
+    15-word reply (live path). Off-loaded to a worker thread so it
+    doesn't stall the asyncio loop.
 
     Default behaviour (`return_word_timings=False`) returns just the MP3
     bytes — same contract every existing caller relies on.
 
     With `return_word_timings=True` returns `(bytes, word_timings)` where
-    word_timings is `[{word, start, end}, ...]` in seconds. Timings are
-    SYNTHESIZED (we're not on Cartesia today): whitespace-split, distributed
-    across the actual audio duration measured by ffprobe. Accuracy is
-    ~80-95% which is enough for karaoke captions to track without visible
-    drift in the 8-12 word display window.
+    word_timings is `[{word, start, end}, ...]` in seconds. Real per-word
+    timings are pulled from the ElevenLabs `/with-timestamps` endpoint
+    (per-character alignment aggregated to word boundaries) for ~10ms
+    sync accuracy on karaoke captions. Falls back to the whitespace-split
+    + ffprobe-duration synthesizer if the API errors or returns no
+    alignment — the caller never sees the difference.
 
     `voice` overrides ELEVENLABS_VOICE_ID when set — used by
     bridge_clips.render_all to render a per-character voice without mutating
     the env.
+
+    `model_id` overrides eleven_flash_v2_5. Pass "eleven_v3" for the
+    pre-rendered expressive tier (audio tags honoured). See
+    `_eleven_tts_sync` docstring for the full tiering rationale.
     """
-    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, timings=%s, eleven=%s)",
-                len(text), voice or "default", return_word_timings, "yes" if eleven else "no")
+    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, model=%s, timings=%s, eleven=%s)",
+                len(text), voice or "default", model_id or "default(flash)",
+                return_word_timings, "yes" if eleven else "no")
     if not eleven:
         if return_word_timings:
             return b"", []
         return b""
 
-    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice)
+    if return_word_timings:
+        # Real per-character timings via /with-timestamps. ~50-100ms
+        # higher TTFB than convert() because the response is a single
+        # JSON blob, not a streaming generator. Worth it for precise
+        # karaoke sync; live path doesn't request timings unless karaoke
+        # actually needs them.
+        try:
+            audio_bytes, word_timings = await asyncio.to_thread(
+                _eleven_tts_with_timestamps_sync, text, voice, model_id=model_id,
+            )
+            if audio_bytes and word_timings:
+                logger.info("[TTS] real timings: %d words from API alignment",
+                            len(word_timings))
+                return audio_bytes, word_timings
+            # API returned audio but no alignment (rare, model-specific).
+            # Fall through to synthesize against measured duration so
+            # karaoke still tracks.
+            if audio_bytes:
+                duration_ms = await asyncio.to_thread(
+                    _probe_audio_duration_ms, audio_bytes,
+                )
+                synth = synthesize_word_timings(text, duration_ms)
+                logger.info("[TTS] API alignment empty; synthesized %d words "
+                            "over %s ms", len(synth),
+                            duration_ms if duration_ms else "(estimate)")
+                return audio_bytes, synth
+            return b"", []
+        except Exception as e:
+            logger.warning("[TTS] with_timestamps failed (%s) — falling back to "
+                           "convert() + synthesize", e)
+            # Fall through to the convert() path below, then synthesize.
+
+    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice, model_id=model_id)
 
     if not return_word_timings:
         return audio_bytes

@@ -2,6 +2,8 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import StageView from './StageView'
+import { LiquidGlassDefs } from './lib/LiquidGlassDefs'
+import './lib/liquid-glass.css'
 
 // Tiny path-based router — keeps the dashboard router-free (no react-router
 // dep) while still letting the operator hit /stage on the demo Mac for the
@@ -19,7 +21,16 @@ function Root() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
   const isStage = path === '/stage' || path.startsWith('/stage/');
-  return isStage ? <StageView /> : <App />;
+  return (
+    <>
+      {/* Liquid Glass SVG filter — mounted ONCE so anywhere in the tree
+          can `filter: url(#lg-distortion)` via the .lg-glass utility class.
+          Defs live in lib/LiquidGlassDefs; the matching CSS utilities live
+          in lib/liquid-glass.css. Both imported above. */}
+      <LiquidGlassDefs />
+      {isStage ? <StageView /> : <App />}
+    </>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<Root />)

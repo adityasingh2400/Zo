@@ -64,9 +64,16 @@ export function RoutingPanel({ routingDecisions = [], routingStats, compact = fa
         <span style={styles.badge}>on-device first</span>
       </div>
 
+      {/* KPI order is deliberate. Serial Position Effects (Lidwell p178):
+          items at the start (primacy) and end (recency) of a list are
+          remembered better than the middle. Gutenberg Diagram (p100): for
+          left-to-right readers, the top-left is the primary optical area.
+          So we put the demo's punchline ($ saved vs all-cloud) FIRST, the
+          supporting metric (% local) SECOND, and the noisy counter (total
+          decisions) LAST and muted — context, not headline. */}
       <div style={styles.kpiRow}>
-        <Kpi value={`${pctLocal}%`} label="local" color="#22c55e" />
         <Kpi value={formatUSD(cost_saved_usd)} label="saved" color="#fafafa" />
+        <Kpi value={`${pctLocal}%`} label="local" color="#22c55e" />
         <Kpi value={`${total}`} label="decisions" color="#a1a1aa" muted />
       </div>
 
@@ -108,20 +115,36 @@ function CompactStrip({ local, total, pctLocal, costSaved, avgMs, lastDecision }
   const dotColor = wasLocal ? '#22c55e' : '#f59e0b';
 
   return (
-    <div style={{
-      ...stripStyles.container,
-      borderColor: pulse ? dotColor : '#27272a',
-      boxShadow: pulse ? `0 0 18px ${dotColor}66` : 'none',
-      transition: 'border-color 240ms ease, box-shadow 240ms ease',
-    }}>
+    <div
+      // Liquid Glass surface — same recipe as the CostTicker so the two
+      // bezel chrome pieces feel like one paired stack. --still flavor
+      // because there's no content behind the bezel to refract; the dark
+      // glass aesthetic still upgrades the look from "panel" to "lens".
+      // Pulse driven by the latest routing decision (Common Fate, p40).
+      className="lg-glass lg-glass--still"
+      style={{
+        ...stripStyles.container,
+        ...(pulse && {
+          borderColor: dotColor,
+          boxShadow: `0 12px 40px rgba(0,0,0,0.45), 0 0 18px ${dotColor}66`,
+        }),
+        transition: 'border-color 240ms ease, box-shadow 240ms ease',
+      }}
+    >
       <div style={stripStyles.dotWrap}>
         <span style={{ ...stripStyles.dot, background: dotColor, boxShadow: `0 0 10px ${dotColor}` }} />
         <span style={stripStyles.dotLabel}>ROUTER</span>
       </div>
       <div style={stripStyles.divider} />
-      <Stat label="LOCAL" value={`${local} / ${total}`} sub={`${pctLocal}%`} accent="#22c55e" />
-      <div style={stripStyles.divider} />
+      {/* Stat order, same logic as the full panel above: Serial Position
+          Effects (p178) puts the dollar figure in the primacy slot, then
+          % local, then latency as quiet context in the recency slot. The
+          stage strip is the audience's only telemetry surface — getting the
+          read-order right is the difference between a story and a wall of
+          numbers. */}
       <Stat label="SAVED" value={formatUSD(costSaved)} accent="#fafafa" />
+      <div style={stripStyles.divider} />
+      <Stat label="LOCAL" value={`${local} / ${total}`} sub={`${pctLocal}%`} accent="#22c55e" />
       <div style={stripStyles.divider} />
       <Stat
         label="AVG"
@@ -218,8 +241,19 @@ const styles = {
   },
   kpi: {
     display: 'flex', flexDirection: 'column', alignItems: 'center',
-    gap: 2, padding: '6px 4px',
-    background: '#09090b', borderRadius: 8, border: '1px solid #18181b',
+    gap: 2, padding: '8px 4px',
+    // Top-Down Lighting Bias (Lidwell p196): the brain assumes light comes
+    // from above, so a thin white inset on the top edge + a dark gradient
+    // body + soft outer shadow reads as a "raised" tile. Lifts the demo's
+    // money numbers above the surrounding panel chrome. Mirrors the same
+    // depth language used on the CostTicker so all telemetry surfaces feel
+    // like one coordinated stack.
+    background:
+      'linear-gradient(rgba(255,255,255,0.05), rgba(255,255,255,0) 40%), #09090b',
+    borderRadius: 8,
+    border: '1px solid #18181b',
+    boxShadow:
+      '0 1px 0 rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05)',
   },
   kpiValue: {
     fontSize: 26, fontWeight: 800, letterSpacing: -0.5,
@@ -278,13 +312,10 @@ const styles = {
 // into a single horizontal row.
 const stripStyles = {
   container: {
+    // Layout/typography only — glass surface owned by .lg-glass utility.
     display: 'flex', alignItems: 'center', gap: 14,
-    background: 'rgba(9,9,11,0.85)',
-    border: '1px solid #27272a',
-    borderRadius: 12, padding: '10px 16px',
-    backdropFilter: 'blur(8px)',
+    padding: '10px 16px',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
   },
   dotWrap: {
     display: 'flex', alignItems: 'center', gap: 8,

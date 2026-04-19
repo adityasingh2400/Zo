@@ -215,7 +215,11 @@ export default function StageView() {
           without overlapping the phone frame). */}
       {!MINIMAL_STAGE && hintVisible && wideBezel && (
         <div style={styles.bezelBottomLeft}>
-          <div style={styles.hint}>
+          {/* Liquid Glass — same surface language as the CostTicker and
+              the routing strip above so all three pieces of bezel chrome
+              feel like one stack. --still skips the SVG distortion (bezel
+              is flat black). */}
+          <div className="lg-glass lg-glass--still" style={styles.hint}>
             <div style={styles.hintHeader}>
               <span style={{
                 ...styles.hintDot,
@@ -281,11 +285,8 @@ const styles = {
     pointerEvents: 'auto',
   },
   hint: {
-    background: 'rgba(9,9,11,0.85)',
-    border: '1px solid #27272a',
-    borderRadius: 12, padding: '10px 14px',
-    backdropFilter: 'blur(8px)',
-    boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+    // Layout/typography only — glass surface owned by .lg-glass utility.
+    padding: '10px 14px',
     fontSize: 12, color: '#a1a1aa',
     minWidth: 180,
   },

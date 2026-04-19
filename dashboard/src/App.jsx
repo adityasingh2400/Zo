@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { LiveStage } from './components/LiveStage';
 import { ProductPanel } from './components/ProductPanel';
@@ -29,6 +29,20 @@ export default function App() {
   const [sellInput, setSellInput] = useState('sell this for $49');
   const [dragging, setDragging] = useState(false);
   const [showTelemetry, setShowTelemetry] = useState(false);
+
+  // Visibility (Lidwell p202): the close button's tooltip already promised
+  // Esc would close the overlay, but there was no actual handler — a silent
+  // mismatch between system status and what the UI claims. Wire it for real
+  // and (below) surface the hint as a visible kbd chip rather than hiding
+  // it in a hover-only tooltip (Recognition Over Recall, p164).
+  useEffect(() => {
+    if (!showTelemetry) return;
+    function onKey(e) {
+      if (e.key === 'Escape') setShowTelemetry(false);
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showTelemetry]);
 
   async function uploadFile(file) {
     const formData = new FormData();
@@ -86,15 +100,33 @@ export default function App() {
             <span style={styles.telemetryBadge}>{routingStats.total}</span>
           )}
         </button>
-        <div style={styles.connectionPill}>
-          <div style={{
-            ...styles.connectionDot,
-            background: connected ? '#22c55e' : '#ef4444',
-            boxShadow: connected ? '0 0 8px #22c55e' : '0 0 8px #ef4444',
-          }} />
-          <span style={{ color: connected ? '#22c55e' : '#ef4444', fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>
-            {connected ? 'CONNECTED' : 'DISCONNECTED'}
-          </span>
+        {/* Highlighting (Lidwell p108): keep highlighted content under ~10%
+            of the surface or the highlight loses meaning. CONNECTED is the
+            expected resting state — it does not deserve loud green type and
+            a glowing dot every second of the demo. The pill stays small and
+            quiet at rest; only DISCONNECTED gets the full red flare, because
+            that is the one state the operator needs to act on (Signal-to-
+            Noise Ratio, p182: maximize signal, minimize decoration). */}
+        <div
+          style={{
+            ...styles.connectionPill,
+            ...(connected
+              ? styles.connectionPillIdle
+              : styles.connectionPillAlert),
+          }}
+        >
+          <div
+            style={{
+              ...styles.connectionDot,
+              background: connected ? '#22c55e' : '#ef4444',
+              boxShadow: connected ? 'none' : '0 0 10px #ef4444',
+            }}
+          />
+          {connected ? (
+            <span style={styles.connectionLabelIdle}>live</span>
+          ) : (
+            <span style={styles.connectionLabelAlert}>DISCONNECTED</span>
+          )}
         </div>
       </div>
 
@@ -155,14 +187,23 @@ export default function App() {
           <div style={styles.telemetryPanel}>
             <div style={styles.telemetryHeader}>
               <h2 style={styles.telemetryTitle}>Telemetry</h2>
-              <button
-                type="button"
-                onClick={() => setShowTelemetry(false)}
-                style={styles.telemetryClose}
-                title="Close (Esc)"
-              >
-                ✕
-              </button>
+              {/* Recognition Over Recall (Lidwell p164) + Visibility (p202):
+                  show the keyboard escape hatch as a visible kbd chip rather
+                  than burying it in a hover-only tooltip. The chip is the
+                  affordance — clicking the X works, pressing Esc works, and
+                  the user can see both options without having to remember
+                  or hover-discover them. */}
+              <div style={styles.telemetryCloseGroup}>
+                <kbd style={styles.escKbd}>Esc</kbd>
+                <button
+                  type="button"
+                  onClick={() => setShowTelemetry(false)}
+                  style={styles.telemetryClose}
+                  aria-label="Close telemetry (Escape)"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
             <div style={styles.telemetryBody}>
               <div style={styles.telemetryCol}>
@@ -203,12 +244,31 @@ const styles = {
     display: 'flex', alignItems: 'center', gap: 10,
   },
   connectionPill: {
-    display: 'flex', alignItems: 'center', gap: 8,
+    display: 'flex', alignItems: 'center', gap: 6,
     background: 'rgba(15,15,18,0.8)', backdropFilter: 'blur(8px)',
-    border: '1px solid #27272a', borderRadius: 999,
-    padding: '6px 12px',
+    borderRadius: 999,
+    transition: 'border-color 200ms ease, padding 200ms ease',
   },
-  connectionDot: { width: 8, height: 8, borderRadius: 4 },
+  connectionPillIdle: {
+    border: '1px solid #27272a',
+    padding: '4px 10px',
+  },
+  connectionPillAlert: {
+    // The one case the operator must notice, so the pill earns the loud
+    // border + breathing glow. (Highlighting, p108.)
+    border: '1px solid rgba(239,68,68,0.6)',
+    padding: '6px 12px',
+    boxShadow: '0 0 18px rgba(239,68,68,0.35)',
+    animation: 'pulse 1.6s ease-in-out infinite',
+  },
+  connectionDot: { width: 7, height: 7, borderRadius: 4 },
+  connectionLabelIdle: {
+    color: '#71717a', fontSize: 10, fontWeight: 700, letterSpacing: 1,
+    textTransform: 'lowercase',
+  },
+  connectionLabelAlert: {
+    color: '#ef4444', fontSize: 12, fontWeight: 800, letterSpacing: 1,
+  },
   controls: {
     display: 'flex', gap: 8, padding: '0 0 8px',
   },
@@ -265,6 +325,17 @@ const styles = {
   telemetryTitle: {
     margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 2,
     textTransform: 'uppercase', color: '#fafafa',
+  },
+  telemetryCloseGroup: {
+    display: 'flex', alignItems: 'center', gap: 8,
+  },
+  escKbd: {
+    display: 'inline-block', minWidth: 28, padding: '3px 8px',
+    background: '#18181b', border: '1px solid #3f3f46',
+    borderRadius: 5, fontSize: 11, fontWeight: 700,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    textAlign: 'center', color: '#a1a1aa',
+    letterSpacing: 0.5,
   },
   telemetryClose: {
     background: 'transparent', color: '#a1a1aa',

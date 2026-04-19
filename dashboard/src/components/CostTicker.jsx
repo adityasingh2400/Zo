@@ -34,11 +34,29 @@ const COST_PER_CLOUD = 0.00035;
 // Kill-shot animation — short enough to feel sharp, long enough to be visible.
 const COUNT_UP_MS = 320;
 
-export function CostTicker({ wsRef, connected, comparison = '$9,628/mo human team' }) {
+// Human comparison: a US-based live commerce host runs ~$9,628/mo at 40hr
+// weeks. The contrast against $0.00 routing cost is the demo's closing line.
+// Kept as a structured value so the Comparison (Lidwell p42) layout below can
+// render it on a common scale with the live cost rather than as a footnote.
+const HUMAN_COMPARISON = {
+  amount: 9628,
+  perPeriod: '/mo',
+  label: 'human host team',
+};
+
+export function CostTicker({ wsRef, connected, comparison = HUMAN_COMPARISON }) {
   const [actual, setActual] = useState(0);   // truth: total cost incurred
   const [shown, setShown]   = useState(0);   // animated value the eye sees
   const [flash, setFlash]   = useState(false);
+  // Common Fate (Lidwell p40): elements that move together are perceived as
+  // related. The CostTicker and the RoutingPanel dot tell ONE story — "the
+  // router stayed local, the cost held at zero." Pulsing them together makes
+  // the cause→effect link readable from 30 ft. Color encodes which kind of
+  // decision just landed: green = local (held the line), amber = cloud
+  // (incurred a tick), null = resting.
+  const [pulse, setPulse] = useState(null);  // 'local' | 'cloud' | null
   const animRef = useRef(null);
+  const pulseTimerRef = useRef(null);
 
   // Subscribe to routing_decision events directly — same pattern LiveStage
   // uses (addEventListener, never replace the existing onmessage handler).
@@ -66,10 +84,22 @@ export function CostTicker({ wsRef, connected, comparison = '$9,628/mo human tea
       // in backend/agents/router.py: local tools have was_local=true.
       if (msg.tool === 'escalate_to_cloud') {
         setActual(v => v + COST_PER_CLOUD);
+        // Cloud pulse comes through the count-up animation effect below,
+        // which sets pulse='cloud' when `actual` increases.
+      } else {
+        // Local-path decision — no money spent, but the ticker should
+        // still react so the audience reads "stayed at zero" as an active
+        // win rather than a passive flat line. (Common Fate, p40.)
+        setPulse('local');
+        if (pulseTimerRef.current) clearTimeout(pulseTimerRef.current);
+        pulseTimerRef.current = setTimeout(() => setPulse(null), 700);
       }
     }
     ws.addEventListener('message', onMessage);
-    return () => ws.removeEventListener('message', onMessage);
+    return () => {
+      ws.removeEventListener('message', onMessage);
+      if (pulseTimerRef.current) clearTimeout(pulseTimerRef.current);
+    };
   }, [wsRef, connected]);
 
   // Count-up animation: lerp from `shown` → `actual` over COUNT_UP_MS.
@@ -82,6 +112,12 @@ export function CostTicker({ wsRef, connected, comparison = '$9,628/mo human tea
     const from = shown;
     const to = actual;
     setFlash(true);
+    // The cost only moves when an escalate_to_cloud lands, so any actual→shown
+    // delta means "we just spent money." Pulse amber in lockstep with the
+    // routing dot (Common Fate, Lidwell p40).
+    setPulse('cloud');
+    if (pulseTimerRef.current) clearTimeout(pulseTimerRef.current);
+    pulseTimerRef.current = setTimeout(() => setPulse(null), 700);
     function step(now) {
       const t = Math.min(1, (now - start) / COUNT_UP_MS);
       // Smooth ease-out so the digits decelerate into place, not just snap.
@@ -117,20 +153,59 @@ export function CostTicker({ wsRef, connected, comparison = '$9,628/mo human tea
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  // Pulse → border + glow color. Common Fate (p40) ties this to the routing
+  // panel: when its dot pulses green/amber, this surface pulses with it.
+  const pulseColor = pulse === 'cloud' ? '#fbbf24'
+                   : pulse === 'local' ? '#22c55e'
+                   : null;
+
   return (
-    <div style={styles.container}>
-      <div style={styles.label}>COST THIS STREAM</div>
-      <div
-        style={{
-          ...styles.value,
-          color: flash ? '#fbbf24' : '#fafafa',
-          textShadow: flash ? '0 0 24px rgba(251,191,36,0.6)' : 'none',
-          transition: 'color 200ms ease, text-shadow 200ms ease',
-        }}
-      >
-        {formatCost(shown)}
+    <div
+      // Liquid Glass surface — strong flavor (heavier blur, brighter rim)
+      // because the cost ticker is the demo's most-watched single number.
+      // --still flavor skips the SVG distortion (the bezel is flat black,
+      // there's nothing visible to refract). Pulse-driven outline overrides
+      // the utility's default rim via inline style — Common Fate (Lidwell
+      // p40) ties the green/amber pulse here to the routing dot pulse.
+      className="lg-glass lg-glass--strong lg-glass--still"
+      style={{
+        ...styles.container,
+        ...(pulseColor && {
+          borderColor: pulseColor,
+          boxShadow: `0 12px 40px rgba(0,0,0,0.45), 0 0 24px ${pulseColor}55`,
+        }),
+        transition: 'border-color 240ms ease, box-shadow 240ms ease',
+      }}
+    >
+      <div style={styles.eyebrow}>COST THIS STREAM</div>
+
+      {/* Comparison (Lidwell p42): present Zo cost and the human-team cost on
+          a common scale (same row, same type treatment, same label rhythm).
+          The eye reads them as compared values, not as a number with a
+          footnote. The vertical divider is the visual axis of comparison. */}
+      <div style={styles.compareRow}>
+        <div style={styles.col}>
+          <div
+            style={{
+              ...styles.value,
+              color: flash ? '#fbbf24' : '#fafafa',
+              textShadow: flash ? '0 0 24px rgba(251,191,36,0.6)' : 'none',
+              transition: 'color 200ms ease, text-shadow 200ms ease',
+            }}
+          >
+            {formatCost(shown)}
+          </div>
+          <div style={styles.colLabel}>Zo · live now</div>
+        </div>
+        <div style={styles.compareDivider} />
+        <div style={{ ...styles.col, ...styles.colMuted }}>
+          <div style={styles.valueMuted}>
+            {formatHuman(comparison.amount)}
+            <span style={styles.valueUnit}>{comparison.perPeriod}</span>
+          </div>
+          <div style={styles.colLabel}>{comparison.label}</div>
+        </div>
       </div>
-      <div style={styles.comparison}>vs {comparison}</div>
     </div>
   );
 }
@@ -143,30 +218,70 @@ function formatCost(v) {
   return `$${safe.toFixed(5)}`;
 }
 
+// Whole-dollar comparison value with thousands separators ("$9,628"). The
+// human comparison never gets fractional precision — pretending we measure
+// payroll to five decimals would undercut the point.
+function formatHuman(v) {
+  const safe = Number.isFinite(v) ? Math.max(0, v) : 0;
+  return `$${Math.round(safe).toLocaleString('en-US')}`;
+}
+
 const styles = {
   container: {
-    display: 'flex', flexDirection: 'column', alignItems: 'flex-end',
-    gap: 4, padding: '12px 18px',
-    background: 'rgba(9,9,11,0.85)',
-    border: '1px solid rgba(63,63,70,0.6)',
-    borderRadius: 12,
-    backdropFilter: 'blur(8px)',
-    boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+    // Layout/typography only. Background, border, backdrop-filter, shadow,
+    // and inset highlight are all owned by the .lg-glass--strong utility
+    // (lib/liquid-glass.css), which already encodes the Top-Down Lighting
+    // Bias (Lidwell p196) inset rim + Apple WWDC '25 specular treatment.
+    display: 'flex', flexDirection: 'column', alignItems: 'stretch',
+    gap: 8, padding: '14px 16px',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    minWidth: 220,
+    minWidth: 280,
   },
-  label: {
+  eyebrow: {
     fontSize: 10, fontWeight: 800, letterSpacing: 2,
     color: '#52525b', textTransform: 'uppercase',
   },
+  compareRow: {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto minmax(0, 1fr)',
+    alignItems: 'center', gap: 12,
+  },
+  col: {
+    display: 'flex', flexDirection: 'column',
+    gap: 2, minWidth: 0,
+  },
+  colMuted: {
+    // Comparison (p42): same shape, dimmer color. Equal weight would lie
+    // about live status; clearly muted "human team" preserves the truth
+    // that one side is live cost, the other is the reference baseline.
+    opacity: 0.85,
+  },
+  compareDivider: {
+    width: 1, alignSelf: 'stretch', minHeight: 36,
+    background:
+      'linear-gradient(to bottom, transparent, rgba(82,82,91,0.8), transparent)',
+  },
   value: {
-    fontSize: 38, fontWeight: 900, letterSpacing: -0.5,
+    fontSize: 28, fontWeight: 900, letterSpacing: -0.5,
     fontVariantNumeric: 'tabular-nums',
     lineHeight: 1,
     paddingTop: 2,
   },
-  comparison: {
-    fontSize: 11, fontWeight: 600, letterSpacing: 0.5,
-    color: '#a1a1aa', paddingTop: 2,
+  valueMuted: {
+    fontSize: 24, fontWeight: 800, letterSpacing: -0.4,
+    fontVariantNumeric: 'tabular-nums',
+    lineHeight: 1, color: '#a1a1aa',
+    paddingTop: 2,
+    display: 'inline-flex', alignItems: 'baseline', gap: 2,
+  },
+  valueUnit: {
+    fontSize: 12, fontWeight: 700, color: '#71717a',
+    letterSpacing: 0.5,
+  },
+  colLabel: {
+    fontSize: 10, fontWeight: 700, letterSpacing: 1,
+    color: '#52525b', textTransform: 'uppercase',
+    paddingTop: 2,
+    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
   },
 };

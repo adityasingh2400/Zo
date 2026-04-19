@@ -162,7 +162,10 @@ export function TikTokShopOverlay({
   }, [pendingComments]);
 
   const productName = productData?.name || 'New Drop';
-  const productPrice = productData?.price || '—';
+  // Don't fall back to a styled "—" — the bold yellow em-dash placeholder
+  // rendered as a thick yellow bar across the buy card, looking like a
+  // random underline. Just hide the price line until a real price arrives.
+  const productPrice = productData?.price || null;
 
   return (
     <div style={styles.outer}>
@@ -193,10 +196,16 @@ export function TikTokShopOverlay({
 
         {/* Top bar inside the 9:16: host handle + LIVE pill + viewers + Follow.
             Sits on a subtle gradient so text stays legible over the avatar.
-            Hidden in minimalChrome mode. */}
+            Hidden in minimalChrome mode (the whole pill cluster goes dark
+            during transition + chat work).
+            The pills + the buy card all use the .lg-glass utility (Apple
+            Liquid Glass — see lib/liquid-glass.css). The inline `style`
+            objects here only carry layout, color, and typography — never
+            background/border/backdrop-filter, which are owned by the
+            utility class so the look stays consistent across surfaces. */}
         {!minimalChrome && (
           <div style={styles.topBar}>
-            <div style={styles.hostStrip}>
+            <div className="lg-glass lg-glass--soft lg-glass--pill" style={styles.hostStrip}>
               <div style={styles.hostAvatar}>Z</div>
               <div style={styles.hostMeta}>
                 <span style={styles.hostHandle}>{productHandle}</span>
@@ -209,7 +218,7 @@ export function TikTokShopOverlay({
                 <span style={styles.liveBadgeDot} />
                 LIVE
               </div>
-              <div style={styles.viewerPill}>
+              <div className="lg-glass lg-glass--soft lg-glass--pill" style={styles.viewerPill}>
                 <span style={styles.viewerEye}>👁</span>
                 <span style={styles.viewerCount}>{formatViewers(viewers)}</span>
               </div>
@@ -249,15 +258,19 @@ export function TikTokShopOverlay({
         )}
 
         {/* BUY button — sourced from productData so it reads the actual
-            item the avatar is selling. When no product loaded, shows a
-            generic "Shop now" so the demo never reads empty. Hidden in
-            minimalChrome mode. */}
+            item the avatar is selling. When no product loaded, the price
+            line just hides instead of rendering a thick yellow em-dash
+            placeholder. The card uses .lg-glass--strong (more pronounced
+            rim + heavier blur) because this is the most-looked-at piece
+            of chrome in the entire demo. Hidden in minimalChrome. */}
         {!minimalChrome && (
           <div style={styles.buyDock}>
-            <div style={styles.buyCard}>
+            <div className="lg-glass lg-glass--strong" style={styles.buyCard}>
               <div style={styles.buyMeta}>
                 <span style={styles.buyName}>{productName}</span>
-                <span style={styles.buyPrice}>{productPrice}</span>
+                {productPrice && (
+                  <span style={styles.buyPrice}>{productPrice}</span>
+                )}
               </div>
               <button type="button" style={styles.buyBtn}>
                 <span style={styles.buyBtnLabel}>BUY NOW</span>
@@ -314,7 +327,9 @@ function CommentLine({ comment, minimalChrome = false }) {
 function RailIcon({ icon, label }) {
   return (
     <div style={styles.railIcon}>
-      <span style={styles.railIconGlyph}>{icon}</span>
+      {/* Round liquid-glass disc — sits over the avatar, so the SVG
+          displacement actually shows when the avatar is moving. */}
+      <span className="lg-glass lg-glass--round" style={styles.railIconGlyph}>{icon}</span>
       <span style={styles.railIconLabel}>{label}</span>
     </div>
   );
@@ -356,12 +371,10 @@ const styles = {
     pointerEvents: 'none',
   },
   hostStrip: {
+    // Layout/spacing only. Glass surface is owned by the .lg-glass utility
+    // class on the element so the look stays consistent everywhere.
     display: 'flex', alignItems: 'center', gap: 10,
-    background: 'rgba(0,0,0,0.45)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    backdropFilter: 'blur(10px)',
     padding: '5px 6px 5px 5px',
-    borderRadius: 999,
     pointerEvents: 'auto',
   },
   hostAvatar: {
@@ -401,11 +414,9 @@ const styles = {
     animation: 'pulse 1.4s ease-in-out infinite',
   },
   viewerPill: {
+    // Layout/spacing only — glass surface owned by .lg-glass utility class.
     display: 'flex', alignItems: 'center', gap: 6,
-    background: 'rgba(0,0,0,0.55)',
-    border: '1px solid rgba(255,255,255,0.08)',
-    backdropFilter: 'blur(10px)',
-    padding: '3px 9px', borderRadius: 999,
+    padding: '3px 9px',
     fontSize: 11, fontWeight: 700, color: '#fff',
   },
   viewerEye: { fontSize: 12 },
@@ -431,10 +442,8 @@ const styles = {
     display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
   },
   railIconGlyph: {
-    width: 42, height: 42, borderRadius: 21,
-    background: 'rgba(0,0,0,0.5)',
-    border: '1px solid rgba(255,255,255,0.1)',
-    backdropFilter: 'blur(6px)',
+    // Sizing only — round glass disc surface owned by .lg-glass + .lg-glass--round.
+    width: 42, height: 42,
     color: '#fff', fontSize: 18,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
@@ -449,14 +458,13 @@ const styles = {
     pointerEvents: 'none',
   },
   buyCard: {
-    background: 'rgba(0,0,0,0.65)',
-    border: '1px solid rgba(255,255,255,0.12)',
-    backdropFilter: 'blur(10px)',
-    borderRadius: 14, padding: '8px 8px 8px 14px',
+    // Layout/spacing only — strong-glass surface owned by .lg-glass--strong.
+    // Border-radius is set on .lg-glass (14px default) so it matches the
+    // utility's specular layer perfectly without double-declaration.
+    padding: '8px 8px 8px 14px',
     display: 'flex', alignItems: 'center', gap: 12,
     pointerEvents: 'auto',
     maxWidth: '78%',
-    boxShadow: '0 8px 24px rgba(0,0,0,0.55)',
   },
   buyMeta: {
     display: 'flex', flexDirection: 'column', lineHeight: 1.15,

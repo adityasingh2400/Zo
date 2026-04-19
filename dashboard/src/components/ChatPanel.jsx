@@ -99,7 +99,13 @@ export function ChatPanel({ onSendComment, commentResponse, pendingComments = []
           placeholder="Type a comment..."
           style={styles.input}
         />
-        <button onClick={handleSend} style={styles.sendBtn}>Send</button>
+        <button onClick={handleSend} style={styles.sendBtn}>
+          {/* Recognition Over Recall (Lidwell p164): Enter-to-send is wired,
+              but invisible behavior is no behavior at all to a first-time
+              user. The kbd chip surfaces the shortcut at the exact moment
+              the user is deciding how to commit. */}
+          Send <kbd style={styles.sendKbd}>↵</kbd>
+        </button>
       </div>
     </div>
   );
@@ -122,7 +128,15 @@ const styles = {
   },
   sendBtn: {
     background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 8,
-    padding: '10px 20px', fontWeight: 700, cursor: 'pointer',
+    padding: '10px 16px', fontWeight: 700, cursor: 'pointer',
+    display: 'inline-flex', alignItems: 'center', gap: 8,
+  },
+  sendKbd: {
+    display: 'inline-block', minWidth: 18, padding: '1px 6px',
+    background: 'rgba(255,255,255,0.2)', border: '1px solid rgba(255,255,255,0.3)',
+    borderRadius: 4, fontSize: 11, fontWeight: 700,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    color: '#fff', textAlign: 'center',
   },
   latencyChip: {
     fontSize: 10, fontWeight: 800, color: '#bbf7d0',

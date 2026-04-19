@@ -1,0 +1,238 @@
+/*
+ * Liquid Glass utility classes — Apple WWDC 2025 / iOS 26 aesthetic,
+ * adapted for Zo's dark theme.
+ *
+ * Recipe (per cssscript.com canonical implementation, four layers):
+ *
+ *   .lg-glass            Container. Sets the rim, drop shadow, rounded
+ *                        corners, and `position: relative` so the layer
+ *                        pseudo-elements absolutely-position cleanly.
+ *   ::before             Distortion + backdrop-blur layer. The SVG filter
+ *                        from LiquidGlassDefs.jsx warps anything visible
+ *                        through this layer.
+ *   ::after              Specular highlight. The "wet" inset glow that
+ *                        makes the surface look refractive instead of flat.
+ *   > content            Render naturally above both pseudo-elements via
+ *                        `position: relative; z-index: 1`.
+ *
+ * Modifiers:
+ *   .lg-glass--still     Skip the SVG distortion (use on surfaces that sit
+ *                        over flat color — bezel chrome — where displacement
+ *                        is invisible and just costs GPU time).
+ *   .lg-glass--soft      Lighter blur, lower opacity. For ambient pills.
+ *   .lg-glass--strong    Stronger rim highlight. For hero CTAs.
+ *
+ * IMPORTANT: only use on persistent chrome. Per-frame moving elements
+ * (chat bubbles, hearts) re-trigger filter compositing every animation
+ * frame; that wrecks 60fps on integrated GPUs. The TikTokShopOverlay is
+ * already careful here — heart spans and comment lines stay simple.
+ *
+ * Color tokens come from the existing Zo palette (App.jsx, RoutingPanel,
+ * CostTicker). NOT introducing new colors. The dark glass background is
+ * a translucent version of the existing #0f0f12 panel color; the rim
+ * highlight is plain white at very low alpha — same trick I used for
+ * Top-Down Lighting Bias on the KPI cards earlier.
+ */
+
+:root {
+  /* Dark-glass body — derived from #0f0f12 (existing RoutingPanel bg) at ~42% alpha */
+  --lg-bg: rgba(15, 15, 22, 0.42);
+  --lg-bg-soft: rgba(15, 15, 22, 0.28);
+  --lg-bg-strong: rgba(9, 9, 11, 0.62);
+
+  /* Rim & specular — plain white at low alpha, mirrors WWDC reference */
+  --lg-rim: rgba(255, 255, 255, 0.14);
+  --lg-rim-soft: rgba(255, 255, 255, 0.08);
+  --lg-specular: rgba(255, 255, 255, 0.32);
+  --lg-specular-strong: rgba(255, 255, 255, 0.5);
+
+  /* Backdrop blur tuning */
+  --lg-blur: 22px;
+  --lg-blur-soft: 14px;
+  --lg-blur-strong: 28px;
+
+  /* Saturation boost on the backdrop — keeps colors vivid through frosted glass.
+     Apple ships ~150-180% on iOS 26; 160% is a tasteful midpoint. */
+  --lg-saturate: 160%;
+
+  /* Outer shadow — soft, multi-layered. Stays dark to anchor the surface
+     against the dark theme without introducing colored glow. */
+  --lg-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 12px 40px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+/* ============================================================
+ * Base container
+ * ============================================================ */
+.lg-glass {
+  position: relative;
+  background: transparent;
+  border: 1px solid var(--lg-rim);
+  border-radius: 14px;
+  box-shadow: var(--lg-shadow);
+  overflow: hidden;
+  isolation: isolate;
+  /* Don't break selectability of children */
+  color: inherit;
+}
+
+/* The frosted distortion + blur layer.
+ * z-index: -1 (with `isolation: isolate` on the parent containing the
+ * stacking context) keeps the layer BEHIND text content automatically —
+ * no need to wrap every text node in a span. Without this, an absolutely-
+ * positioned pseudo at z-index 0 would paint OVER inline text (CSS step
+ * 6 vs step 5 of stacking order). */
+.lg-glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--lg-bg);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  /* Filter applied here, NOT to the parent — so children stay crisp. The
+     filter ID is defined in LiquidGlassDefs.jsx, mounted once at the root. */
+  filter: url(#lg-distortion);
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+/* The specular highlight — a soft inset glow at the top edge that makes the
+ * surface read as refractive glass instead of flat translucent. Lives ABOVE
+ * the content (z-index: 1) so it catches text edges with the highlight; the
+ * effect is purely visual and `pointer-events: none` keeps clicks reaching
+ * the content underneath. */
+.lg-glass::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow:
+    inset 0 1px 0 var(--lg-specular),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  /* Subtle top→bottom shine that catches the rim from a virtual top light.
+     Mirrors the Top-Down Lighting Bias (Lidwell p196) treatment we used on
+     the KPI cards — same physical metaphor, more pronounced for glass. */
+  background:
+    linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.08) 0%,
+      rgba(255, 255, 255, 0) 30%,
+      rgba(255, 255, 255, 0) 70%,
+      rgba(0, 0, 0, 0.08) 100%
+    );
+}
+
+/* ============================================================
+ * Modifiers
+ * ============================================================ */
+
+/* Skip distortion — used for surfaces on flat color (bezel) where the
+   filter would just waste GPU. Keeps blur + specular + rim. */
+.lg-glass--still::before {
+  filter: none;
+}
+
+/* Softer flavor — for ambient pills like @username, viewer count. */
+.lg-glass--soft {
+  border-color: var(--lg-rim-soft);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.03) inset,
+    0 4px 14px rgba(0, 0, 0, 0.32);
+}
+.lg-glass--soft::before {
+  background: var(--lg-bg-soft);
+  backdrop-filter: blur(var(--lg-blur-soft)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur-soft)) saturate(var(--lg-saturate));
+}
+
+/* Stronger flavor — for hero CTAs and the cost ticker's primary surface.
+ * Heavier blur for content separation, but the rim is *softer* than the
+ * default so the surface reads as a floating frosted shape rather than a
+ * bordered card. Earlier revision stacked three white-ish rims (parent
+ * border + ::after inset highlight + --lg-shadow inset top) which became
+ * visibly outlined on dark backgrounds. */
+.lg-glass--strong {
+  border-color: rgba(255, 255, 255, 0.06);
+}
+.lg-glass--strong::before {
+  background: var(--lg-bg-strong);
+  backdrop-filter: blur(var(--lg-blur-strong)) saturate(var(--lg-saturate));
+  -webkit-backdrop-filter: blur(var(--lg-blur-strong)) saturate(var(--lg-saturate));
+}
+.lg-glass--strong::after {
+  /* Single soft top highlight only — no inset 1px ring (that was the
+     "second outline" stacking onto the parent border). */
+  box-shadow: inset 0 1px 0 var(--lg-specular);
+}
+
+/* Pill shape — for compact elements like the @username strip and viewer pill. */
+.lg-glass--pill {
+  border-radius: 999px;
+}
+
+/* Round shape — for the right-rail icon buttons.
+ *
+ * Two fixes the hero --lg-shadow can't deliver at this size:
+ *
+ * 1. The default shadow is `0 12px 40px rgba(0,0,0,0.45)` — a 40px blur
+ *    around a 42px disc smears WIDER than the disc itself and reads as
+ *    a soft rectangular halo behind the round shape (the "ugly square
+ *    logos surrounding them" bug). Replace with a tight, proportional
+ *    shadow: small drop + thin dark hairline at the border.
+ *
+ * 2. The SVG `filter: url(#lg-distortion)` has a known Chromium quirk
+ *    when stacked with `border-radius` — the filter primitive region
+ *    extends ~10% beyond the element bounds and bleeds outside the
+ *    rounded clip, painting a square footprint behind the disc. At
+ *    42px the displacement isn't visible anyway, so kill the filter
+ *    on round elements and keep just the blur + saturate frosting. */
+.lg-glass--round {
+  border-radius: 50%;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+.lg-glass--round::before {
+  filter: none;
+}
+.lg-glass--round::after {
+  /* Specular highlight for round surfaces is a soft top arc, not the
+     square-bottom-shadow gradient the default ::after uses. The default
+     bottom-dark gradient on a circle reads as a chin-shadow that breaks
+     the symmetry; replace with a clean top-only highlight. */
+  background: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.12) 0%,
+    rgba(255, 255, 255, 0) 45%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+/* ============================================================
+ * Accessibility / motion + transparency preferences
+ * ============================================================ */
+
+/* Honor user preference: skip the heavy displacement + saturate boost for
+   users who request reduced transparency (macOS / iOS accessibility setting).
+   Falls back to a clean opaque dark surface — still readable, no broken UI. */
+@media (prefers-reduced-transparency: reduce) {
+  .lg-glass::before {
+    filter: none;
+    background: rgba(15, 15, 22, 0.95);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .lg-glass--soft::before {
+    background: rgba(15, 15, 22, 0.92);
+  }
+  .lg-glass--strong::before {
+    background: rgba(9, 9, 11, 0.95);
+  }
+}

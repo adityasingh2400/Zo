@@ -38,6 +38,11 @@ struct ContentView: View {
     @State private var showingHostSheet = false
     @State private var hostInput: String = ""
 
+    // Rolling history of the last few transcripts — so during stage rehearsal
+    // the operator can see what whisper has been hearing across reps, not just
+    // the active one. Capped at 5. Tap the header to clear.
+    @State private var transcriptHistory: [TranscriptCardData] = []
+
     enum UIState: Equatable {
         case loading
         case ready
@@ -62,6 +67,7 @@ struct ContentView: View {
 
                 ScrollView {
                     VStack(spacing: 10) {
+                        if !transcriptHistory.isEmpty { transcriptHistorySection }
                         if let t = transcript { transcriptCard(t) }
                         if let g = gemma      { gemmaCard(g) }
                         if let d = decision   { decisionCard(d) }
@@ -202,6 +208,48 @@ struct ContentView: View {
         .padding(12).background(Color.white.opacity(0.04)).cornerRadius(8)
     }
 
+    // Rehearsal affordance: shows the last 5 transcripts above the active one
+    // with dimmed styling so it's clear which one is current. Tap the header
+    // to clear — useful between reps if the history gets cluttered.
+    private var transcriptHistorySection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("HISTORY")
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.35))
+                    .tracking(1.2)
+                Spacer()
+                Text("tap to clear")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.25))
+            }
+            .padding(.horizontal, 4)
+            .contentShape(Rectangle())
+            .onTapGesture { transcriptHistory.removeAll() }
+
+            ForEach(Array(transcriptHistory.enumerated()), id: \.offset) { _, d in
+                HStack(alignment: .top, spacing: 10) {
+                    Text("·")
+                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.25))
+                        .frame(width: 60, alignment: .leading)
+                    Text("\"\(d.text)\"")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.45))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("\(d.ms)ms")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.3))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+            }
+        }
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(0.015))
+        .cornerRadius(6)
+    }
+
     private func gemmaCard(_ d: GemmaCardData) -> some View {
         // Magenta to distinguish from WHISPER (gray) and ROUTER (color-coded).
         let accent = Color(red: 0.851, green: 0.275, blue: 0.937)
@@ -328,6 +376,11 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 50_000_000)
         do {
             try recorder.start()
+            // Preserve the just-shown transcript in the rolling history before
+            // wiping so the operator can scan what whisper heard across reps.
+            if let prev = transcript {
+                transcriptHistory = Array(([prev] + transcriptHistory).prefix(5))
+            }
             transcript = nil; decision = nil; gemma = nil
             director.backToIdle()
             state = .recording

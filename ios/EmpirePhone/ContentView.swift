@@ -43,6 +43,11 @@ struct ContentView: View {
     // the active one. Capped at 5. Tap the header to clear.
     @State private var transcriptHistory: [TranscriptCardData] = []
 
+    // Phase 0.2: "+ Film product" flow — camera shim + upload to /api/sell-video.
+    // Gated by FeatureFlags.sellerMode (default false — off for stage).
+    @State private var showingCapture = false
+    @State private var uploadState: SellerCaptureUploadState = .idle
+
     enum UIState: Equatable {
         case loading
         case ready
@@ -76,12 +81,25 @@ struct ContentView: View {
                 }
                 .frame(maxHeight: .infinity)
 
+                if FeatureFlags.sellerMode {
+                    sellerCaptureSection
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+                }
+
                 pushToTalkButton
                     .padding(.horizontal, 16)
                     .padding(.bottom, 24)
             }
 
             if state == .loading { splash }
+        }
+        .sheet(isPresented: $showingCapture) {
+            SellerCaptureShim { url in
+                showingCapture = false
+                Task { await uploadCapturedVideo(url) }
+            }
+            .ignoresSafeArea()
         }
         .alert("Backend host", isPresented: $showingHostSheet) {
             TextField("e.g. 192.168.1.42", text: $hostInput)
@@ -320,6 +338,68 @@ struct ContentView: View {
         case .playCannedClip:  return Color(red: 0.486, green: 0.227, blue: 0.929)
         case .blockComment:    return Color(red: 0.631, green: 0.631, blue: 0.678)
         case .escalateToCloud: return Color(red: 0.961, green: 0.620, blue: 0.043)
+        }
+    }
+
+    // MARK: - Seller capture (Phase 0.2)
+
+    private var sellerCaptureSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                showingCapture = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("+ FILM PRODUCT")
+                        .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                        .tracking(1.2)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.25), lineWidth: 1)
+                )
+            }
+            .disabled(uploadState == .uploading)
+
+            if case .uploading = uploadState {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small).tint(.white)
+                    Text("uploading to Mac…")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+                .padding(.horizontal, 12)
+            } else if case .success(let id) = uploadState {
+                Text("uploaded · \(id.prefix(8))")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.green.opacity(0.85))
+                    .padding(.horizontal, 12)
+            } else if case .failed(let msg) = uploadState {
+                Text(msg)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.red.opacity(0.85))
+                    .lineLimit(2)
+                    .padding(.horizontal, 12)
+            }
+        }
+    }
+
+    private func uploadCapturedVideo(_ url: URL) async {
+        await MainActor.run { uploadState = .uploading }
+        do {
+            let result = try await SellerCaptureUploader.upload(videoURL: url)
+            let requestID = (result["request_id"] as? String)
+                ?? (result["id"] as? String)
+                ?? "ok"
+            await MainActor.run { uploadState = .success(requestID: requestID) }
+        } catch {
+            await MainActor.run {
+                uploadState = .failed(message: error.localizedDescription)
+            }
         }
     }
 

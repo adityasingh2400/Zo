@@ -24,6 +24,8 @@ struct ContentView: View {
     // either open the camera (no product yet) or land on StreamView.
     @State private var phase: Phase = .checking
     @State private var showingCapture = false
+    @State private var showingHostSheet = false
+    @State private var hostInput = ""
 
     enum Phase: Equatable {
         case checking
@@ -60,6 +62,26 @@ struct ContentView: View {
                 }
                 showingCapture = false
             }
+        }
+        .alert("Backend host", isPresented: $showingHostSheet) {
+            TextField("e.g. 172.20.10.2", text: $hostInput)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Button("Save") {
+                GemmaClient.setBackendHost(hostInput)
+                Task { await resolveLaunchPhase() }
+            }
+            Button("Reset to default", role: .destructive) {
+                GemmaClient.setBackendHost(nil)
+                Task { await resolveLaunchPhase() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let resolved = GemmaClient.backendHost ?? "(none)"
+            let source = GemmaClient.hasUserDefaultsOverride ? "runtime override"
+                       : "Info.plist / default"
+            Text("Current: \(resolved) · \(source)\nRun `ipconfig getifaddr en0` on the Mac")
         }
         .task { await bootstrap() }
     }
@@ -118,7 +140,9 @@ struct ContentView: View {
     }
 
     /// Shown when phase=.needsProduct AND the camera sheet has been
-    /// dismissed without uploading — lets the user try again.
+    /// dismissed without uploading — lets the user try again. Also the
+    /// escape hatch for fixing a wrong backend host: long-press the
+    /// TAP TO FILM button to open the host-override alert.
     private var restartSurface: some View {
         VStack(spacing: 18) {
             Image(systemName: "video.fill")
@@ -139,6 +163,27 @@ struct ContentView: View {
                     .background(Color.white)
                     .clipShape(Capsule())
             }
+            .onLongPressGesture(minimumDuration: 0.6) {
+                hostInput = GemmaClient.backendHost ?? ""
+                showingHostSheet = true
+            }
+
+            // Always-visible tiny footer showing the resolved backend host
+            // so when the Mac's IP changes the user sees exactly what the
+            // phone is targeting and can long-press to fix.
+            VStack(spacing: 2) {
+                Text("backend")
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .tracking(1)
+                    .foregroundColor(.white.opacity(0.3))
+                Text(GemmaClient.backendHost ?? "(not configured)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.5))
+                Text("long-press the button above to change")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.25))
+            }
+            .padding(.top, 14)
         }
     }
 }

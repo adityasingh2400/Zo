@@ -152,13 +152,31 @@ struct SellerCaptureView: View {
     }
 
     private func failureBanner(message: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.red)
-            Text(message)
-                .font(.system(size: 12))
-                .foregroundColor(.white)
-                .lineLimit(3)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.red)
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundColor(.white)
+                    .lineLimit(3)
+            }
+            // Show the target host + port so the user knows exactly which
+            // Mac IP to fix. On "Could not connect to the server" (-1004)
+            // the fix is almost always: same-network or long-press host
+            // override. Surfacing the host here makes the fix obvious.
+            HStack(spacing: 6) {
+                Text("target")
+                    .font(.system(size: 9, weight: .heavy, design: .monospaced))
+                    .tracking(1)
+                    .foregroundColor(.white.opacity(0.4))
+                Text("\(GemmaClient.backendHost ?? "?"):8000")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.65))
+            }
+            Text("close this → long-press TAP TO FILM to change the host")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(.white.opacity(0.35))
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)

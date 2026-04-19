@@ -43,6 +43,9 @@ export function TikTokShopOverlay({
   pitchAudio,
   onAudioEnded,
   productHandle = '@zo_demo',
+  minimalChrome = false,  // strip every non-chat pill so /stage is a clean
+                          // canvas for transition + chat-reactivity work.
+                          // Driven by MINIMAL_STAGE in StageView.
 }) {
   // Viewer count — pure visual, ticks up by 1-3 every 4-7s so the room
   // reads it as a real stream gathering traction. Seeded from a stable-feeling
@@ -184,80 +187,98 @@ export function TikTokShopOverlay({
             pitchAudio={pitchAudio}
             onAudioEnded={onAudioEnded}
             inOverlay
+            minimalChrome={minimalChrome}
           />
         </div>
 
         {/* Top bar inside the 9:16: host handle + LIVE pill + viewers + Follow.
-            Sits on a subtle gradient so text stays legible over the avatar. */}
-        <div style={styles.topBar}>
-          <div style={styles.hostStrip}>
-            <div style={styles.hostAvatar}>Z</div>
-            <div style={styles.hostMeta}>
-              <span style={styles.hostHandle}>{productHandle}</span>
-              <span style={styles.hostSub}>Zo Live · selling now</span>
+            Sits on a subtle gradient so text stays legible over the avatar.
+            Hidden in minimalChrome mode. */}
+        {!minimalChrome && (
+          <div style={styles.topBar}>
+            <div style={styles.hostStrip}>
+              <div style={styles.hostAvatar}>Z</div>
+              <div style={styles.hostMeta}>
+                <span style={styles.hostHandle}>{productHandle}</span>
+                <span style={styles.hostSub}>Zo Live · selling now</span>
+              </div>
+              <button type="button" style={styles.followBtn}>+ Follow</button>
             </div>
-            <button type="button" style={styles.followBtn}>+ Follow</button>
+            <div style={styles.topRightCluster}>
+              <div style={styles.liveBadge}>
+                <span style={styles.liveBadgeDot} />
+                LIVE
+              </div>
+              <div style={styles.viewerPill}>
+                <span style={styles.viewerEye}>👁</span>
+                <span style={styles.viewerCount}>{formatViewers(viewers)}</span>
+              </div>
+            </div>
           </div>
-          <div style={styles.topRightCluster}>
-            <div style={styles.liveBadge}>
-              <span style={styles.liveBadgeDot} />
-              LIVE
-            </div>
-            <div style={styles.viewerPill}>
-              <span style={styles.viewerEye}>👁</span>
-              <span style={styles.viewerCount}>{formatViewers(viewers)}</span>
-            </div>
-          </div>
-        </div>
+        )}
 
         {/* Floating hearts rail. Lives just to the left of the BUY button so
             the eye reads "hearts coming up from the buy button" — the same
-            interaction grammar TikTok / Instagram trained the audience on. */}
-        <div style={styles.heartsRail}>
-          {hearts.map(h => (
-            <span
-              key={h.id}
-              style={{
-                ...styles.heart,
-                left: `calc(50% + ${h.offset}px)`,
-                ['--sway']: `${h.sway}px`,
-              }}
-            >
-              ❤
-            </span>
-          ))}
-        </div>
+            interaction grammar TikTok / Instagram trained the audience on.
+            Hidden in minimalChrome mode. */}
+        {!minimalChrome && (
+          <div style={styles.heartsRail}>
+            {hearts.map(h => (
+              <span
+                key={h.id}
+                style={{
+                  ...styles.heart,
+                  left: `calc(50% + ${h.offset}px)`,
+                  ['--sway']: `${h.sway}px`,
+                }}
+              >
+                ❤
+              </span>
+            ))}
+          </div>
+        )}
 
         {/* Right action rail — share/comment/cart icons. Visual only; the
-            BUY button is the action that matters. */}
-        <div style={styles.rightRail}>
-          <RailIcon icon="↗" label="Share" />
-          <RailIcon icon="💬" label={comments.length > 0 ? String(comments.length) : 'Chat'} />
-          <RailIcon icon="🛍" label="Cart" />
-        </div>
+            BUY button is the action that matters. Hidden in minimalChrome. */}
+        {!minimalChrome && (
+          <div style={styles.rightRail}>
+            <RailIcon icon="↗" label="Share" />
+            <RailIcon icon="💬" label={comments.length > 0 ? String(comments.length) : 'Chat'} />
+            <RailIcon icon="🛍" label="Cart" />
+          </div>
+        )}
 
         {/* BUY button — sourced from productData so it reads the actual
             item the avatar is selling. When no product loaded, shows a
-            generic "Shop now" so the demo never reads empty. */}
-        <div style={styles.buyDock}>
-          <div style={styles.buyCard}>
-            <div style={styles.buyMeta}>
-              <span style={styles.buyName}>{productName}</span>
-              <span style={styles.buyPrice}>{productPrice}</span>
+            generic "Shop now" so the demo never reads empty. Hidden in
+            minimalChrome mode. */}
+        {!minimalChrome && (
+          <div style={styles.buyDock}>
+            <div style={styles.buyCard}>
+              <div style={styles.buyMeta}>
+                <span style={styles.buyName}>{productName}</span>
+                <span style={styles.buyPrice}>{productPrice}</span>
+              </div>
+              <button type="button" style={styles.buyBtn}>
+                <span style={styles.buyBtnLabel}>BUY NOW</span>
+                <span style={styles.buyBtnArrow}>→</span>
+              </button>
             </div>
-            <button type="button" style={styles.buyBtn}>
-              <span style={styles.buyBtnLabel}>BUY NOW</span>
-              <span style={styles.buyBtnArrow}>→</span>
-            </button>
           </div>
-        </div>
+        )}
 
         {/* Comment scroll — left side, comments slide up from the bottom
             and fade as they near the buy dock. Each entry is @username:text
-            in the recognizable platform format. */}
-        <div style={styles.chatRail}>
+            in the recognizable platform format. In minimalChrome mode the
+            BUY card is gone, so the rail can extend lower + wider; merge
+            the chrome-mode position offset inline so the layout doesn't
+            need a separate style block. */}
+        <div style={{
+          ...styles.chatRail,
+          ...(minimalChrome ? styles.chatRailMinimal : null),
+        }}>
           {comments.map(c => (
-            <CommentLine key={c.id} comment={c} />
+            <CommentLine key={c.id} comment={c} minimalChrome={minimalChrome} />
           ))}
         </div>
       </div>
@@ -265,17 +286,27 @@ export function TikTokShopOverlay({
   );
 }
 
-function CommentLine({ comment }) {
+function CommentLine({ comment, minimalChrome = false }) {
   const isAudience = comment.source === 'audience';
   return (
     <div style={{
       ...styles.commentLine,
+      ...(minimalChrome ? styles.commentLineMinimal : null),
       borderLeftColor: isAudience ? '#ec4899' : '#7c3aed',
     }}>
-      <span style={{ ...styles.commentUser, color: isAudience ? '#fbcfe8' : '#c4b5fd' }}>
+      <span style={{
+        ...styles.commentUser,
+        ...(minimalChrome ? styles.commentUserMinimal : null),
+        color: isAudience ? '#fbcfe8' : '#c4b5fd',
+      }}>
         @{comment.username}
       </span>
-      <span style={styles.commentText}>{comment.text}</span>
+      <span style={{
+        ...styles.commentText,
+        ...(minimalChrome ? styles.commentTextMinimal : null),
+      }}>
+        {comment.text}
+      </span>
     </div>
   );
 }
@@ -460,6 +491,17 @@ const styles = {
     overflow: 'hidden',
     justifyContent: 'flex-end',
   },
+  // In minimalChrome the BUY dock is gone, so the chat rail can extend
+  // lower (toward the bottom of the phone frame) and use more horizontal
+  // room. Slightly larger maxHeight + tighter bottom inset puts the chat
+  // closer to where the eye expects the action to be without overlapping
+  // the karaoke captions (which sit centered, lower than this rail).
+  chatRailMinimal: {
+    bottom: 24,
+    width: '68%',
+    gap: 10,
+    maxHeight: '52%',
+  },
   commentLine: {
     background: 'rgba(0,0,0,0.45)',
     backdropFilter: 'blur(6px)',
@@ -470,11 +512,29 @@ const styles = {
     fontSize: 12, lineHeight: 1.3,
     animation: 'commentRise 360ms cubic-bezier(0.2, 0.8, 0.2, 1.0)',
   },
+  // Fewer pills competing for attention means each chat bubble can read
+  // a bit larger without crowding. Bumps font size + padding + contrast
+  // so the bubbles are the visual anchor of the stage during minimal-mode
+  // chat-reactivity work. Text only — colors/borders inherited.
+  commentLineMinimal: {
+    background: 'rgba(0,0,0,0.62)',
+    borderRadius: 12, padding: '8px 12px',
+    fontSize: 14, lineHeight: 1.35,
+    gap: 8,
+    borderLeftWidth: 4,
+  },
   commentUser: {
     fontWeight: 800, fontSize: 11, flexShrink: 0,
   },
+  commentUserMinimal: {
+    fontSize: 13,
+    letterSpacing: 0.2,
+  },
   commentText: {
     color: '#fafafa', fontWeight: 500, wordBreak: 'break-word',
+  },
+  commentTextMinimal: {
+    fontSize: 14,
   },
 };
 

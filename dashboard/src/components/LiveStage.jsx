@@ -41,6 +41,10 @@ export function LiveStage({
                             // mount, just without the voice pill / routing badge — same
                             // as before this prop existed. Pass it from useEmpireSocket
                             // to enable the in-stage voice/routing overlays.
+  minimalChrome = false,   // when true (driven by MINIMAL_STAGE in StageView), also
+                            // hide voice-state pill + routing badge + TranslationChip
+                            // so the stage is a clean canvas for transition + chat work.
+                            // Karaoke captions stay because they ARE the agent's reaction.
 }) {
   // Voice/routing state listened off the shared WS directly so LiveStage stays
   // self-contained — no prop changes needed in App.jsx (which Cody is also
@@ -535,14 +539,17 @@ export function LiveStage({
 
         {/* Voice-flow state — drives the audience's mental model of where we are
             in the request. Cody's VoiceMic + router will broadcast the events
-            that flip voiceState; this component just renders. */}
-        {voiceState && voiceState !== 'idle' && (
+            that flip voiceState; this component just renders. Hidden in
+            minimalChrome — the avatar's actual reaction (clip swap + karaoke)
+            IS the state in that mode. */}
+        {voiceState && voiceState !== 'idle' && !minimalChrome && (
           <VoiceStatePill state={voiceState} />
         )}
 
         {/* Routing decision badge — pops on every comment routed locally vs cloud.
-            Auto-fades after 3.2s so the stage stays clean. */}
-        {routingDecision && (
+            Auto-fades after 3.2s so the stage stays clean. Hidden in minimalChrome
+            (it's a dev/operator signal, not part of the audience-facing reaction). */}
+        {routingDecision && !minimalChrome && (
           <RoutingBadge decision={routingDecision} />
         )}
 
@@ -602,8 +609,10 @@ export function LiveStage({
           windowSize={audioPlaying?.kind === 'pitch' ? 9 : 7}
           visible={!!audioPlaying}
         />
+        {/* TranslationChip is itself a pill ("🔴 LIVE · auto-captioned"),
+            so suppress in minimalChrome — captions speak for themselves. */}
         <TranslationChip
-          visible={!!audioPlaying}
+          visible={!!audioPlaying && !minimalChrome}
           variant={audioPlaying?.kind === 'pitch' ? 'pitch' : 'live'}
         />
 

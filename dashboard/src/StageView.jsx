@@ -40,6 +40,18 @@ const API_BASE = `http://${window.location.hostname}:8000`;
 // the dev experience in a narrow IDE pane stays usable.
 const WIDE_BEZEL_MIN_PX = 1280;
 
+// MINIMAL_STAGE strips /stage down to just the avatar + chat rail + karaoke
+// captions while we iterate on (1) the new state→state transition treatment
+// and (2) chat-rail polish + agent reactivity. Flip to false to restore the
+// full TikTok Shop chrome (CostTicker, RoutingPanel strip, hint card, host
+// pill / LIVE badge / viewers / Follow / right rail / BUY card / hearts /
+// LiveStage's voice pill + routing badge + TranslationChip).
+//
+// Single source of truth — propagates as `minimalChrome` to TikTokShopOverlay
+// → LiveStage so every conditional reads from the same boolean. Restoring is
+// a one-line change here, no JSX rewiring required.
+const MINIMAL_STAGE = true;
+
 export default function StageView() {
   const {
     productData, pitchVideoUrl, responseVideo, pendingComments,
@@ -174,27 +186,34 @@ export default function StageView() {
         audioResponse={audioResponse}
         pitchAudio={pitchAudio}
         onAudioEnded={handleAudioEnded}
+        minimalChrome={MINIMAL_STAGE}
       />
 
       {/* Bezel chrome — lives in the black bars on either side of 9:16
           at projector widths (≥1280px). At narrower viewports it stacks
-          along the top edge so it never overlaps the phone frame. */}
-      <div style={wideBezel ? styles.bezelTopRight : styles.stackedTopRight}>
-        <CostTicker wsRef={wsRef} connected={connected} />
-      </div>
+          along the top edge so it never overlaps the phone frame. All
+          three pieces are gated behind MINIMAL_STAGE so the stage stays
+          a clean canvas for transition + chat work. */}
+      {!MINIMAL_STAGE && (
+        <div style={wideBezel ? styles.bezelTopRight : styles.stackedTopRight}>
+          <CostTicker wsRef={wsRef} connected={connected} />
+        </div>
+      )}
 
-      <div style={wideBezel ? styles.bezelBottomRight : styles.stackedRoutingNarrow}>
-        <RoutingPanel
-          routingDecisions={routingDecisions}
-          routingStats={routingStats}
-          compact
-        />
-      </div>
+      {!MINIMAL_STAGE && (
+        <div style={wideBezel ? styles.bezelBottomRight : styles.stackedRoutingNarrow}>
+          <RoutingPanel
+            routingDecisions={routingDecisions}
+            routingStats={routingStats}
+            compact
+          />
+        </div>
+      )}
 
       {/* Stage operator hint — visible until the first Go Live press, or
           12s, whichever comes first. Hidden in stacked mode (no room
           without overlapping the phone frame). */}
-      {hintVisible && wideBezel && (
+      {!MINIMAL_STAGE && hintVisible && wideBezel && (
         <div style={styles.bezelBottomLeft}>
           <div style={styles.hint}>
             <div style={styles.hintHeader}>

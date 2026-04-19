@@ -2055,7 +2055,9 @@ async def _run_play_canned_clip(comment: str, args: dict, decision: dict) -> dic
 
     if director:
         await director.play_response(url)
-        trace.phase("canned_clip_playing", label=label, url=url)
+        # `label` collides with trace.phase()'s own positional `label` arg
+        # (the phase name). Surface the bridge label as `clip_label` instead.
+        trace.phase("canned_clip_playing", clip_label=label, url=url)
         # Bridge clips are short (~2s). Fade after clip + tail.
         play_ms = (clip.get("ms") or 2500) + 400
 

@@ -1,5 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { LiveStage } from './LiveStage';
+import { Spin3D } from './Spin3D';
+import { HeroSlideshow } from './HeroSlideshow';
+import { useSpin3DVoiceState } from '../hooks/useSpin3DVoiceState';
 
 /**
  * TikTokShopOverlay — the demo's framing layer.
@@ -42,11 +45,39 @@ export function TikTokShopOverlay({
   audioResponse,
   pitchAudio,
   onAudioEnded,
+  // view3d = {kind:'frame_carousel', frames:[...], heroes:[...], hero_meta:[...]}
+  // produced by backend/agents/threed.py from the seller's product video.
+  // When present, drives the floating product showcase overlaid on the
+  // top-right of the avatar: Spin3D (live 3D rotation) on top, HeroSlideshow
+  // (auto-cycling best shots, one at a time) underneath. Both wrapped in
+  // lg-glass bubble containers so they read as floating element-wise overlays
+  // on the avatar rather than chrome bolted to the side.
+  view3d,
   productHandle = '@zo_demo',
   minimalChrome = false,  // strip every non-chat pill so /stage is a clean
                           // canvas for transition + chat-reactivity work.
                           // Driven by MINIMAL_STAGE in StageView.
+                          // NB: the productShowcase (Spin3D + HeroSlideshow)
+                          // ignores this flag — it IS the audience-facing
+                          // product chrome, not platform decoration.
 }) {
+  // Spin3D state — same WS-driven idle/thinking/responding state machine
+  // ProductPanel uses on the operator dashboard. Shared hook → both panels
+  // glow + slow + accent-flash in lockstep with the avatar's voice pipeline.
+  const spinState = useSpin3DVoiceState({ wsRef, connected });
+  // Showcase only renders once the carousel has at least one frame. Until
+  // then the right side of the phone stays clean — no empty floating cards
+  // staring at the audience pre-pitch.
+  const hasCarousel = !!view3d?.frames?.length;
+  // Two hero lists from threed.py: `heroes` (rembg'd PNGs, transparent —
+  // for Spin3D-style transparent backdrops) and `raw_heroes` (untouched
+  // JPEGs from the source frame, real backgrounds intact). HeroSlideshow
+  // wants the RAW versions per the operator's call: "for the 4 rotating
+  // images you don't need background removal, only for the 3D revolving
+  // model." Falls back to the rembg'd `heroes` if raw_heroes is empty
+  // (e.g. older cached carousel built before the raw save shipped).
+  const heroes = (view3d?.raw_heroes?.length ? view3d.raw_heroes : view3d?.heroes) || [];
+  const heroMeta = view3d?.hero_meta || [];
   // Viewer count — pure visual, ticks up by 1-3 every 4-7s so the room
   // reads it as a real stream gathering traction. Seeded from a stable-feeling
   // value so it never starts at 0 during a stage demo.
@@ -169,6 +200,50 @@ export function TikTokShopOverlay({
 
   return (
     <div style={styles.outer}>
+      {/* Product showcase — lives in the RIGHT BEZEL (the black space to
+          the right of the centered 9:16 phone frame), NOT overlaid on the
+          avatar. Spin3D (live 3D rotation) on top, HeroSlideshow (auto-
+          cycle through 3-4 best shots one at a time) underneath. Sized
+          generously since the bezel has plenty of room — both panels are
+          ~360-400px wide so the rendered product is properly readable
+          from across a room (stage display) instead of squinted-at like
+          the previous overlaid version.
+
+          Each panel is a glass bubble (.lg-glass) so it reads as a
+          curated product showcase rather than dev chrome. Bezel placement
+          means: avatar gets the full 9:16 frame, no chrome covers her
+          face, audience eye naturally tracks left-to-right (avatar → 3D
+          rendering → hero stills → "buy now").
+
+          Entire block is gated on view3d.frames so there's no placeholder
+          shimmer before the seller's video has been processed. */}
+      {hasCarousel && (
+        <div style={styles.bezelShowcase}>
+          <div className="lg-glass" style={styles.bezelBubble}>
+            <Spin3D
+              view={view3d}
+              height={400}
+              label={productData?.name || undefined}
+              state={spinState}
+              accent="#7c3aed"
+              theme="studio_dark"
+              secondsPerRev={4.2}
+            />
+          </div>
+          {heroes.length > 0 && (
+            <div className="lg-glass" style={styles.bezelBubble}>
+              <HeroSlideshow
+                heroes={heroes}
+                heroMeta={heroMeta}
+                intervalMs={3500}
+                fadeMs={600}
+                theme="studio_dark"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Phone-screen safe area: vertical 9:16 inside a centered card on
           the 16:9 stage. Aspect ratio is enforced via aspect-ratio CSS
           (Vite + modern Chrome handle this fine), with a max-height fall-
@@ -490,6 +565,39 @@ const styles = {
     fontSize: 12, fontWeight: 900, letterSpacing: 1.5,
   },
   buyBtnArrow: { fontSize: 14, fontWeight: 900 },
+  // Bezel-side product showcase — sits in the BLACK SPACE to the right of
+  // the centered 9:16 phone frame on a 16:9 stage. Width 420px with a
+  // 32-wide right margin leaves ample bezel breathing room and gives the
+  // Spin3D + slideshow a properly readable size for stage displays. zIndex
+  // is below the BUY dock chrome (which lives inside the phone frame) so
+  // any future overlay growth doesn't cover it.
+  //
+  // 16:9 viewport + centered 9:16 phone math: at 1920×1080 the phone is
+  // 607.5px wide centered, leaving ~656px on each side. Our 420px showcase
+  // + 32px right margin = 452px, fits with ~204px of bezel slack. At
+  // 1280×720 we get ~140px of slack, still comfortable. Below 1280 the
+  // bezel itself is too narrow — flexbox fallback shrinks the showcase
+  // until it would visually collide with the phone frame, then min-width
+  // kicks it onto an `display: none` (pure CSS, no JS resize listener).
+  bezelShowcase: {
+    position: 'absolute', right: 32, top: '50%',
+    transform: 'translateY(-50%)',
+    zIndex: 4,
+    width: 420,
+    maxWidth: 'calc((100vw - min(56.25vh, 100%)) / 2 - 32px)',
+    display: 'flex', flexDirection: 'column', gap: 16,
+    pointerEvents: 'auto',
+  },
+  // Glass bubble wrapper around each showcase element (Spin3D / slideshow).
+  // Layout/spacing only — the lg-glass utility class owns the actual
+  // backdrop blur, rim highlight, and rounded-corner surface. Slightly
+  // beefier padding than the previous overlay variant so the bezel
+  // version reads as a premium product card, not dev chrome.
+  bezelBubble: {
+    padding: 10,
+    borderRadius: 22,
+    overflow: 'hidden',
+  },
   chatRail: {
     position: 'absolute', left: 12, bottom: 88, zIndex: 5,
     width: '60%',

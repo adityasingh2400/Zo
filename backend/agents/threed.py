@@ -366,14 +366,26 @@ async def carousel_from_video(
     # Cache hit: every output frame already exists for this video hash.
     cached = sorted(p for p in out_dir.glob("[0-9]*.png"))
     cached_heroes = sorted(p.name for p in out_dir.glob("hero_*.png"))
-    if len(cached) >= n_frames:
+    cached_raw_heroes = sorted(p.name for p in out_dir.glob("hero_*_raw.jpg"))
+    # Treat the cache as STALE if raw_heroes are missing — they were added
+    # in a later commit and older cached carousels don't have them.
+    # Re-triggering carousel build (~7s cold) is the right call so the
+    # user's slideshow shows real-background images.
+    needs_raw_heroes_rebuild = (
+        n_heroes > 0 and len(cached_heroes) > 0 and len(cached_raw_heroes) == 0
+    )
+    if needs_raw_heroes_rebuild:
+        logger.info("carousel cache stale (raw_heroes missing) for %s — rebuilding", slug)
+    if len(cached) >= n_frames and not needs_raw_heroes_rebuild:
         urls = [f"/renders/spin/{slug}/{p.name}" for p in cached[:n_frames]]
         hero_urls = [f"/renders/spin/{slug}/{name}" for name in cached_heroes]
+        raw_hero_urls = [f"/renders/spin/{slug}/{name}" for name in cached_raw_heroes]
         ms = int((time.perf_counter() - t_all) * 1000)
-        logger.info("carousel cache hit: %s (%d frames, %d heroes, %dms)",
-                    slug, len(urls), len(hero_urls), ms)
+        logger.info("carousel cache hit: %s (%d frames, %d heroes, %d raw, %dms)",
+                    slug, len(urls), len(hero_urls), len(raw_hero_urls), ms)
         return {
             "kind": "frame_carousel", "frames": urls, "heroes": hero_urls,
+            "raw_heroes": raw_hero_urls,
             "ms": ms, "source": "video", "slug": slug, "cached": True,
         }
 
@@ -578,15 +590,31 @@ async def carousel_from_video(
     # resolution. These are the "magazine shots" — meant to be displayed in a
     # gallery alongside the carousel. Reuses existing full-res RGBA so cost
     # is just PIL crop + resize per hero (~300ms total for 4).
+    #
+    # We also save a RAW (background-intact) JPEG copy of each hero from
+    # the source frame BEFORE rembg ran. The frontend's HeroSlideshow uses
+    # the raw versions because the user wants the actual product photo
+    # with its real backdrop in the slideshow — only Spin3D needs the
+    # transparent rembg'd version (so the studio relight shader has a
+    # clean alpha mask to composite against). Two URL lists in the return
+    # dict: `heroes` (rembg'd PNGs, transparent) for Spin3D-style use,
+    # `raw_heroes` (untouched JPEGs from the source frame) for slideshow.
     t_hero = time.perf_counter()
     hero_urls: list[str] = []
+    raw_hero_urls: list[str] = []
     hero_meta: list[dict[str, Any]] = []
     if n_heroes > 0 and frame_records:
         try:
             from PIL import ImageFilter
+            # Build idx → raw image map from `survivors` (the pre-rembg
+            # PIL Images that fed _process_one). We need this so the raw
+            # hero save can pull the original frame at the same idx the
+            # rembg'd hero was picked from.
+            raw_imgs_by_idx: dict[int, Any] = {i: img for i, img, _s in survivors}
             hero_indexes = _pick_diverse_heroes(frame_records, n_heroes=n_heroes)
             for j, idx in enumerate(hero_indexes):
                 rec = frame_records[idx]
+                rec_idx = int(rec["idx"])
                 # Use the same per-frame crop the carousel used at this index.
                 crop_box = crops[idx] if (stabilize and idx < len(crops)) else None
                 rgba = rec["rgba"]
@@ -604,6 +632,34 @@ async def carousel_from_video(
                 out_path = out_dir / f"hero_{j:02d}.png"
                 hero_img.save(out_path, format="PNG", optimize=False)
                 hero_urls.append(f"/renders/spin/{slug}/{out_path.name}")
+
+                # RAW hero — same source frame, no rembg, no crop. Saved as
+                # JPEG (smaller than PNG, no transparency needed). Falls
+                # back gracefully if the raw frame somehow isn't in the map
+                # (e.g. survivor list got mutated upstream): the frontend
+                # just doesn't render that slot.
+                raw_src = raw_imgs_by_idx.get(rec_idx)
+                if raw_src is not None:
+                    try:
+                        raw_out = out_dir / f"hero_{j:02d}_raw.jpg"
+                        # RGB only for JPEG. If source was RGBA, drop alpha
+                        # by compositing onto white (matches the studio
+                        # backdrop the seller probably filmed against).
+                        raw_to_save = raw_src
+                        if raw_to_save.mode != "RGB":
+                            if raw_to_save.mode == "RGBA":
+                                from PIL import Image as _PILImage
+                                bg = _PILImage.new("RGB", raw_to_save.size, (255, 255, 255))
+                                bg.paste(raw_to_save, mask=raw_to_save.split()[-1])
+                                raw_to_save = bg
+                            else:
+                                raw_to_save = raw_to_save.convert("RGB")
+                        raw_to_save.save(raw_out, format="JPEG",
+                                         quality=88, optimize=True)
+                        raw_hero_urls.append(f"/renders/spin/{slug}/{raw_out.name}")
+                    except Exception as raw_e:
+                        logger.warning("raw hero %d save failed: %s", j, raw_e)
+
                 hero_meta.append({
                     "index": int(idx),
                     "angle_deg": round(360.0 * idx / max(1, len(frame_records)), 1),
@@ -632,6 +688,7 @@ async def carousel_from_video(
         "kind": "frame_carousel",
         "frames": saved,
         "heroes": hero_urls,
+        "raw_heroes": raw_hero_urls,
         "hero_meta": hero_meta,
         "ms": total_ms,
         "source": "video",

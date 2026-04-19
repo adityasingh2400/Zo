@@ -201,14 +201,53 @@ async def render_comment_response_wav2lip(
     # Saves ~1MB upload per call (~500ms-1s) and avoids reading the source on the client.
     files = {"audio": ("audio.mp3", audio_bytes, "audio/mpeg")}
     data = {"source_path": source_path_on_pod, "out_height": str(out_height)}
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        r = await client.post(f"{WAV2LIP_URL}/lipsync_fast", data=data, files=files)
-        r.raise_for_status()
-        content = r.content
-        headers = dict(r.headers)
-    elapsed = time.perf_counter() - t0
-    logger.info("[LIPSYNC] Wav2Lip done in %.2fs, %d bytes", elapsed, len(content))
-    return content, headers
+
+    # Retry loop — Wav2Lip's pod streams the rendered mp4 mid-response, and
+    # SSH-tunnel buffer pressure / transient pod CPU spikes occasionally
+    # produce `RemoteProtocolError: peer closed connection without sending
+    # complete message body (received N bytes, expected M)`. The render
+    # itself usually completed — it's the wire transfer that broke. The
+    # second attempt typically hits the pod's face-detect cache (warm path)
+    # so it's both fast AND much more likely to succeed (no recompute, less
+    # pod CPU contention). Three attempts with linear backoff (2s/4s/6s)
+    # absorb the typical flake without making genuine pod-down failures
+    # take painfully long.
+    MAX_ATTEMPTS = 3
+    last_err: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(f"{WAV2LIP_URL}/lipsync_fast", data=data, files=files)
+                r.raise_for_status()
+                content = r.content
+                headers = dict(r.headers)
+            elapsed = time.perf_counter() - t0
+            if attempt > 1:
+                logger.info("[LIPSYNC] Wav2Lip recovered on attempt %d/%d", attempt, MAX_ATTEMPTS)
+            logger.info("[LIPSYNC] Wav2Lip done in %.2fs, %d bytes", elapsed, len(content))
+            return content, headers
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout,
+                httpx.ConnectError, httpx.WriteError) as e:
+            # Transient — pod stream broke / tunnel hiccup / connection
+            # reset. Worth retrying. Sleep briefly so we don't slam the
+            # pod immediately if it's recovering from a CPU spike.
+            last_err = e
+            if attempt == MAX_ATTEMPTS:
+                logger.error("[LIPSYNC] Wav2Lip exhausted %d attempts (last: %s: %s)",
+                             MAX_ATTEMPTS, type(e).__name__, str(e)[:120])
+                break
+            wait_s = 2.0 * attempt
+            logger.warning("[LIPSYNC] Wav2Lip attempt %d/%d failed (%s) — "
+                           "retrying in %.1fs", attempt, MAX_ATTEMPTS,
+                           type(e).__name__, wait_s)
+            await asyncio.sleep(wait_s)
+        except httpx.HTTPStatusError:
+            # Server-rejected (4xx/5xx) — don't retry, the input is bad
+            # or the pod is misconfigured. Caller's substrate-fallback
+            # logic in main.py handles 400/404 specifically.
+            raise
+    # Re-raise the last transient so the caller's fallback path triggers.
+    raise last_err if last_err else RuntimeError("[LIPSYNC] retry loop exhausted unexpectedly")
 
 
 async def render_pitch_latentsync(

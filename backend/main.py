@@ -41,6 +41,7 @@ from agents.creator import generate_3d_model, remove_background
 from agents.eyes import (
     analyze_and_script_claude,
     analyze_and_script_gemma,
+    analyze_and_script_text_only,
     analyze_with_claude,
     classify_comment_gemma,
     transcribe_voice,
@@ -465,6 +466,24 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
     logger.info("=" * 60)
     pipeline_start = time.time()
 
+    # Tier 1 ambient cover for the entire upload→pitch processing window.
+    # 14s of avatar-picks-up-spec-sheet-and-reads-it footage that maps
+    # believably to "AI is reviewing your product" while Gemma + Wav2Lip
+    # do their work. Without this clip the avatar sits in mute Tier 0
+    # idle for 5-15s between upload and pitch start — reads as a frozen
+    # broadcast. dispatch_audio_first_pitch crossfades the pitch over
+    # this clip when ready (auto-cancels the natural-end fade); if the
+    # pipeline runs longer than 14s, the clip ends naturally and Tier 0
+    # resumes underneath until pitch lands. Voice state flips to
+    # `thinking` so the Spin3D rim light + voice pill both reflect the
+    # "AI is processing" moment in lockstep with the visual.
+    if director:
+        try:
+            await director.play_processing()
+            await director.set_voice_state("thinking")
+        except Exception:
+            logger.exception("[pipeline] play_processing emit failed (non-fatal)")
+
     # PHASE 1: Product analysis + pitch script + background removal in parallel.
     #
     # PRODUCT_ANALYSIS_MODEL env var (defaults to "auto") picks the vision/
@@ -482,11 +501,44 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str,
                                detail=f"model={pam}")
     t0 = time.time()
 
+    # Detect if Deepgram already extracted a usable seller narration during
+    # the intake phase. run_video_sell_pipeline injects it as
+    # "Seller's narration: <transcript>" appended to voice_text. When
+    # present and at least 20 chars long, we skip Gemma's vision pass
+    # entirely and go straight to a text-only call (~2-3s vs ~18s).
+    # Mirrors swarmsell's intake recipe (Deepgram → text → SLM → output).
+    NARRATION_MARKER = "Seller's narration:"
+    has_narration = False
+    if NARRATION_MARKER in voice_text:
+        narration = voice_text.split(NARRATION_MARKER, 1)[1].strip()
+        has_narration = len(narration) >= 20
+
     async def _analyze_combined():
-        """Try Gemma first (on-device), fall back to Claude if requested
-        or on Gemma failure. Returns the same `{product, script}` shape
-        from either path so downstream code is agnostic."""
+        """Cascade: text-only Gemma (fast) → vision Gemma (fallback) →
+        Claude cloud (last resort). All return the same `{product,
+        script}` shape so downstream code is agnostic.
+
+        Text-only path requires a Deepgram-derived narration in
+        voice_text (set by run_video_sell_pipeline during intake).
+        Photo-only uploads (/api/sell with no audio) skip the text-only
+        path because there's nothing to read — they go straight to
+        vision Gemma."""
         if pam in ("gemma", "auto"):
+            # Fast path — text-only when Deepgram narration exists.
+            if has_narration:
+                try:
+                    result = await analyze_and_script_text_only(voice_text)
+                    src = result.get("source", "")
+                    if src == "cactus_on_device":
+                        return result
+                    logger.info("[EYES] text-only Gemma failed (%s), trying vision",
+                                result.get("reason", "unknown"))
+                except Exception as e:
+                    logger.warning("[EYES] text-only Gemma errored, trying vision: %s", e)
+
+            # Vision fallback — slower but pixel-grounded for cases where
+            # text alone wasn't enough (or the photo-only upload path
+            # where we never had narration).
             try:
                 result = await analyze_and_script_gemma(frame_b64, voice_text)
                 src = result.get("source", "")
@@ -853,6 +905,26 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str,
     logger.info("  voice_text: %s", voice_text[:100])
     logger.info("=" * 60)
 
+    # Fire the "she picks up a spec sheet and reads it" Tier 1 cover IMMEDIATELY
+    # — before intake (Deepgram + frame extraction + carousel build, ~3-5 s)
+    # even starts. Without this the avatar sits in dead idle for 3-5 s after
+    # the operator drops a video, then ANOTHER 5-15 s during Phase 1 Gemma
+    # before the pitch lands. Total dead-air budget was 8-20 s; firing here
+    # closes the 3-5 s pre-intake gap and keeps the audience visually
+    # engaged the entire way to the pitch crossfade.
+    #
+    # Also fires from run_sell_pipeline for the photo upload path
+    # (/api/sell). Calling here twice for video uploads is fine — the
+    # second emit is a no-op crossfade to the same URL (Director.emit
+    # logs it but the dashboard sees identical url + intent and doesn't
+    # re-prepare the video element).
+    if director:
+        try:
+            await director.play_processing()
+            await director.set_voice_state("thinking")
+        except Exception:
+            logger.exception("[video-pipeline] play_processing emit failed (non-fatal)")
+
     log_event("SYSTEM", "Video received. Starting intake pipeline...")
     await _emit_pipeline_step(request_id, "deepgram", "active")
 
@@ -892,44 +964,37 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str,
     logger.info("[INTAKE]   transcript: %d chars", len(transcript))
     logger.info("[INTAKE]   timings: %s", json.dumps(timings))
 
-    transcript_extract_hint = ""  # injected into Claude prompt below
     if transcript:
         log_event("EYES", f'Seller said: "{transcript[:200]}..."')
         await broadcast_to_dashboards({"type": "transcript", "text": transcript})
-        # Race transcript_extract against a tight timeout. If Cactus on NPU
-        # finishes in <1.5s we ground Claude's prompt on its hints. If it's
-        # slower (CPU prefill on Mac dev = 10s), we fire Claude without
-        # waiting and let extract land on the dashboard separately.
+
+    # NOTE: transcript_extract was firing here in parallel — a separate
+    # Cactus call to extract structured pitch hints ({title, key_features,
+    # tone}) for grounding Claude's prompt. With the new text-only Gemma
+    # path (analyze_and_script_text_only), Gemma already has the full
+    # transcript via voice_text and produces both product fields + script
+    # in one call. The extract was now redundant AND was blocking the
+    # main Cactus device — running both in parallel competed for ANE/CPU
+    # cycles, dragging the text-only Gemma call from ~3s to ~9s. Skipping
+    # it cuts the Gemma stage in half without losing any signal (the
+    # transcript is already in voice_text, Gemma reads it directly).
+    # Re-enable by setting EMPIRE_TRANSCRIPT_EXTRACT=1 if you ever want
+    # the structured hint block back as a Claude-fallback grounding.
+    if transcript and os.getenv("EMPIRE_TRANSCRIPT_EXTRACT") == "1":
         try:
             from agents.transcript_extract import (
                 extract_transcript_signals,
-                hint_block_for_claude,
             )
             extract_task = asyncio.create_task(
                 extract_transcript_signals(transcript)
             )
-            try:
-                extract = await asyncio.wait_for(asyncio.shield(extract_task), timeout=1.5)
-                transcript_extract_hint = hint_block_for_claude(extract)
-                pipeline_state["transcript_extract"] = extract
-                await broadcast_to_dashboards({"type": "transcript_extract", "data": extract})
-                log_event("EYES",
-                          f"Transcript extract ready in time ({extract.get('latency_ms', 0)}ms)",
-                          {"source": extract.get("source")})
-            except TimeoutError:
-                # Extract is slow — let Claude run unblocked. The pending
-                # task keeps running and reports when it lands.
-                log_event("EYES", "Transcript extract slow (>1.5s), running unblocked")
-                asyncio.ensure_future(_finish_transcript_extract(extract_task))
+            asyncio.ensure_future(_finish_transcript_extract(extract_task))
+            log_event("EYES", "Transcript extract opted-in (background only)")
         except Exception as e:
             logger.warning("[TRANSCRIPT_EXTRACT] setup failed: %s", e)
 
     if best_frames_b64:
         combined_voice = f"{voice_text}. Seller's narration: {transcript}" if transcript else voice_text
-        if transcript_extract_hint:
-            # Append the on-device hint block. Claude treats it as additional
-            # context and grounds the script accordingly.
-            combined_voice = f"{combined_voice}\n\n{transcript_extract_hint}"
         pipeline_state["product_photo_b64"] = best_frames_b64[0]
         await broadcast_to_dashboards({"type": "phone_frame", "frame": best_frames_b64[0][:100] + "..."})
         await run_sell_pipeline(best_frames_b64[0], combined_voice,
@@ -1578,9 +1643,17 @@ app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
 # All under one /clips URL so the Director and dashboard see one namespace.
 CLIPS_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "clips"
 STATES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "states"
+# Veo bridge clip library — welcome.mp4, pitch_chained.mp4, intent-based
+# bridges (question/objection/compliment/neutral/intro), and the new
+# processing/paper-reading clip. The simulator + Director both reference
+# these via /bridges/<intent>/<clip>.mp4. Without this mount the URLs 404
+# (the welcome.mp4 fallback in TIER1_INTERJECTIONS was silently failing).
+BRIDGES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+BRIDGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 app.mount("/states", StaticFiles(directory=str(STATES_DIR)), name="states")
+app.mount("/bridges", StaticFiles(directory=str(BRIDGES_DIR)), name="bridges")
 
 # Pre-rendered local answers — the sub-300ms respond_locally path. Generated
 # offline by scripts/render_local_answers.py; missing files fall back to

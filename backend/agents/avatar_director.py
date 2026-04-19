@@ -284,6 +284,41 @@ class Director:
         # before the bridge takes over. Caller can race ahead with rendering.
         await asyncio.sleep(READING_CHAT_HOLD_MS / 1000)
 
+    async def play_processing(self) -> None:
+        """Tier 1 ambient cover for the upload→pitch processing window.
+
+        Plays the ~14 s "she picks up a printed spec sheet, reads it, then
+        sets it down + settles into anchor pose" Veo clip. Maps believably
+        to "the AI is reviewing your product" for the audience while Gemma
+        + rembg + TTS + Wav2Lip churn in the background — bridges the
+        otherwise-dead 5-15 s gap between upload landing and pitch starting.
+
+        Crossfade behaviour:
+        - If the pipeline finishes BEFORE the clip ends (~5-13 s typical
+          for cache-warm runs), `dispatch_audio_first_pitch` emits a new
+          Tier 1 (`pitch_veo`) which crossfades over this clip mid-readback
+          — feels like "she finished thinking and started speaking."
+        - If the pipeline finishes AFTER the clip ends (cold Wav2Lip,
+          large product video, etc.), the clip ends naturally and Tier 0
+          idle resumes underneath until the pitch crossfades in. Slight
+          "she put the paper down then thought for a sec" beat — still
+          reads as natural human pacing rather than a frozen avatar.
+
+        End frame is the canonical anchor pose (hands at waist, soft
+        smile, eye contact) so the pitch crossfade lands clean either
+        way — same target pose as the welcome clip + the Wav2Lip
+        substrates. No special handoff logic needed.
+        """
+        await self.emit(
+            "tier1",
+            "processing",
+            "/bridges/processing/processing.mp4",
+            loop=False,
+            mode="crossfade",
+            ttl_ms=14_130,
+            emitted_by="play_processing",
+        )
+
     async def play_bridge(self, label: str) -> dict[str, Any] | None:
         """Pick a bridge from the runtime LatentSync manifest and emit it.
         Returns the chosen entry or None if no bridge available."""

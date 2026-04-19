@@ -246,6 +246,96 @@ Extract as JSON only: {{"action": "sell|describe|compare", "price": "$X or null"
 
 # ── EYES: Claude Vision (cloud, rich analysis) ──────────────────────────────
 
+async def analyze_and_script_text_only(voice_text: str) -> dict:
+    """Text-only fused product analysis + pitch script via Cactus Gemma 4.
+
+    The "blazingly fast" path. Skips the 15-18s vision pass on the product
+    image entirely — uses the Deepgram-extracted seller narration in
+    voice_text as the only input. One Cactus call, ~2-3s on Apple Neural
+    Engine vs ~18s for the vision-fused variant.
+
+    Mirrors swarmsell's intake pattern: Deepgram → text → SLM → structured
+    output. Vision is reserved for the photo upload path (no audio
+    transcript) where there's literally nothing else for Gemma to chew on.
+    For video uploads with Deepgram narration ("Is a black sports watch.
+    We do same day shipping. I want you to sell..."), Gemma can infer
+    every product field from the text and write a believable pitch
+    without ever looking at the pixels.
+
+    Trade-off: vision-derived fields (category, materials, visual_details)
+    become educated text-based guesses. The audience never sees the
+    `product_data` JSON directly — they hear the script + see the actual
+    video frames in the carousel — so guess-quality matters less than
+    pipeline latency. The router (classify_comment_gemma) consumes the
+    name/category for live chat routing; "Black Sports Watch" → "watches"
+    is enough to route correctly.
+
+    Returns the same shape as analyze_and_script_gemma:
+      {product, script, source, latency_ms, cost}
+
+    On parse failure / Cactus error, returns {"source": "gemma_failed"}
+    so the caller can cascade to the vision path (or to Claude cloud).
+    """
+    logger.info("[GEMMA-text] analyze_and_script_text_only called "
+                "(voice_text: %d chars, cactus: %s)",
+                len(voice_text), CACTUS_AVAILABLE)
+
+    if not CACTUS_AVAILABLE:
+        return {"source": "gemma_failed", "reason": "cactus_unavailable"}
+
+    prompt = f"""The seller said: "{voice_text}"
+
+Return EXACTLY this JSON and nothing else — no preamble, no markdown fences, no trailing commentary:
+{{"product":{{"name":"...","category":"...","materials":["..."],"selling_points":["...","...","..."],"visual_details":["...","..."]}},"script":"..."}}
+
+Rules:
+- "name": short product name based on what the seller described.
+- "category": one of: clothing, accessories, electronics, home, fitness, beauty, toys, sports, other.
+- "materials", "selling_points", "visual_details": educated guesses derived from the seller's description (NOT vision — text only).
+- "script": ONE paragraph, under 70 words, second-person, TikTok Live energy. Mention something the seller said. End with a call to action. No stage directions, no quotation marks inside the script, no line breaks."""
+
+    r = await asyncio.to_thread(
+        _cactus_chat,
+        [{"role": "user", "content": prompt}],
+        512,
+        None,           # NO image — text-only is the entire point
+    )
+    text = (r.get("response") or "").strip()
+    latency = int(r.get("total_time_ms", 0))
+
+    if r.get("error"):
+        logger.warning("[GEMMA-text] call error: %s", r.get("error"))
+        return {"source": "gemma_failed", "reason": str(r.get("error"))[:120],
+                "latency_ms": latency}
+
+    parsed = _parse_json_from_text(text)
+    if not parsed:
+        logger.info("[GEMMA-text] JSON unparseable (latency %dms); raw: %s",
+                    latency, text[:300])
+        return {"source": "gemma_failed", "reason": "unparseable_json",
+                "latency_ms": latency}
+
+    product = parsed.get("product") if isinstance(parsed.get("product"), dict) else None
+    script_raw = parsed.get("script")
+    script = script_raw.strip() if isinstance(script_raw, str) else ""
+    if not product or not script:
+        logger.info("[GEMMA-text] parsed but missing fields "
+                    "(product=%s, script_len=%d)", bool(product), len(script))
+        return {"source": "gemma_failed", "reason": "missing_fields",
+                "latency_ms": latency}
+
+    logger.info("[GEMMA-text] OK in %dms (1 text-only call) — "
+                "%dx faster than vision path", latency,
+                max(1, 18000 // max(latency, 1)))
+    return {
+        "product": product,
+        "script": script,
+        "source": "cactus_on_device",
+        "latency_ms": latency,
+        "cost": "$0.00",
+    }
+
+
 async def analyze_and_script_gemma(frame_b64: str, voice_text: str) -> dict:
     """On-device product analysis + pitch script via Cactus Gemma 4.
 

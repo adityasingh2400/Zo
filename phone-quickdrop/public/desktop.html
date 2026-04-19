@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#000000" />
+  <title>quickdrop · dashboard</title>
+  <style>
+    :root {
+      --bg: #0a0a0b;
+      --panel: #121214;
+      --panel-2: #1a1a1d;
+      --fg: #f5f5f7;
+      --muted: #8a8a8e;
+      --line: rgba(255,255,255,0.08);
+      --good: #30d158;
+      --warn: #ff9f0a;
+      --bad: #ff3b30;
+      --accent: #0a84ff;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+      gap: 32px;
+      padding: 40px clamp(24px, 5vw, 72px);
+      min-height: 100vh;
+    }
+    @media (max-width: 920px) {
+      body { grid-template-columns: 1fr; padding: 24px; }
+    }
+
+    /* ---------- left pane: QR + url ---------- */
+    .left {
+      display: flex; flex-direction: column; gap: 22px;
+      align-items: stretch; justify-content: flex-start;
+    }
+    .brand {
+      display: flex; align-items: center; gap: 10px;
+      font-weight: 600; letter-spacing: -0.01em; font-size: 15px;
+    }
+    .brand .logo {
+      width: 22px; height: 22px; border-radius: 6px;
+      background: linear-gradient(135deg, #ff3b30, #ff9f0a);
+      display: inline-flex; align-items: center; justify-content: center;
+      color: #000; font-weight: 800; font-size: 13px;
+    }
+    .brand .meta { color: var(--muted); font-weight: 400; margin-left: auto; font-size: 12px; }
+
+    .hero {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 28px;
+      display: flex; flex-direction: column; gap: 18px;
+    }
+    .hero h1 {
+      margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.015em;
+    }
+    .hero p.lede { margin: 0; color: var(--muted); font-size: 14px; }
+    .qr-wrap {
+      align-self: center;
+      background: #fff;
+      padding: 16px;
+      border-radius: 18px;
+      width: min(360px, 80vw);
+      aspect-ratio: 1 / 1;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset;
+    }
+    .qr-wrap svg {
+      width: 100% !important; height: 100% !important;
+      shape-rendering: crispEdges;
+      color: #000;
+    }
+    .qr-wrap svg rect[fill="#ffffff"],
+    .qr-wrap svg path[fill="#ffffff"] { fill: transparent; }
+
+    .url-row {
+      display: flex; align-items: center; gap: 8px;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font: 13px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    .url-row .url {
+      flex: 1; min-width: 0; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+      color: #fff;
+      user-select: all;
+    }
+    .url-row button {
+      background: transparent; border: 1px solid var(--line);
+      color: var(--fg); padding: 5px 10px; border-radius: 8px;
+      font-size: 12px; font-family: inherit; cursor: pointer;
+    }
+    .url-row button:hover { border-color: rgba(255,255,255,0.25); }
+    .url-row button.copied { border-color: var(--good); color: var(--good); }
+
+    .steps {
+      counter-reset: step; padding: 0; margin: 0; list-style: none;
+      display: grid; gap: 6px;
+    }
+    .steps li {
+      counter-increment: step;
+      padding-left: 28px; position: relative;
+      color: var(--muted); font-size: 13px; line-height: 1.5;
+    }
+    .steps li::before {
+      content: counter(step);
+      position: absolute; left: 0; top: 1px;
+      width: 20px; height: 20px; border-radius: 50%;
+      background: var(--panel-2); border: 1px solid var(--line);
+      color: var(--fg); font-size: 11px; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .steps li b { color: var(--fg); font-weight: 500; }
+
+    /* ---------- right pane: status + recordings ---------- */
+    .right {
+      display: flex; flex-direction: column; gap: 18px;
+      min-height: 0;
+    }
+    .status {
+      display: flex; align-items: center; gap: 14px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 18px;
+    }
+    .status .dot {
+      width: 9px; height: 9px; border-radius: 50%;
+      background: var(--muted);
+      box-shadow: 0 0 0 0 rgba(0,0,0,0);
+      transition: background 0.2s ease, box-shadow 0.2s ease;
+    }
+    .status[data-state="phone"] .dot { background: var(--good); box-shadow: 0 0 8px rgba(48, 209, 88, 0.6); }
+    .status[data-state="waiting"] .dot { background: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+    .status[data-state="offline"] .dot { background: var(--bad); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .status .label { font-weight: 500; }
+    .status .sub { color: var(--muted); margin-left: auto; font-size: 12px; }
+
+    .recordings {
+      flex: 1 1 auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 6px;
+      display: flex; flex-direction: column;
+      min-height: 280px;
+      overflow: hidden;
+    }
+    .recordings header {
+      padding: 14px 16px 8px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .recordings header h3 {
+      margin: 0; font-size: 13px; font-weight: 600;
+      color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    .recordings header .count {
+      color: var(--muted); font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .rec-list {
+      list-style: none; padding: 0; margin: 0;
+      overflow-y: auto;
+      max-height: 60vh;
+    }
+    .rec-list li {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px; align-items: center;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      transition: background 0.15s ease, border-color 0.15s ease;
+      animation: slideIn 0.3s ease;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .rec-list li:hover {
+      background: var(--panel-2);
+      border-color: var(--line);
+    }
+    .rec-list .name {
+      font: 13px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+      color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      min-width: 0;
+    }
+    .rec-list .meta {
+      color: var(--muted); font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .rec-list button.reveal {
+      background: transparent; border: 1px solid var(--line);
+      color: var(--fg); padding: 4px 9px; border-radius: 7px;
+      font-size: 11px; cursor: pointer;
+    }
+    .rec-list button.reveal:hover { border-color: rgba(255,255,255,0.25); }
+    .rec-list .empty {
+      padding: 36px 18px; text-align: center; color: var(--muted);
+      font-size: 13px;
+    }
+    .rec-list li.partial .name::after {
+      content: "partial"; margin-left: 8px;
+      color: var(--warn); font-size: 10px; text-transform: uppercase;
+      font-weight: 600; letter-spacing: 0.05em;
+    }
+    .rec-list li.fresh { background: rgba(48, 209, 88, 0.08); border-color: rgba(48, 209, 88, 0.25); }
+
+    .footer {
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+      color: var(--muted); font-size: 12px;
+      padding: 0 4px;
+    }
+    .footer code {
+      background: var(--panel-2); border: 1px solid var(--line);
+      padding: 2px 7px; border-radius: 6px; color: var(--fg);
+      font: 12px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <section class="left">
+    <div class="brand">
+      <span class="logo">Q</span>
+      <span>quickdrop</span>
+      <span class="meta">port {{PORT}}</span>
+    </div>
+
+    <div class="hero">
+      <div>
+        <h1>Scan to record</h1>
+        <p class="lede">Phone records on tap, video lands here the second you stop.</p>
+      </div>
+
+      <div class="qr-wrap">{{QR_SVG}}</div>
+
+      <div class="url-row">
+        <span class="url" id="phone-url">{{PHONE_URL}}</span>
+        <button id="copy-btn" type="button">Copy</button>
+      </div>
+
+      <ol class="steps">
+        <li>Make sure your phone is on the same Wi-Fi as this laptop.</li>
+        <li>Scan the QR (camera app). Tap the link.</li>
+        <li>Accept the cert warning <b>once</b> · then allow camera + mic.</li>
+        <li>Tap the red button to record. Tap again to stop.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="right">
+    <div class="status" id="status" data-state="connecting">
+      <span class="dot"></span>
+      <span class="label" id="status-label">connecting…</span>
+      <span class="sub" id="status-sub"></span>
+    </div>
+
+    <div class="recordings">
+      <header>
+        <h3>recordings</h3>
+        <span class="count" id="rec-count">0</span>
+      </header>
+      <ul class="rec-list" id="rec-list">
+        <li class="empty" id="rec-empty">No recordings yet. Tap the red button on your phone.</li>
+      </ul>
+    </div>
+
+    <div class="footer">
+      <span>output</span>
+      <code id="output-dir">{{OUTPUT_DIR}}</code>
+    </div>
+  </section>
+
+  <script>
+  (() => {
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+
+    const status = $("status");
+    const statusLabel = $("status-label");
+    const statusSub = $("status-sub");
+    const recList = $("rec-list");
+    const recEmpty = $("rec-empty");
+    const recCount = $("rec-count");
+    const copyBtn = $("copy-btn");
+    const phoneUrlEl = $("phone-url");
+
+    // --- copy-to-clipboard ---
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(phoneUrlEl.textContent.trim());
+        copyBtn.textContent = "Copied";
+        copyBtn.classList.add("copied");
+        setTimeout(() => {
+          copyBtn.textContent = "Copy";
+          copyBtn.classList.remove("copied");
+        }, 1400);
+      } catch {
+        // fallback: select the URL
+        const range = document.createRange();
+        range.selectNodeContents(phoneUrlEl);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    });
+
+    // --- recordings rendering ---
+    const fmtBytes = (n) => {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    };
+    const fmtAgo = (ts) => {
+      const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+      if (s < 5) return "just now";
+      if (s < 60) return `${s}s ago`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h ago`;
+      const d = Math.floor(h / 24);
+      return `${d}d ago`;
+    };
+    const fmtDur = (ms) => {
+      if (ms < 1000) return `${ms}ms`;
+      if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
+      return `${Math.round(ms / 1000)}s`;
+    };
+
+    let recordings = [];
+
+    function renderRecordings(freshFileName = null) {
+      recCount.textContent = recordings.length;
+      if (recordings.length === 0) {
+        recList.innerHTML = "";
+        recList.appendChild(recEmpty);
+        return;
+      }
+      const frag = document.createDocumentFragment();
+      for (const r of recordings) {
+        const li = document.createElement("li");
+        if (r.partial) li.classList.add("partial");
+        if (r.fileName === freshFileName) li.classList.add("fresh");
+
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = r.fileName;
+
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = `${fmtBytes(r.bytes)} · ${fmtDur(r.ms)} · ${fmtAgo(r.ts)}`;
+
+        const reveal = document.createElement("button");
+        reveal.className = "reveal";
+        reveal.type = "button";
+        reveal.textContent = "Show";
+        reveal.title = "Reveal in Finder";
+        reveal.addEventListener("click", async () => {
+          try {
+            await fetch("/api/reveal", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ path: r.filePath }),
+            });
+          } catch {}
+        });
+
+        li.appendChild(name);
+        li.appendChild(meta);
+        li.appendChild(reveal);
+        frag.appendChild(li);
+      }
+      recList.innerHTML = "";
+      recList.appendChild(frag);
+    }
+
+    // tick the "ago" text every 15s
+    setInterval(() => { if (recordings.length) renderRecordings(); }, 15_000);
+
+    // --- WebSocket observer ---
+    function setStatus(state, label, sub) {
+      status.dataset.state = state;
+      statusLabel.textContent = label;
+      statusSub.textContent = sub || "";
+    }
+
+    let ws = null;
+    let backoff = 1000;
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${location.host}/ws`;
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        setStatus("offline", "offline", "");
+        setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, 8000);
+        return;
+      }
+      setStatus("connecting", "connecting…", "");
+
+      ws.addEventListener("open", () => {
+        backoff = 1000;
+        try { ws.send(JSON.stringify({ type: "subscribe_observer" })); } catch {}
+      });
+      ws.addEventListener("message", (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+
+        if (msg.type === "snapshot") {
+          recordings = Array.isArray(msg.recordings) ? msg.recordings : [];
+          renderRecordings();
+          updatePhoneStatus(msg.phonesConnected || 0);
+          return;
+        }
+        if (msg.type === "phone_status") {
+          updatePhoneStatus(msg.connected || 0);
+          return;
+        }
+        if (msg.type === "recording_saved" && msg.recording) {
+          recordings = [msg.recording, ...recordings].slice(0, 100);
+          renderRecordings(msg.recording.fileName);
+          flashTitle("● new recording");
+          return;
+        }
+      });
+      ws.addEventListener("close", () => {
+        setStatus("offline", "offline", "reconnecting…");
+        setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, 8000);
+      });
+      ws.addEventListener("error", () => { /* close handler follows */ });
+    }
+
+    function updatePhoneStatus(n) {
+      if (n > 0) {
+        setStatus("phone", n === 1 ? "phone connected" : `${n} phones connected`,
+                  "ready to record");
+      } else {
+        setStatus("waiting", "waiting for phone", "scan the QR to begin");
+      }
+    }
+
+    let titleResetHandle = null;
+    const baseTitle = document.title;
+    function flashTitle(txt) {
+      document.title = txt;
+      clearTimeout(titleResetHandle);
+      titleResetHandle = setTimeout(() => { document.title = baseTitle; }, 4000);
+    }
+
+    connect();
+  })();
+  </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useEffect } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { LiveStage } from './components/LiveStage';
 import { ProductPanel } from './components/ProductPanel';
@@ -44,6 +45,23 @@ export default function App() {
     localStorage.setItem('CONTROL_ROOM_MODE', next ? 'on' : 'off');
     setControlRoomMode(next);
   }
+
+  // Control Room is a viewport-bounded layout. Without this the body can
+  // still scroll if any sub-child temporarily overflows (e.g. ops stack
+  // before internal auto-scroll engages). Lock html/body overflow while
+  // Control Room mode is active; restore on flip back to Legacy.
+  useEffect(() => {
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    const prevBodyOverflow = document.body.style.overflow;
+    if (controlRoomMode) {
+      document.documentElement.style.overflow = 'hidden';
+      document.body.style.overflow = 'hidden';
+    }
+    return () => {
+      document.documentElement.style.overflow = prevHtmlOverflow;
+      document.body.style.overflow = prevBodyOverflow;
+    };
+  }, [controlRoomMode]);
 
   async function uploadFile(file) {
     const formData = new FormData();
@@ -345,14 +363,14 @@ const styles = {
   controlRoomMain: {
     flex: 1, display: 'flex', flexDirection: 'column',
     padding: '14px 16px 16px', gap: 12,
-    minWidth: 0, minHeight: 0,
+    minWidth: 0, minHeight: 0, overflow: 'hidden',
     fontFamily: '-apple-system, "SF Pro Text", "Inter", system-ui, sans-serif',
     color: '#1d1d1f',
   },
   controlRoomStageRow: {
     display: 'grid',
     gridTemplateColumns: '128px 1fr minmax(0, 360px)',
-    gap: 12, minHeight: 0, flex: 1,
+    gap: 12, minHeight: 0, flex: 1, overflow: 'hidden',
   },
   controlRoomStage: {
     minHeight: 0, minWidth: 0,
@@ -364,7 +382,7 @@ const styles = {
   },
   controlRoomBottomRow: {
     display: 'grid', gridTemplateColumns: '1fr 1.5fr',
-    gap: 12, height: 240,
+    gap: 12, height: 200, flexShrink: 0,
   },
   telemetryBadge: {
     background: '#22c55e', color: '#09090b', borderRadius: 999,

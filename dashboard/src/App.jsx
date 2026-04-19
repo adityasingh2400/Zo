@@ -140,7 +140,7 @@ export default function App() {
           />
         </div>
         <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
+          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} connected={connected} />
           <ChatPanel
             onSendComment={sendComment}
             commentResponse={responseVideo}

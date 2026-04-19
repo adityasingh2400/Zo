@@ -270,18 +270,18 @@ export function useEmpireSocket() {
           // Dedup: when the operator types in ChatPanel, sendComment
           // optimistically pushes pendingComments (so the pending pill
           // appears instantly) AND fires simulate_comment over the WS.
-          // The backend echoes it back as audience_comment, which lands
-          // here a few ms later. Without dedup the originating window
-          // would render the comment twice in ChatPanel. We swallow the
-          // echo when a same-text pending entry exists from the last 5s.
+          // The backend echoes it back as audience_comment with the same
+          // client_id. We swallow the echo when its client_id matches a
+          // local optimistic pending entry. This is targeted on client_id
+          // (not text), so two different audience phones submitting the
+          // same text within a few seconds each get their own bubble —
+          // they have no client_id and hit the normal append path.
           if (msg.text) {
             const audId = `aud_${msg.ts || Date.now()}`;
             setPendingComments(prev => {
-              const now = Date.now();
-              const echo = prev.some(p =>
-                p.text === msg.text && (now - (p.t0 || 0)) < 5000
-              );
-              if (echo) return prev;
+              if (msg.client_id && prev.some(p => p.id === msg.client_id)) {
+                return prev;
+              }
               return [...prev, {
                 id: audId, text: msg.text, t0: Date.now(),
                 source: 'audience', username: msg.username || 'guest',
@@ -331,9 +331,17 @@ export function useEmpireSocket() {
 
   const sendComment = useCallback((text) => {
     if (!text?.trim()) return;
-    const id = `c_${Date.now()}`;
+    const id = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     setPendingComments(prev => [...prev, { id, text: text.trim(), t0: Date.now() }]);
-    wsRef.current?.send(JSON.stringify({ type: 'simulate_comment', text: text.trim() }));
+    // client_id round-trips through the backend so the audience_comment
+    // echo handler can dedup THIS optimistic entry without false-positiving
+    // on a real audience phone that happened to type the same text within
+    // a few seconds. See the audience_comment case below for the dedup.
+    wsRef.current?.send(JSON.stringify({
+      type: 'simulate_comment',
+      text: text.trim(),
+      client_id: id,
+    }));
   }, []);
 
   const sendSell = useCallback((voiceText) => {

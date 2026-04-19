@@ -466,16 +466,22 @@ async def dashboard_ws(ws: WebSocket):
                 # typed test comments (mission item 3 — operator can
                 # rehearse without a phone). Tagged username='operator'
                 # so it visually distinguishes from QR submissions.
-                # The originating client's useEmpireSocket dedups on
-                # text+t0 so its own ChatPanel pending pill (created
-                # optimistically by sendComment) doesn't double-up.
+                # We forward the optional client_id sent by sendComment so
+                # the originating client's useEmpireSocket can dedup ITS
+                # own optimistic pending pill against ITS own echo —
+                # without false-positiving on a real audience phone that
+                # happened to type the same text within a few seconds.
                 if comment_text.strip():
-                    await broadcast_to_dashboards({
+                    payload = {
                         "type": "audience_comment",
                         "username": "operator",
                         "text": comment_text,
                         "ts": int(time.time() * 1000),
-                    })
+                    }
+                    client_id = msg.get("client_id")
+                    if client_id:
+                        payload["client_id"] = client_id
+                    await broadcast_to_dashboards(payload)
                 async def _run():
                     try:
                         await run_routed_comment(comment_text)

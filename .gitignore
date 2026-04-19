@@ -9,3 +9,12 @@ build/
 *.egg-info/
 .expo/
 .agents/
+
+# Local lipsync benchmark renders / scratch outputs (large mp4s, not source-of-truth)
+phase0/bench/videos/
+phase0/renders_e2e/
+
+# 3D carousel render outputs (per-upload generated PNG sequences, multi-MB each)
+backend/renders/spin/
+backend/renders/resp_*.mp4
+backend/renders/pitch_*.mp4

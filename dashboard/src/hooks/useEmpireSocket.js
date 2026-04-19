@@ -22,7 +22,25 @@ export function useEmpireSocket() {
   const [pendingComments, setPendingComments] = useState([]); // [{id, text, t0}]
   const [view3d, setView3d] = useState(null); // {kind, frames|url, ms, source}
   const [transcriptExtract, setTranscriptExtract] = useState(null); // on-device structured pitch hints
+  // Voice flow state — driven by Cody's voice + router events (additive).
+  // Lifecycle: VoiceMic.jsx may flip to 'transcribing' optimistically; server
+  // broadcasts then walk through 'thinking' → 'responding' → null.
+  const [voiceState, setVoiceState] = useState(null); // null | 'transcribing' | 'thinking' | 'responding'
+  const [voiceTranscript, setVoiceTranscript] = useState(null); // { text, source, ms }
+  const [routingDecision, setRoutingDecision] = useState(null); // last decision (drives the badge)
+  const [routingDecisions, setRoutingDecisions] = useState([]); // rolling window of recent decisions
+  const voiceStateTimerRef = useRef(null);
   const wsRef = useRef(null);
+
+  // Helper: set voice state with a safety auto-clear so a dropped follow-up
+  // event can never leave the pill stuck on stage.
+  const setVoiceStateSafe = useCallback((s) => {
+    setVoiceState(s);
+    if (voiceStateTimerRef.current) clearTimeout(voiceStateTimerRef.current);
+    if (s) {
+      voiceStateTimerRef.current = setTimeout(() => setVoiceState(null), 12_000);
+    }
+  }, []);
 
   const connect = useCallback(() => {
     const ws = new WebSocket(WS_URL);
@@ -84,6 +102,26 @@ export function useEmpireSocket() {
           setLiveStage('BRIDGE');
           // Drop any pending entry that matches this comment so the chip clears.
           setPendingComments(prev => prev.filter(p => p.text !== msg.comment));
+          // Voice flow lands here if this response was triggered by voice.
+          // Clearing voiceState lets the LIVE pill take over visually.
+          setVoiceStateSafe(null);
+          break;
+        case 'voice_state':
+          // Director-driven explicit voice state. Authoritative.
+          setVoiceStateSafe(msg.state || null);
+          break;
+        case 'voice_transcript':
+          // Cody's POST /api/voice_comment broadcasts this once Cactus/Gemma
+          // has the text. We're now mid-route → reflect that in the UI.
+          setVoiceTranscript({ text: msg.text, source: msg.source, ms: msg.ms });
+          setVoiceStateSafe('thinking');
+          break;
+        case 'routing_decision':
+          // Router has picked a tool. If it stays local, response will come
+          // very fast (sub-second often). If it escalates, render kicks off.
+          setRoutingDecision(msg);
+          setRoutingDecisions(prev => [...prev.slice(-19), msg]);
+          setVoiceStateSafe('responding');
           break;
         case 'pitch_video':
           setPitchVideoUrl(msg.url);
@@ -128,6 +166,9 @@ export function useEmpireSocket() {
     agentLog, latestAudio, commentResponse, transcript,
     pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
     view3d, transcriptExtract,
+    // Voice + routing surface (additive, no-op until Cody's events ship).
+    voiceState, setVoiceState: setVoiceStateSafe,
+    voiceTranscript, routingDecision, routingDecisions,
     sendComment, sendSell,
     wsRef, // exposed so useAvatarStream can attach an extra message listener
   };

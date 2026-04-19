@@ -181,6 +181,26 @@ export function useEmpireSocket() {
             setResponseVideo(prev => prev ?? degraded);
           }
           break;
+        case 'audience_comment':
+          // QR-submitted comment from a phone in the room. The backend has
+          // already (a) broadcast this informational event and (b) handed
+          // the text to run_routed_comment so the standard router + cost
+          // ticker + comment_response_video chain fires identically to a
+          // typed comment.
+          //
+          // Surface it as pendingComments so the home dashboard's ChatPanel
+          // shows the same "AI Seller (rendering…) responding to '<text>'"
+          // placeholder that typed comments produce — gives the operator
+          // visibility into audience activity even when not on /stage.
+          // Cleared by the matching comment_response_video (same shape).
+          if (msg.text) {
+            const audId = `aud_${msg.ts || Date.now()}`;
+            setPendingComments(prev => [...prev, {
+              id: audId, text: msg.text, t0: Date.now(),
+              source: 'audience', username: msg.username || 'guest',
+            }]);
+          }
+          break;
         case 'voice_transcript':
           // Fires within ~200ms of push-to-talk release. Drop empty
           // transcripts (no_speech / transcription_failed) — the endpoint

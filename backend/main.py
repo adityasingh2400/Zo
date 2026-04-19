@@ -9,8 +9,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +58,34 @@ pipeline_state: dict[str, Any] = {
 
 dashboard_clients: list[WebSocket] = []
 phone_clients: list[WebSocket] = []
+
+# ── Audience comment rate limiter ───────────────────────────────────────────
+# 300 people in the room behind a conference NAT all egress from the same
+# public IP, so we set the per-IP cap permissively (5 / minute) — enough
+# headroom for one person typing fast without inviting a single bad actor
+# from spamming the chat scroll. Comments above the cap are dropped silently
+# (HTTP 429) so the form just looks unresponsive rather than scolding the
+# user mid-demo.
+AUDIENCE_RATE_PER_MIN = 5
+AUDIENCE_TEXT_MAX_CHARS = 240
+_audience_recent: dict[str, list[float]] = {}
+
+
+def _audience_rate_check(ip: str) -> bool:
+    """Return True if `ip` is allowed to post. Side-effect: records the
+    timestamp on success and prunes entries older than 60s. Pure in-process
+    state — fine for a 300-person live demo, would need Redis to scale."""
+    now = time.time()
+    bucket = _audience_recent.setdefault(ip, [])
+    # Drop timestamps older than the 60s window. Keeps the dict bounded
+    # under heavy load — without pruning, a long demo could leak memory.
+    cutoff = now - 60.0
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= AUDIENCE_RATE_PER_MIN:
+        return False
+    bucket.append(now)
+    return True
 
 # Single Director instance owns all play_clip emission. Bound to the
 # dashboard broadcast helper so it can talk to every connected client.
@@ -730,6 +759,296 @@ async def api_state():
         "has_3d": pipeline_state["model_3d"] is not None,
         "log_count": len(pipeline_state["agent_log"]),
     }
+
+
+# ── Audience-facing endpoints (QR-driven comment intake) ───────────────────
+#
+# /comment serves a tiny mobile-first HTML page that audience phones load
+# after scanning the QR code on the intro slide. It posts to
+# /api/audience_comment, which (a) broadcasts the comment to dashboards so
+# it scrolls into the TikTokShopOverlay chat in real time AND (b) feeds it
+# into the same run_routed_comment pipeline a typed comment uses, so the
+# router + cost ticker + avatar response all fire identically.
+#
+# Tunnel-friendly: accepts whatever public hostname Cloudflare assigns
+# (you'd run `cloudflared tunnel --url http://localhost:8000` then point
+# the QR at https://<random>.trycloudflare.com/comment).
+
+# The form is a single string so we don't drag in a Jinja template engine
+# for a 60-line page. CSP-friendly: no external assets, no inline data
+# URIs that need network fetches. Loads instantly even on weak hotspot.
+_COMMENT_FORM_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>EMPIRE · Live Comment</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                   "Segoe UI", Roboto, Inter, Arial, sans-serif;
+      background: radial-gradient(ellipse at top, #1a0b2e 0%, #050507 60%);
+      color: #fafafa;
+      min-height: 100vh; min-height: 100dvh;
+      display: flex; flex-direction: column; align-items: center;
+      padding: 28px 20px 32px; gap: 20px;
+    }
+    .logo {
+      font-weight: 900; letter-spacing: 6px; font-size: 28px;
+      background: linear-gradient(135deg,#ec4899,#7c3aed,#3b82f6);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .pill {
+      font-size: 11px; font-weight: 800; letter-spacing: 2px;
+      color: #ec4899; padding: 4px 10px; border-radius: 999px;
+      background: rgba(236,72,153,0.12); border: 1px solid rgba(236,72,153,0.4);
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 6px 0 0; font-size: 22px; font-weight: 800;
+      text-align: center; line-height: 1.25;
+    }
+    p.sub { margin: 0; color: #a1a1aa; font-size: 14px; text-align: center; }
+    form {
+      width: 100%; max-width: 420px; display: flex; flex-direction: column;
+      gap: 12px; margin-top: 8px;
+    }
+    textarea {
+      background: #18181b; color: #fafafa; border: 1px solid #3f3f46;
+      border-radius: 14px; padding: 14px 16px; font-size: 17px;
+      font-family: inherit; resize: none; min-height: 92px; outline: none;
+      transition: border-color 200ms ease, box-shadow 200ms ease;
+    }
+    textarea:focus { border-color: #ec4899; box-shadow: 0 0 0 3px rgba(236,72,153,0.2); }
+    button {
+      background: linear-gradient(135deg,#ec4899,#f43f5e);
+      color: #fff; border: none; border-radius: 14px;
+      padding: 14px 18px; font-size: 17px; font-weight: 900;
+      letter-spacing: 1.2px; cursor: pointer;
+      box-shadow: 0 6px 18px rgba(244,63,94,0.45);
+      transition: transform 120ms ease, opacity 200ms ease;
+    }
+    button:active { transform: scale(0.98); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .meta {
+      display: flex; justify-content: space-between; align-items: center;
+      color: #a1a1aa; font-size: 12px; padding: 0 4px;
+    }
+    .meta b { color: #fafafa; font-weight: 700; }
+    .ack {
+      color: #22c55e; font-weight: 800; font-size: 14px;
+      text-align: center; min-height: 20px;
+      transition: opacity 240ms ease;
+    }
+    .feed {
+      width: 100%; max-width: 420px; display: flex; flex-direction: column;
+      gap: 6px; margin-top: 4px;
+    }
+    .feed .row {
+      background: rgba(24,24,27,0.7); border: 1px solid #27272a;
+      border-radius: 10px; padding: 8px 10px;
+      font-size: 13px; color: #d4d4d8;
+    }
+    .feed .row .you { color: #fbcfe8; font-weight: 800; margin-right: 6px; }
+    .footer {
+      margin-top: auto; color: #52525b; font-size: 11px; text-align: center;
+      letter-spacing: 0.4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="logo">EMPIRE</div>
+  <span class="pill">Live · Ask anything</span>
+  <h1>Drop a question for the seller.</h1>
+  <p class="sub">Your comment goes straight to the live chat. The avatar replies in under a second.</p>
+  <form id="f">
+    <textarea id="t" placeholder="e.g. is it real leather? does it ship overseas?" maxlength="240" autofocus></textarea>
+    <div class="meta">
+      <span>Posting as <b id="u">@guest</b></span>
+      <span id="cnt">0 / 240</span>
+    </div>
+    <button id="b" type="submit">SEND →</button>
+    <div id="ack" class="ack" aria-live="polite"></div>
+  </form>
+  <div class="feed" id="feed"></div>
+  <div class="footer">Be cool. We rate-limit at 5/min — the avatar has a queue to clear.</div>
+  <script>
+  (function(){
+    var u = "guest_" + (1000 + Math.floor(Math.random()*9000));
+    document.getElementById("u").textContent = "@" + u;
+    var t = document.getElementById("t");
+    var cnt = document.getElementById("cnt");
+    var ack = document.getElementById("ack");
+    var btn = document.getElementById("b");
+    var feed = document.getElementById("feed");
+    function updateCnt() { cnt.textContent = t.value.length + " / 240"; }
+    t.addEventListener("input", updateCnt);
+    document.getElementById("f").addEventListener("submit", function(e){
+      e.preventDefault();
+      var text = t.value.trim();
+      if (!text) return;
+      btn.disabled = true; ack.style.opacity = 0; ack.textContent = "";
+      fetch("/api/audience_comment", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({username: u, text: text})
+      }).then(function(r){
+        if (r.status === 429) {
+          ack.textContent = "Slow down a sec — try again in a moment.";
+          ack.style.color = "#fbbf24"; ack.style.opacity = 1;
+          return null;
+        }
+        if (!r.ok) {
+          ack.textContent = "Couldn't send. Connection?";
+          ack.style.color = "#ef4444"; ack.style.opacity = 1;
+          return null;
+        }
+        ack.textContent = "Sent ✓ — ask another.";
+        ack.style.color = "#22c55e"; ack.style.opacity = 1;
+        var row = document.createElement("div"); row.className = "row";
+        row.innerHTML = '<span class="you">@' + u + '</span>' +
+          text.replace(/[<>&]/g, function(c){ return {"<":"&lt;",">":"&gt;","&":"&amp;"}[c]; });
+        feed.prepend(row);
+        while (feed.children.length > 6) feed.removeChild(feed.lastChild);
+        t.value = ""; updateCnt(); t.focus();
+        return null;
+      }).catch(function(err){
+        ack.textContent = "Network hiccup — try again.";
+        ack.style.color = "#ef4444"; ack.style.opacity = 1;
+      }).finally(function(){
+        setTimeout(function(){ btn.disabled = false; }, 600);
+      });
+    });
+    updateCnt();
+  })();
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/comment", response_class=HTMLResponse)
+async def comment_form() -> HTMLResponse:
+    """Public mobile-first comment form. Audience scans the QR on the
+    intro slide, lands here, types a question, and the avatar responds
+    on stage in <8s. Zero auth, no JS framework — loads on a weak hotspot."""
+    return HTMLResponse(_COMMENT_FORM_HTML, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/audience_comment")
+async def api_audience_comment(payload: dict, request: Request):
+    """Audience-submitted comment from a phone. Two side effects:
+      1. Broadcast `audience_comment` to all connected dashboards so the
+         TikTokShopOverlay chat scroll renders the bubble immediately,
+         attributed to @<username>.
+      2. Hand the comment text to `run_routed_comment` so the same router
+         + cost-ticker + avatar pipeline a typed comment uses fires for
+         the audience input. The router emits routing_decision (drives
+         the cost ticker) and eventually comment_response_video (drives
+         the avatar response).
+    """
+    # Identify the client by best-available IP. Behind a Cloudflare tunnel
+    # we'll get cf-connecting-ip; fall back to whatever uvicorn populated.
+    client_ip = (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    if not _audience_rate_check(client_ip):
+        # Drop silently from the audience view — the form will show "slow
+        # down" but the chat scroll never sees the comment.
+        raise HTTPException(status_code=429, detail="rate_limited")
+
+    text_raw = (payload.get("text") or "").strip()
+    if not text_raw:
+        raise HTTPException(status_code=400, detail="empty_text")
+    # Trim to a sane upper bound so a runaway client can't broadcast
+    # multi-kilobyte messages into the dashboard chat scroll.
+    text = text_raw[:AUDIENCE_TEXT_MAX_CHARS]
+    username_raw = (payload.get("username") or "guest").strip()
+    # Same idea for the username — only allow sane chars and cap length.
+    username = "".join(ch for ch in username_raw if ch.isalnum() or ch in "_-")[:24] or "guest"
+    ts = int(time.time() * 1000)
+
+    # Surface immediately to the overlay so the audience sees their comment
+    # land in the chat scroll BEFORE the avatar response renders.
+    await broadcast_to_dashboards({
+        "type": "audience_comment",
+        "username": username,
+        "text": text,
+        "ts": ts,
+    })
+    log_event("AUDIENCE", f"@{username}: {text[:80]}", {"ip": client_ip})
+
+    # Route through the same dispatcher typed comments use. Fire-and-forget
+    # so the HTTP response back to the phone returns instantly — we don't
+    # want the form to hang while Wav2Lip renders a 5s response.
+    async def _route():
+        try:
+            await run_routed_comment(text)
+        except Exception as e:
+            log_event("ROUTER", f"audience comment routing failed: {e}",
+                      {"username": username})
+            logger.exception("audience comment routing failed")
+
+    asyncio.create_task(_route())
+    return {"status": "queued", "username": username, "ts": ts}
+
+
+@app.post("/api/go_live")
+async def api_go_live():
+    """Stage-view G-hotkey target. Plays a generic intro clip ("hey
+    everyone, welcome back to the stream") via the Director so the
+    avatar starts speaking instantly when the operator triggers Go Live.
+
+    Falls back through the bridge_clips manifest chain:
+      1. intro_arbitrary label (added in BRIDGE_SCRIPTS, populated by
+         scripts/render_generic_clips.py)
+      2. neutral fallback pool
+      3. phase0 LatentSync library
+      4. None — returns 503 so the operator knows nothing rendered
+
+    Idempotent: spamming G plays back-to-back intros, which the Director's
+    crossfade machinery handles cleanly. Useful for nervous demo restarts.
+    """
+    clip = pick_bridge_clip("intro_arbitrary")
+    if not clip:
+        # No intros rendered yet — fall through to a neutral acknowledgment
+        # so the avatar at least says SOMETHING when the operator presses G.
+        clip = pick_bridge_clip("neutral")
+    if not clip:
+        log_event("DIRECTOR", "go_live: no clips available — render bridges first")
+        raise HTTPException(
+            status_code=503,
+            detail=("No intro/neutral clips on disk. Run "
+                    "`python scripts/render_generic_clips.py` first."),
+        )
+    url = clip.get("url")
+    script = clip.get("script", "")
+    log_event("DIRECTOR", f"go_live: playing intro — {script[:60]}", {"url": url})
+
+    if director:
+        await director.play_response(url)
+        # Probe the actual file duration when it's a renders/ MP4 so the
+        # idle release fires when the avatar finishes. Bridge clips are
+        # short (~2s) so a word-count fallback is tight enough.
+        play_ms = (clip.get("ms") or 0)
+        if not play_ms:
+            words = max(4, len(script.split()))
+            play_ms = int(words * 350)
+        play_ms_with_tail = play_ms + 400
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            if director:
+                await director.fade_to_idle()
+
+        asyncio.create_task(_release_after(play_ms_with_tail))
+
+    return {"status": "playing", "url": url, "script": script}
 
 
 # ── Lip-sync endpoints (Phase 1 pipeline) ──────────────

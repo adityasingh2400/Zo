@@ -27,10 +27,35 @@ const TOOL_LABEL = {
   escalate_to_cloud: 'escalate_to_cloud',
 };
 
-export function RoutingPanel({ routingDecisions = [], routingStats }) {
+export function RoutingPanel({ routingDecisions = [], routingStats, compact = false }) {
   const { total = 0, local = 0, cost_saved_usd = 0 } = routingStats || {};
   const pctLocal = total > 0 ? Math.round((local / total) * 100) : 0;
+  // Avg latency over the rolling window of decisions — gives the audience
+  // a tight number for "sub-second routing" without over-claiming the
+  // single-decision low. Falls back to "—" when no decisions yet.
+  const avgMs = routingDecisions.length
+    ? Math.round(routingDecisions.reduce((acc, d) => acc + (Number(d.ms) || 0), 0)
+                 / routingDecisions.length)
+    : null;
   const recent = routingDecisions.slice(-6).reverse();  // newest first
+  const lastDecision = routingDecisions[routingDecisions.length - 1];
+
+  // Compact mode: a single horizontal strip designed to live on the dark
+  // bezel of the TikTok Shop overlay. Reads from 30+ feet — the moat made
+  // visible without taking stage real estate. Pulses green on each new
+  // local-path decision so the audience tracks the ticking.
+  if (compact) {
+    return (
+      <CompactStrip
+        local={local}
+        total={total}
+        pctLocal={pctLocal}
+        costSaved={cost_saved_usd}
+        avgMs={avgMs}
+        lastDecision={lastDecision}
+      />
+    );
+  }
 
   return (
     <div style={styles.container}>
@@ -57,6 +82,64 @@ export function RoutingPanel({ routingDecisions = [], routingStats }) {
           recent.map((d, i) => <DecisionRow key={d.seq ?? `${d.receivedAt}-${d.tool}-${d.comment}`} decision={d} fresh={i === 0} />)
         )}
       </div>
+    </div>
+  );
+}
+
+// CompactStrip — the stage-mode flavor of the routing panel. One row, three
+// numbers + a status dot. Pulses each time a new local decision lands so
+// the audience can clock the routing as it happens, not after.
+function CompactStrip({ local, total, pctLocal, costSaved, avgMs, lastDecision }) {
+  const [pulse, setPulse] = useState(false);
+  const lastSeqRef = useRef(null);
+  useEffect(() => {
+    const seq = lastDecision?.seq;
+    if (seq == null || seq === lastSeqRef.current) return;
+    lastSeqRef.current = seq;
+    setPulse(true);
+    const h = setTimeout(() => setPulse(false), 700);
+    return () => clearTimeout(h);
+  }, [lastDecision?.seq]);
+
+  // Color the dot based on whether the LATEST decision was local or cloud —
+  // the audience reads the dot before the digits. Default green when nothing
+  // has happened yet (the resting "we'd be local if a comment landed" tone).
+  const wasLocal = lastDecision ? !!lastDecision.was_local : true;
+  const dotColor = wasLocal ? '#22c55e' : '#f59e0b';
+
+  return (
+    <div style={{
+      ...stripStyles.container,
+      borderColor: pulse ? dotColor : '#27272a',
+      boxShadow: pulse ? `0 0 18px ${dotColor}66` : 'none',
+      transition: 'border-color 240ms ease, box-shadow 240ms ease',
+    }}>
+      <div style={stripStyles.dotWrap}>
+        <span style={{ ...stripStyles.dot, background: dotColor, boxShadow: `0 0 10px ${dotColor}` }} />
+        <span style={stripStyles.dotLabel}>ROUTER</span>
+      </div>
+      <div style={stripStyles.divider} />
+      <Stat label="LOCAL" value={`${local} / ${total}`} sub={`${pctLocal}%`} accent="#22c55e" />
+      <div style={stripStyles.divider} />
+      <Stat label="SAVED" value={formatUSD(costSaved)} accent="#fafafa" />
+      <div style={stripStyles.divider} />
+      <Stat
+        label="AVG"
+        value={avgMs == null ? '—' : (avgMs < 1000 ? `${avgMs}ms` : `${(avgMs / 1000).toFixed(1)}s`)}
+        accent="#a1a1aa"
+      />
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, accent }) {
+  return (
+    <div style={stripStyles.stat}>
+      <span style={stripStyles.statLabel}>{label}</span>
+      <span style={{ ...stripStyles.statValue, color: accent }}>
+        {value}
+        {sub && <span style={stripStyles.statSub}>{` ${sub}`}</span>}
+      </span>
     </div>
   );
 }
@@ -187,5 +270,50 @@ const styles = {
     fontSize: 11, color: '#71717a',
     fontVariantNumeric: 'tabular-nums',
     minWidth: 44, textAlign: 'right',
+  },
+};
+
+// Stage-mode strip — designed for stadium readability. Lives on the dark
+// frame next to the 9:16 overlay; same data as the full panel, distilled
+// into a single horizontal row.
+const stripStyles = {
+  container: {
+    display: 'flex', alignItems: 'center', gap: 14,
+    background: 'rgba(9,9,11,0.85)',
+    border: '1px solid #27272a',
+    borderRadius: 12, padding: '10px 16px',
+    backdropFilter: 'blur(8px)',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+  },
+  dotWrap: {
+    display: 'flex', alignItems: 'center', gap: 8,
+  },
+  dot: {
+    width: 10, height: 10, borderRadius: 5,
+    animation: 'pulse 1.2s ease-in-out infinite',
+  },
+  dotLabel: {
+    fontSize: 10, fontWeight: 800, letterSpacing: 1.5,
+    color: '#a1a1aa', textTransform: 'uppercase',
+  },
+  divider: {
+    width: 1, height: 28, background: '#27272a',
+  },
+  stat: {
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+    gap: 1, minWidth: 70,
+  },
+  statLabel: {
+    fontSize: 9, fontWeight: 800, letterSpacing: 1.5,
+    color: '#52525b', textTransform: 'uppercase',
+  },
+  statValue: {
+    fontSize: 18, fontWeight: 800, letterSpacing: -0.3,
+    fontVariantNumeric: 'tabular-nums', lineHeight: 1.1,
+  },
+  statSub: {
+    fontSize: 11, fontWeight: 600, color: '#71717a',
+    marginLeft: 2,
   },
 };

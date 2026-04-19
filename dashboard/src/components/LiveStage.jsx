@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useAvatarStream, TIER1_FADEOUT_MS } from '../hooks/useAvatarStream';
+import { dlog } from '../lib/dlog';
 import { KaraokeCaptions } from './KaraokeCaptions';
 import { TranslationChip } from './TranslationChip';
 
@@ -54,6 +55,13 @@ export function LiveStage({
   // the IndexSizeError volume crashes from out-of-range t values.
   const tier1FadeRafRef = useRef(null);
 
+  // Speculative preload (Pass 2). When the router fires a routing_decision
+  // we often know the URL of the upcoming Tier 1 clip 100-300ms BEFORE the
+  // play_clip event lands. Stashing it here makes the Tier 1 driver use the
+  // already-decoded incoming element directly, skipping the canplay round
+  // trip on the actual play. Cleared after the play_clip consumes it.
+  const tier1PreloadRef = useRef({ url: null, slot: null });
+
   // Hidden <audio> element owned by LiveStage. Drives both audio-first
   // comment responses AND 30s pitch playback. KaraokeCaptions (Phase 4)
   // reads currentTime off this element via the ref. Single instance reused
@@ -84,27 +92,31 @@ export function LiveStage({
     const outgoingEl = tier0ActiveIsA ? tier0ARef.current : tier0BRef.current;
     if (!incomingEl) return;
 
-    incomingEl.src = `${API_BASE}${url}`;
+    const fadeMs = stream.tier0?.fadeMs ?? 600;
     incomingEl.muted = true;
     incomingEl.loop = stream.tier0?.loop ?? true;
     incomingEl.volume = 0;
 
-    const fadeMs = stream.tier0?.fadeMs ?? 600;
-    const onCanPlay = () => {
-      incomingEl.removeEventListener('canplay', onCanPlay);
-      incomingEl.play().then(() => {
-        // Promote incoming to active, fade it in, fade outgoing out.
+    // First-frame match (REVISIONS §17). Loads the new src, seeks to t=0,
+    // waits for the seeked event so the decoder has the EXACT first frame
+    // ready before we start the opacity ramp. Without this, the incoming
+    // element was sometimes painting frame 2-5 (whatever decoded first
+    // after canplay) when the fade kicked in — a small but visible "her
+    // head jumped" pop on slo-mo replay.
+    prepareFirstFrame(incomingEl, `${API_BASE}${url}`)
+      .then(() => incomingEl.play())
+      .then(() => {
         setTier0ActiveIsA(prev => !prev);
         setTier0Opacity(1);
         stream.sendStageReady();
-        // Pause the outgoing element after the fade so we don't keep two
-        // 1080p decoders running.
         setTimeout(() => {
           try { outgoingEl?.pause(); } catch {}
         }, fadeMs + 50);
-      }).catch(() => {});
-    };
-    incomingEl.addEventListener('canplay', onCanPlay, { once: true });
+      })
+      .catch((err) => {
+        console.warn('[LiveStage] tier0 prep failed', err);
+      });
+
     lastTier0Url.current = url;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stream.tier0?.url, stream.tier0?.loop]);
@@ -127,15 +139,50 @@ export function LiveStage({
     if (tier1FadeRafRef.current) {
       cancelAnimationFrame(tier1FadeRafRef.current);
       tier1FadeRafRef.current = null;
+      dlog('tier1', 'prev_raf_cancelled', { intent: stream.tier1?.intent });
     }
+    dlog('tier1', 'event_received', {
+      intent: stream.tier1?.intent || '(none)',
+      url: stream.tier1?.url || '(empty=fade-out)',
+      fadeMs: stream.tier1?.fadeMs,
+      muted: !!stream.tier1?.muted,
+    });
 
     // Idle release — fade Tier 1 out, reveal Tier 0 underneath.
     if (!url) {
       const activeEl = tier1ActiveIsA ? tier1ARef.current : tier1BRef.current;
-      // Hard-mute the active element immediately so the audio drops with the
-      // visual, not 500ms after. Volume = 0 instead of muted=true so the
-      // playback continues (CSS opacity handles the visual fade), just silent.
-      try { if (activeEl) activeEl.volume = 0; } catch {}
+
+      // Audio ramp alongside the CSS opacity fade. Previously we hard-muted
+      // the element immediately on idle release — audio dropped to silence
+      // while the video kept visually fading, which read as "the audio cut
+      // out right before her face vanished". Now we ramp volume to 0 over
+      // the same fadeMs window so audio + visual fade in lockstep, no
+      // perceptual lag at the seam. Skip the ramp on muted elements
+      // (audio-first paths) since their soundtrack is owned by the
+      // standalone <audio> element and is fading via its own onEnded.
+      const startVol = (() => {
+        try { return activeEl ? activeEl.volume : 0; } catch { return 0; }
+      })();
+      if (activeEl && !activeEl.muted && startVol > 0) {
+        const start = performance.now();
+        function fadeOutTick(now) {
+          const t = Math.max(0, Math.min(1, (now - start) / fadeMs));
+          try { activeEl.volume = startVol * (1 - t); } catch {
+            tier1FadeRafRef.current = null;
+            return;
+          }
+          if (t < 1) {
+            tier1FadeRafRef.current = requestAnimationFrame(fadeOutTick);
+          } else {
+            tier1FadeRafRef.current = null;
+          }
+        }
+        tier1FadeRafRef.current = requestAnimationFrame(fadeOutTick);
+      } else {
+        // Already silent or muted — just clamp to 0 to be safe.
+        try { if (activeEl) activeEl.volume = 0; } catch {}
+      }
+
       setTier1Opacity(0);
       setOverlayVisible(false);
       // After the fade settles, pause the active element so the decoder is free.
@@ -161,7 +208,6 @@ export function LiveStage({
     // the new event arrived, this clamp guarantees no audio bleed.
     try { if (outgoingEl) outgoingEl.volume = 0; } catch {}
 
-    incomingEl.src = `${API_BASE}${url}`;
     // Audio-first path: Director sets muted=true on the play_clip event. The
     // soundtrack is coming from a standalone <audio> element (audioResponse
     // / pitchAudio), so this video element must stay silent or we double
@@ -174,35 +220,62 @@ export function LiveStage({
     incomingEl.volume = 0;
 
     const expectedDurationMs = stream.tier1.expectedDurationMs;
-    const onCanPlay = () => {
-      incomingEl.removeEventListener('canplay', onCanPlay);
 
-      // Duration handshake (REVISIONS §4). When the audio is already playing
-      // through a standalone <audio> element, we want the video to match the
-      // audio length within ~150ms — otherwise we'd see either a silent
-      // video tail (video > audio) or a clipped audio finale (audio > video).
-      // Reject the late video and let audio finish alone in the mismatch.
-      if (audioFirstMuted && expectedDurationMs && incomingEl.duration) {
-        const videoMs = incomingEl.duration * 1000;
-        const driftMs = Math.abs(videoMs - expectedDurationMs);
-        if (driftMs > 150) {
-          console.warn('[LiveStage] audio-first duration drift', {
-            videoMs: Math.round(videoMs), expectedDurationMs, driftMs: Math.round(driftMs),
-          });
-          // Don't promote, don't crossfade. Tier 0 keeps painting underneath
-          // and audio finishes from the standalone element. Ack as
-          // 'skipped' so backend telemetry can record it.
-          stream.sendAck(stream.tier1.intent, url, 'skipped');
-          return;
+    // Speculative preload reuse (Pass 2). If a routing_decision recently
+    // primed the inactive element with this exact URL, we can skip the
+    // full prepareFirstFrame round-trip entirely — the element already
+    // has the first frame decoded + seeked. Slot match is required so we
+    // don't accidentally promote the wrong element on a tier1 ping-pong.
+    const incomingSlot = tier1ActiveIsA ? 'B' : 'A';
+    const fullSrc = `${API_BASE}${url}`;
+    const preloaded =
+      tier1PreloadRef.current.url === url &&
+      tier1PreloadRef.current.slot === incomingSlot &&
+      incomingEl.src === fullSrc &&
+      incomingEl.readyState >= 2 &&     // HAVE_CURRENT_DATA — first frame ready
+      incomingEl.currentTime <= 0.01;   // not already playing from a previous run
+    if (preloaded) {
+      tier1PreloadRef.current = { url: null, slot: null };
+      dlog('tier1', 'preload_hit', { intent: stream.tier1.intent, url, slot: incomingSlot });
+    }
+
+    const ready = preloaded
+      ? Promise.resolve()
+      : prepareFirstFrame(incomingEl, fullSrc);
+
+    ready
+      .then(() => {
+        // Duration handshake (REVISIONS §4). When the audio is already
+        // playing through a standalone <audio> element, we want the video
+        // to match the audio length within ~150ms — otherwise we'd see
+        // either a silent video tail or a clipped audio finale. Reject
+        // the late video and let audio finish alone in the mismatch.
+        if (audioFirstMuted && expectedDurationMs && incomingEl.duration) {
+          const videoMs = incomingEl.duration * 1000;
+          const driftMs = Math.abs(videoMs - expectedDurationMs);
+          if (driftMs > 150) {
+            console.warn('[LiveStage] audio-first duration drift', {
+              videoMs: Math.round(videoMs), expectedDurationMs, driftMs: Math.round(driftMs),
+            });
+            stream.sendAck(stream.tier1.intent, url, 'skipped');
+            throw new Error('duration_drift');
+          }
         }
-      }
-
-      incomingEl.play().then(() => {
-        // Swap which element is active and run the opacity transition.
+        return incomingEl.play();
+      })
+      .then(() => {
+        // First frame is decoded AND positioned at t=0; opacity ramp
+        // happens against a known-good frame, no head-jump pop.
         setTier1ActiveIsA(prev => !prev);
         setTier1Opacity(1);
         setOverlayVisible(stream.tier1.intent === 'response');
         stream.sendAck(stream.tier1.intent, url, 'started');
+        dlog('tier1', 'play_started', {
+          intent: stream.tier1.intent, url, fadeMs,
+          muted: audioFirstMuted,
+          slot: tier1ActiveIsA ? 'B' : 'A',
+          preloaded,
+        });
 
         if (audioFirstMuted) {
           // No audio ramp — the standalone <audio> already owns the
@@ -216,12 +289,9 @@ export function LiveStage({
 
         // Default path: rAF audio fade alongside the CSS opacity transition.
         // t is clamped to [0, 1] on BOTH ends — without the lower clamp,
-        // performance.now() jitter (or any handler that re-fires the effect
-        // mid-tick) could produce a slightly negative t, throwing
-        // IndexSizeError on `el.volume = -0.025…` and aborting the fade.
-        // Storing the rAF id in a ref lets the NEXT Tier 1 transition cancel
-        // this loop before starting its own — eliminating concurrent fades
-        // fighting over the same A/B element volumes.
+        // performance.now() jitter could produce a slightly negative t,
+        // throwing IndexSizeError. Storing the rAF id in a ref lets the
+        // NEXT Tier 1 transition cancel this loop before starting its own.
         const start = performance.now();
         function tick(now) {
           const t = Math.max(0, Math.min(1, (now - start) / fadeMs));
@@ -229,7 +299,6 @@ export function LiveStage({
             incomingEl.volume = t;
             if (outgoingEl) outgoingEl.volume = 1 - t;
           } catch {
-            // Element was detached / src changed mid-tick — bail.
             tier1FadeRafRef.current = null;
             return;
           }
@@ -237,18 +306,16 @@ export function LiveStage({
             tier1FadeRafRef.current = requestAnimationFrame(tick);
           } else {
             tier1FadeRafRef.current = null;
-            // Pause outgoing after the fade so the decoder is free for the
-            // next preload.
             try { outgoingEl?.pause(); } catch {}
           }
         }
         tier1FadeRafRef.current = requestAnimationFrame(tick);
-      }).catch(err => {
+      })
+      .catch(err => {
+        if (err?.message === 'duration_drift') return;
         console.warn('[LiveStage] tier1 play() rejected', err);
         stream.sendAck(stream.tier1.intent, url, 'stalled');
       });
-    };
-    incomingEl.addEventListener('canplay', onCanPlay, { once: true });
 
     const onError = () => {
       stream.sendAck(stream.tier1.intent, url, 'stalled');
@@ -321,6 +388,11 @@ export function LiveStage({
     // Tier 1 emit will reset muted=audioFirstMuted as part of its setup.
     try { if (tier1ARef.current) tier1ARef.current.muted = true; } catch {}
     try { if (tier1BRef.current) tier1BRef.current.muted = true; } catch {}
+    dlog('audio', 'play_started', {
+      kind: next.kind, seq: next.payload.seq,
+      url: next.payload.url,
+      tier1_force_muted: true,
+    });
 
     const playPromise = a.play();
     if (playPromise && typeof playPromise.catch === 'function') {
@@ -343,6 +415,7 @@ export function LiveStage({
       const playing = audioPlaying;
       if (!playing) return;
       console.log('[LiveStage] audio-first ended', playing.kind, playing.payload.seq);
+      dlog('audio', 'ended', { kind: playing.kind, seq: playing.payload.seq });
       onAudioEnded?.(playing.kind);
       setAudioPlaying(null);
     }
@@ -804,6 +877,102 @@ const styles = {
     color: '#22c55e', fontSize: 14, fontStyle: 'italic', marginTop: 8, paddingLeft: 46,
   },
 };
+
+// ── Frame-accurate clip preparation (REVISIONS §17 fix) ─────────────────────
+// Loads a video src into an element, seeks to t=0, and resolves only after
+// the seeked event fires + the element has decoded the first frame
+// (readyState >= HAVE_CURRENT_DATA). Used by both Tier 0 and Tier 1
+// drivers so the opacity ramp always starts against a known-good first
+// frame — eliminates the "her head jumped" pop visible on slo-mo replay
+// when canplay returned a frame from an unspecified position.
+//
+// Caller must set incomingEl.muted/loop/volume BEFORE calling. Promise
+// rejects on element error or 4-second hard timeout (network stall) so
+// the caller can surface a stalled ack instead of hanging forever.
+//
+// Idempotent on a hot-cache hit: if the element is already at this exact
+// src + t=0 and decoded, resolves immediately on the next microtask
+// without re-loading. This is what makes the speculative preload path
+// (Tier 1 routing_decision pre-warm) zero-cost on the actual play.
+function prepareFirstFrame(el, src, { timeoutMs = 4000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      el.removeEventListener('seeked', onSeeked);
+      el.removeEventListener('error', onError);
+      clearTimeout(timer);
+    };
+
+    function fail(err) {
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+
+    function onError() {
+      fail(el.error || 'video_error');
+    }
+
+    function trySeekToZero() {
+      // currentTime = 0 is a no-op if we're already at 0 AND the element
+      // hasn't seeked since load — so we force a seek for new srcs only.
+      if (el.currentTime > 0.001) {
+        el.currentTime = 0;
+      } else {
+        // Already at 0; emit a synthetic seeked tick so the resolve path
+        // is uniform.
+        Promise.resolve().then(onSeeked);
+      }
+    }
+
+    function onLoadedMeta() {
+      el.removeEventListener('loadedmetadata', onLoadedMeta);
+      trySeekToZero();
+    }
+
+    function onSeeked() {
+      // readyState >= 2 (HAVE_CURRENT_DATA) means the first frame is
+      // decoded and available for compositing. Browsers usually have
+      // this by the time seeked fires after a load, but we double-check.
+      if (el.readyState >= 2) {
+        cleanup();
+        resolve();
+      } else {
+        // Rare: seeked fired but the frame isn't decoded yet. Wait one
+        // canplay then resolve.
+        const onCanPlay = () => {
+          el.removeEventListener('canplay', onCanPlay);
+          cleanup();
+          resolve();
+        };
+        el.addEventListener('canplay', onCanPlay, { once: true });
+      }
+    }
+
+    el.addEventListener('error', onError, { once: true });
+    el.addEventListener('seeked', onSeeked);
+    const timer = setTimeout(() => fail(new Error('prepare_timeout')), timeoutMs);
+
+    // Hot path: same src + already at t=0 + already decoded → skip the
+    // load entirely, just resolve. This is what makes speculative
+    // preload zero-cost on play.
+    if (el.src === src && el.readyState >= 2 && el.currentTime <= 0.01) {
+      cleanup();
+      resolve();
+      return;
+    }
+
+    if (el.src !== src) {
+      el.src = src;
+      el.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
+      // Some browsers (Safari) need an explicit load() call after src
+      // change for autoplay-disabled elements to start buffering.
+      try { el.load(); } catch {}
+    } else {
+      // Same src, possibly mid-playback or post-end. Seek directly.
+      trySeekToZero();
+    }
+  });
+}
 
 if (typeof document !== 'undefined' && !document.getElementById('livestage-keyframes')) {
   const s = document.createElement('style');

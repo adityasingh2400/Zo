@@ -79,11 +79,20 @@ def save_manifest(manifest: dict[str, list[dict]]) -> None:
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
 
-async def render_one(label: str, text: str, out_path: Path, substrate: str) -> tuple[float, int]:
+async def render_one(
+    label: str, text: str, out_path: Path, substrate: str,
+    *, model_id: str = "eleven_v3",
+) -> tuple[float, int]:
     """TTS → Wav2Lip → write. Returns (elapsed_s, bytes). Raises on failure
-    so the caller can record + continue with the next clip."""
+    so the caller can record + continue with the next clip.
+
+    `model_id` defaults to eleven_v3 because BRIDGE_SCRIPTS is tagged with
+    inline audio directives ([curious], [warmly], etc.) that flash would
+    read aloud. v3 honours them. Render time per clip is ~6-8s (vs ~4-5s
+    on flash) but bridges are pre-rendered once and re-used across every
+    demo, so the extra render cost is paid in the past tense forever."""
     t0 = time.perf_counter()
-    audio = await text_to_speech(text)
+    audio = await text_to_speech(text, model_id=model_id)
     if not audio:
         raise RuntimeError("TTS returned empty audio (ElevenLabs not configured?)")
     t_tts = time.perf_counter() - t0
@@ -100,7 +109,7 @@ async def render_one(label: str, text: str, out_path: Path, substrate: str) -> t
     out_path.write_bytes(mp4)
     total = time.perf_counter() - t0
     print(
-        f"  ✓ {label}/{out_path.stem}: tts={t_tts:.1f}s lip={t_lip:.1f}s "
+        f"  ✓ {label}/{out_path.stem} [{model_id}]: tts={t_tts:.1f}s lip={t_lip:.1f}s "
         f"total={total:.1f}s size={len(mp4) / 1024:.0f}KB",
         flush=True,
     )
@@ -120,7 +129,35 @@ async def main() -> None:
         default=POD_SPEAKING_1080P,
         help="pod-side path to source speaking video",
     )
+    ap.add_argument(
+        "--model",
+        default="eleven_v3",
+        help="ElevenLabs model id. Default eleven_v3 honours the audio "
+             "tags in BRIDGE_SCRIPTS. Pass eleven_flash_v2_5 only after "
+             "stripping tags from the scripts (otherwise flash reads them aloud).",
+    )
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="wipe existing _generic dir + manifest before rendering. "
+             "Use after BRIDGE_SCRIPTS text changes (sha256 slugs change → "
+             "old MP4s become orphans the runtime picker still sees).",
+    )
     args = ap.parse_args()
+
+    # --reset: clear stale clips/manifest. Critical when BRIDGE_SCRIPTS
+    # text changes — slugs are sha256-of-text, so any edit produces new
+    # filenames and leaves the old ones behind. Without --reset, the
+    # runtime random.choice() picker would mix new (tagged) clips with
+    # stale (untagged) ones and the demo voice would feel inconsistent.
+    if args.reset and OUT_DIR.exists():
+        import shutil as _shutil
+        for child in OUT_DIR.iterdir():
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                _shutil.rmtree(child)
+        print(f"[reset] cleared {OUT_DIR.relative_to(ROOT)}/")
 
     only_set = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
 
@@ -152,13 +189,14 @@ async def main() -> None:
         return
 
     print(f"Rendering {len(jobs)} generic clips via substrate={args.substrate}")
-    print(f"Output: {OUT_DIR.relative_to(ROOT)}/")
+    print(f"  model={args.model}  output={OUT_DIR.relative_to(ROOT)}/")
     total_t = 0.0
     total_bytes = 0
     failures: list[tuple[str, str, str]] = []
     for label, text, out_path in jobs:
         try:
-            t, n = await render_one(label, text, out_path, args.substrate)
+            t, n = await render_one(label, text, out_path, args.substrate,
+                                    model_id=args.model)
             total_t += t
             total_bytes += n
             # Add to manifest under its label, dedup by file name so reruns

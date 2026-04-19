@@ -59,40 +59,60 @@ GENERIC_MANIFEST_PATH = GENERIC_DIR / "manifest.json"
 # Each entry: (label, text). Labels match the Gemma classifier output:
 # "question" | "compliment" | "objection" | "neutral".
 # Keep utterances 1.5-3s long — they buy us time, not full responses.
+#
+# Tagging rationale (Apr 2026):
+#   These are the ONE bridge tier that's pre-rendered before any demo and
+#   never re-rendered per-product, so they get the eleven_v3 model with
+#   inline audio tags ([curious], [warmly], [pauses], etc.). Tags shape
+#   the prosody of the words that follow them and unlock the gap between
+#   "AI voice reading filler" and "person genuinely reacting in real time."
+#
+#   Conservative tag density on purpose: every tag adds a small risk of
+#   the model mis-interpreting a directive as something to read aloud.
+#   We pick one emotional-shape tag at the front of each line and at most
+#   one delivery beat ([pauses]) inside. Non-verbal sound effects like
+#   [laughs] and [sighs] are deliberately avoided here — they read as a
+#   distinct beat the lipsync substrate can't match because the substrate
+#   video is one continuous "speaking pose" with no laugh / sigh frames.
+#   Save those tags for content where the substrate matches.
+#
+#   Pair this with `model_id="eleven_v3"` when calling text_to_speech in
+#   the render pipeline below. v3 honors the brackets; flash will read
+#   them aloud.
 BRIDGE_SCRIPTS: list[tuple[str, str]] = [
-    # questions
-    ("question", "Great question — let me think about that."),
-    ("question", "Ooh, good one. Hold on a sec."),
-    ("question", "Yeah, totally fair to ask."),
-    ("question", "I love that you asked that."),
-    # compliments
-    ("compliment", "Aww thank you so much!"),
-    ("compliment", "I appreciate that, seriously."),
-    ("compliment", "You're so sweet, thank you."),
-    # objections
-    ("objection", "Totally hear you on that."),
-    ("objection", "I get it, let me address that."),
-    ("objection", "That's fair, here's the deal."),
+    # questions — show genuine engagement, not a chatbot ack
+    ("question", "[curious] Ooh, great question. [pauses] Let me think about that."),
+    ("question", "[warmly] Yeah, that's a good one. Hold on a sec."),
+    ("question", "[curious] Mmm, totally fair to ask. One sec..."),
+    ("question", "[happily] I love that you asked that — okay, so..."),
+    # compliments — actual gratitude, not a polite reflex
+    ("compliment", "[happily] Aww, thank you so much!"),
+    ("compliment", "[warmly] I appreciate that — seriously, thank you."),
+    ("compliment", "[playfully] You're so sweet, thank you!"),
+    # objections — empathy first, fact second; v3 nails the pivot
+    ("objection", "[reassuring] Totally hear you on that. Here's the thing..."),
+    ("objection", "[calm] I get it. Let me actually address that."),
+    ("objection", "[warmly] That's fair — here's the real deal."),
     # neutral acks (used as fallback for any label)
-    ("neutral", "Okay, hang on one second."),
-    ("neutral", "Yeah, let me show you."),
-    ("neutral", "Mhm, mhm."),
-    ("neutral", "Right, so..."),
+    ("neutral", "[softly] Okay, hang on one second..."),
+    ("neutral", "[warmly] Yeah, let me show you."),
+    ("neutral", "[playfully] Mhm, mhm. Okay so..."),
+    ("neutral", "[curious] Right, so..."),
     # ── Stage-demo additions (Step 7 of the TikTok Shop overlay plan) ──
     # intro_arbitrary fires from /api/go_live when the operator presses G
     # on /stage. These need to read as natural live-stream openers — like
     # the speaker just hit "Go Live" and is greeting whoever just joined.
     # Keep them ~1.5-2.5s so the overlay's hearts + viewer count have a
     # beat to land before any product-specific pitch follows.
-    ("intro_arbitrary", "Hey everyone, welcome back to the stream!"),
-    ("intro_arbitrary", "What's up, we are LIVE — glad you're here."),
-    ("intro_arbitrary", "Good to see y'all dropping in. Let's get into it."),
+    ("intro_arbitrary", "[excited] Hey everyone, welcome back to the stream!"),
+    ("intro_arbitrary", "[cheerfully] What's up, we are LIVE — so glad you're here."),
+    ("intro_arbitrary", "[warmly] Good to see y'all dropping in. [excited] Let's get into it."),
     # bridge_arbitrary covers the 60s when the avatar is buying time
     # while the on-device vision pipeline analyzes the held-up item.
     # Read as the speaker improvising while looking at something.
-    ("bridge_arbitrary", "Alright, let me show you what I picked up today."),
-    ("bridge_arbitrary", "Okay, gonna take a closer look at this one."),
-    ("bridge_arbitrary", "One sec — getting this into frame for you."),
+    ("bridge_arbitrary", "[curious] Alright, let me show you what I picked up today."),
+    ("bridge_arbitrary", "[softly] Okay, gonna take a closer look at this one."),
+    ("bridge_arbitrary", "[playfully] One sec — getting this into frame for you."),
 ]
 
 
@@ -221,10 +241,19 @@ async def render_all(
     elevenlabs_voice: str = "Rachel",
     avatar_video: str = "/workspace/state_pitching_pose_speaking_1080p.mp4",
     overwrite: bool = False,
+    model_id: str = "eleven_v3",
 ):
     """Generate TTS for each script, send through LatentSync, save to disk,
     write/update manifest. Idempotent — skips already-rendered clips by
-    matching the (script, sha256) slug."""
+    matching the (script, sha256) slug.
+
+    `model_id` defaults to eleven_v3 because bridges are pre-rendered once
+    and re-used across every demo forever. v3 honours the audio tags in
+    BRIDGE_SCRIPTS ([curious], [warmly], etc.) which is the entire reason
+    these scripts were tagged in the first place. Render time per clip is
+    higher than flash but only paid once. Pass model_id="eleven_flash_v2_5"
+    if you need to re-render fast (the tags will be read aloud — you'll
+    want to strip them from BRIDGE_SCRIPTS first)."""
     from agents.seller import text_to_speech, render_pitch_latentsync
 
     manifest = load_manifest()
@@ -250,8 +279,8 @@ async def render_all(
 
         t0 = time.time()
         try:
-            logger.info("[tts ] %s/%s — %s", label, slug, text)
-            audio_b64 = await text_to_speech(text, voice=elevenlabs_voice)
+            logger.info("[tts ] %s/%s [%s] — %s", label, slug, model_id, text)
+            audio_b64 = await text_to_speech(text, voice=elevenlabs_voice, model_id=model_id)
             if not audio_b64:
                 logger.warning("[fail] no audio for %s", text)
                 failed += 1
@@ -308,6 +337,9 @@ def main():
     r.add_argument("--avatar", default="/workspace/state_pitching_pose_speaking_1080p.mp4",
                    help="path to avatar source video on the RunPod")
     r.add_argument("--overwrite", action="store_true")
+    r.add_argument("--model", default="eleven_v3",
+                   help="ElevenLabs model id. Default eleven_v3 honours audio tags. "
+                        "Pass eleven_flash_v2_5 only if you re-strip the tags from BRIDGE_SCRIPTS.")
 
     sub.add_parser("manifest", help="print current manifest")
 
@@ -333,6 +365,7 @@ def main():
             elevenlabs_voice=args.voice,
             avatar_video=args.avatar,
             overwrite=args.overwrite,
+            model_id=args.model,
         ))
         sys.exit(0 if result["failed"] == 0 else 1)
 

@@ -1,16 +1,25 @@
 import asyncio
-import contextvars
+import base64
 import json
+import logging
 import os
 import time
-import base64
-import logging
 import traceback
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
@@ -21,37 +30,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger("empire")
 
-from config import (
-    BACKEND_HOST, BACKEND_PORT,
-    USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO, USE_BACKCHANNEL,
-    USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER, USE_LIVE_PAD,
+from agents import brain
+from agents import router as comment_router
+from agents import translator
+from agents.hands import Hands
+from agents.avatar_director import Director
+from agents.bridge_clips import all_bridges, pick_bridge_clip
+from agents.creator import build_all as creator_build_all
+from agents.creator import generate_3d_model, remove_background
+from agents.eyes import (
+    analyze_and_script_claude,
+    analyze_and_script_gemma,
+    analyze_with_claude,
+    classify_comment_gemma,
+    transcribe_voice,
 )
-from agents.eyes import analyze_with_claude, analyze_and_script_claude, classify_comment_gemma, transcribe_voice
-from agents.creator import remove_background, generate_3d_model
+from agents.intake import process_video
+from agents.router import _match_product_field  # used by speculative bridge
 from agents.seller import (
     generate_comment_response,
     make_avatar_speak,
-    text_to_speech,
-    synthesize_word_timings,
-    set_livetalking_session,
     render_comment_response_wav2lip,
     render_pitch_latentsync,
+    set_livetalking_session,
+    text_to_speech,
 )
-from agents.intake import process_video
-from agents.threed import carousel_from_video, glb_from_image
-from agents.bridge_clips import pick_bridge_clip, all_bridges
-from agents.avatar_director import Director
-from agents import router as comment_router
-from agents import trace
-from agents.router import _match_product_field  # used by speculative bridge
+from agents.threed import carousel_from_video
+from config import (
+    BACKEND_HOST,
+    BACKEND_PORT,
+    LIPSYNC_PROVIDER,
+    USE_AUDIO_FIRST,
+    USE_BACKCHANNEL,
+    USE_KARAOKE,
+    USE_PITCH_VEO,
+    USE_SPECULATIVE_BRIDGE,
+)
 
 logger.info(
     "[flags] USE_AUDIO_FIRST=%s USE_KARAOKE=%s USE_PITCH_VEO=%s "
-    "USE_BACKCHANNEL=%s USE_SPECULATIVE_BRIDGE=%s USE_LIVE_PAD=%s "
-    "LIPSYNC_PROVIDER=%s",
+    "USE_BACKCHANNEL=%s USE_SPECULATIVE_BRIDGE=%s LIPSYNC_PROVIDER=%s",
     USE_AUDIO_FIRST, USE_KARAOKE, USE_PITCH_VEO,
-    USE_BACKCHANNEL, USE_SPECULATIVE_BRIDGE, USE_LIVE_PAD,
-    LIPSYNC_PROVIDER,
+    USE_BACKCHANNEL, USE_SPECULATIVE_BRIDGE, LIPSYNC_PROVIDER,
 )
 
 # ── State ──────────────────────────────────────────────
@@ -107,28 +127,21 @@ def _audience_rate_check(ip: str) -> bool:
 # Single Director instance owns all play_clip emission. Bound to the
 # dashboard broadcast helper so it can talk to every connected client.
 director: "Director | None" = None  # set in app startup, see below
+hands: "Hands | None" = None        # set in app startup (Item 5)
 
 
 PRODUCTS_PATH = Path(__file__).resolve().parent / "data" / "products.json"
+AVATARS_PATH = Path(__file__).resolve().parent / "data" / "avatars.json"
 
 
-def _load_active_product() -> None:
-    """Read backend/data/products.json and pick an active product. The active
-    product lives in pipeline_state["product_data"] so the router's
-    respond_locally path can match against its qa_index immediately —
-    no prior /api/sell upload required for the demo.
+def _load_products() -> None:
+    """Read backend/data/products.json into pipeline_state["products_catalog"]
+    (full dict) + set the initial active product. The active product lives in
+    pipeline_state["product_data"] (kept in sync with active_product_id) so
+    the router's respond_locally path can match against its qa_index without
+    requiring a /api/sell upload first.
 
-    INTENTIONALLY EMPTY (`{}`) for the judge-item demo. The judge hands
-    over an arbitrary item live → /api/sell or /api/sell-video →
-    run_sell_pipeline → product_data populates dynamically from Gemma 4
-    vision + Claude. Pre-loading a product here would (a) show the wrong
-    item name in the BUY card before the judge's item analysis lands and
-    (b) cause respond_locally to fire wrong pre-rendered answers for any
-    audience question whose keywords accidentally match the pre-loaded
-    product's qa_index. Add products back here ONLY for non-judge-item
-    rehearsal demos.
-
-    Selection order:
+    Selection order for initial active:
       1. ACTIVE_PRODUCT_ID env var if set and present in the file
       2. First key in the JSON (dicts preserve insertion order)
     Missing file or unreadable JSON: log + skip (router falls back to cloud).
@@ -149,20 +162,68 @@ def _load_active_product() -> None:
                        "(got %s) — skipping", type(products).__name__)
         return
 
-    active_id = os.getenv("ACTIVE_PRODUCT_ID") or next(iter(products.keys()))
-    product = products.get(active_id)
-    if not isinstance(product, dict):
-        logger.warning("Product %r is not an object — skipping", active_id)
+    pipeline_state["products_catalog"] = products
+    initial = os.getenv("ACTIVE_PRODUCT_ID") or next(iter(products.keys()))
+    if initial not in products:
+        logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json — falling back", initial)
+        initial = next(iter(products.keys()))
+    _set_active_product(initial)
+    logger.info("[products] Loaded %d products: %s", len(products), list(products.keys()))
+
+
+def _load_avatars() -> None:
+    """Load backend/data/avatars.json into pipeline_state['avatars_catalog'].
+    Analogous to _load_products. Missing file / bad JSON: log + skip; the
+    system falls back to the single-avatar path (Maya's state videos are
+    the current hardcoded defaults in avatar_director.py)."""
+    if not AVATARS_PATH.exists():
+        logger.info("No avatars.json at %s — skipping pre-load", AVATARS_PATH)
         return
-    if not product:
-        logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json", active_id)
+    try:
+        with AVATARS_PATH.open() as f:
+            avatars = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to read avatars.json: %s", e)
+        return
+    if not isinstance(avatars, dict) or not avatars:
         return
 
+    pipeline_state["avatars_catalog"] = avatars
+    initial = os.getenv("ACTIVE_AVATAR_ID") or next(iter(avatars.keys()))
+    if initial not in avatars:
+        initial = next(iter(avatars.keys()))
+    pipeline_state["active_avatar_id"] = initial
+    logger.info("[avatars] Loaded %d avatars: %s (active=%s)",
+                len(avatars), list(avatars.keys()), initial)
+
+
+def _active_avatar() -> dict:
+    """Resolve the currently-active avatar dict. Returns {} if the catalog
+    is empty (pre-lifespan or no avatars.json), signaling callers to fall
+    back to their legacy hardcoded paths."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    active_id = pipeline_state.get("active_avatar_id")
+    if active_id and active_id in catalog:
+        return catalog[active_id]
+    return {}
+
+
+def _set_active_product(product_id: str) -> dict | None:
+    """Switch the currently-active product. Updates active_product_id +
+    keeps the legacy product_data accessor in sync so existing routes
+    (router, /api/state, agents that read product_data) don't need to change.
+    Returns the product dict on success, None if product_id isn't loaded."""
+    catalog = pipeline_state.get("products_catalog") or {}
+    product = catalog.get(product_id)
+    if not isinstance(product, dict) or not product:
+        logger.warning("[products] _set_active_product: %r not in catalog", product_id)
+        return None
+    pipeline_state["active_product_id"] = product_id
     pipeline_state["product_data"] = product
-    pipeline_state["active_product_id"] = active_id
     qa_count = len(product.get("qa_index") or {})
-    logger.info('[products] Loaded "%s" (id=%s) with %d Q/A entries',
-                product.get("name", "?"), active_id, qa_count)
+    logger.info('[products] Active product → "%s" (id=%s, %d Q/A entries)',
+                product.get("name", "?"), product_id, qa_count)
+    return product
 
 
 def log_event(agent: str, message: str, data: Any = None):
@@ -193,64 +254,18 @@ async def broadcast_to_dashboards(msg: dict):
             dashboard_clients.remove(ws)
         except ValueError:
             pass
-    # Director observer (REVISIONS §12) — every outgoing message also feeds
-    # the motivated-idle state machine. Clean event-listener pattern: the
-    # rest of the codebase doesn't need to call director.notify() at every
-    # lifecycle moment, the broadcast wrapper does it for them.
-    if director is not None:
-        try:
-            await director.observe(msg)
-        except Exception:
-            logger.exception("director.observe failed (non-fatal)")
 
 
 # ── App ────────────────────────────────────────────────
 
-def _startup_banner() -> None:
-    """Print a comprehensive config snapshot at boot so a fresh terminal
-    log immediately tells me what the running backend will and won't do.
-    Single source of truth — anything that can affect demo behavior at
-    runtime should be visible here. Compact + greppable."""
-    from config import (
-        BACKEND_HOST as H, BACKEND_PORT as P,
-        WAV2LIP_URL as W, LATENTSYNC_URL as L,
-        RUNPOD_POD_IP as POD, ELEVENLABS_VOICE_ID as VID,
-        ELEVENLABS_API_KEY as KEY,
-    )
-    from agents.avatar_director import (
-        TIER0_CROSSFADE_MS_DEFAULT, TIER1_CROSSFADE_MS_DEFAULT,
-        READING_CHAT_HOLD_MS,
-    )
-    local_count = len(list(LOCAL_ANSWERS_DIR.glob("*.mp4"))) \
-        if LOCAL_ANSWERS_DIR.exists() else 0
-    generic_count = len(list((LOCAL_ANSWERS_DIR / "_generic").glob("*.mp4"))) \
-        if (LOCAL_ANSWERS_DIR / "_generic").exists() else 0
-    sep = "═" * 72
-    logger.info(sep)
-    logger.info("  Zo backend  %s:%s", H, P)
-    logger.info(sep)
-    logger.info("  feature flags        USE_AUDIO_FIRST=%s  USE_PITCH_VEO=%s  USE_KARAOKE=%s",
-                USE_AUDIO_FIRST, USE_PITCH_VEO, USE_KARAOKE)
-    logger.info("  reading_chat hold    %dms (avatar visibly reads before responding)",
-                READING_CHAT_HOLD_MS)
-    logger.info("  tier0 crossfade      %dms (idle rotation)",
-                TIER0_CROSSFADE_MS_DEFAULT)
-    logger.info("  tier1 crossfade      %dms (response transitions)",
-                TIER1_CROSSFADE_MS_DEFAULT)
-    logger.info("  wav2lip pod          %s", W or "(unset)")
-    logger.info("  latentsync pod       %s", L or "(unset)")
-    logger.info("  runpod ip            %s", POD or "(unset)")
-    logger.info("  elevenlabs           voice=%s  key=%s",
-                VID or "(default)", "yes" if KEY else "MISSING")
-    logger.info("  local_answers/       %d product clips, %d _generic clips",
-                local_count, generic_count)
-    logger.info(sep)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global director
-    _startup_banner()
+    global director, hands
+    print(f"EMPIRE backend running on {BACKEND_HOST}:{BACKEND_PORT}")
+    # Bring up the Hands agent (Item 5). Idempotent — reuses the same
+    # broadcast_to_dashboards callable the Director uses for WS emits.
+    hands = Hands(broadcast=broadcast_to_dashboards)
+    logger.info("[hands] initialized with platforms: %s", list(hands.adapters.keys()))
     # Bring up the Avatar Director early so the first dashboard connect can
     # immediately receive a Tier 0 idle clip.
     director = Director(broadcast_to_dashboards)
@@ -260,7 +275,7 @@ async def lifespan(app: FastAPI):
     # slow. Gemma 4 (vision + classify + script) and whisper-base (voice
     # transcription) live on separate Cactus handles; we load them
     # sequentially to avoid any re-entrant SDK init on startup.
-    from agents.eyes import _get_cactus_model, _get_cactus_whisper_model, CACTUS_AVAILABLE
+    from agents.eyes import CACTUS_AVAILABLE, _get_cactus_model, _get_cactus_whisper_model
     if CACTUS_AVAILABLE:
         logger.info("Pre-loading Cactus Gemma 4 model (background thread)...")
         await asyncio.to_thread(_get_cactus_model)
@@ -273,18 +288,11 @@ async def lifespan(app: FastAPI):
     # given model — paying that cost here means the first user video upload
     # doesn't eat 30+ extra seconds. Fire and forget; if it fails the live
     # path still works (just pays the compile cost on first real call).
-    #
-    # We warm BOTH u2net (production carousel default) and isnet-general-use
-    # (carousel tester default — newer model with better edge fidelity for
-    # product textures). Warming both in parallel costs the same wall-clock
-    # as warming one (each model uses its own session pool); the upside is
-    # that switching rembg_model in the tester UI doesn't trigger a 170MB
-    # download mid-demo.
     try:
-        from agents.threed import prewarm_rembg
         import asyncio as _aio
+
+        from agents.threed import prewarm_rembg
         _aio.create_task(prewarm_rembg("u2net"))
-        _aio.create_task(prewarm_rembg("isnet-general-use"))
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
 
@@ -293,21 +301,54 @@ async def lifespan(app: FastAPI):
     # prior /api/sell call. ACTIVE_PRODUCT_ID env var overrides the first-
     # key default if you want to swap between demo objects without editing
     # code on stage.
-    _load_active_product()
+    _load_products()
+    _load_avatars()
     yield
 
-app = FastAPI(title="Zo", lifespan=lifespan)
+app = FastAPI(title="EMPIRE", lifespan=lifespan)
+
+# CORS: default to localhost:5173 (dev dashboard). Override via FRONTEND_ORIGIN
+# env (comma-separated for multiple origins, e.g. dev + cloudflare tunnel).
+# Replaces the prior allow_origins=["*"] which let any origin call the API.
+_FRONTEND_ORIGINS = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_FRONTEND_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info("[cors] allow_origins=%s", _FRONTEND_ORIGINS)
+
+
+async def _ws_auth_check(ws: WebSocket) -> bool:
+    """Validate ?token=<secret> against WS_SHARED_SECRET env. Returns True
+    when OK; closes the socket with 1008 (policy violation) on mismatch.
+
+    Default-off: when WS_SHARED_SECRET is unset, all connections are allowed
+    (matches the prior unauth behavior so this change doesn't break a fresh
+    clone). Set WS_SHARED_SECRET in .env + VITE_WS_TOKEN in the dashboard env
+    to enable. Required before exposing the backend on a public network."""
+    expected = os.getenv("WS_SHARED_SECRET", "").strip()
+    if not expected:
+        return True
+    provided = ws.query_params.get("token", "")
+    if provided != expected:
+        await ws.close(code=1008, reason="invalid or missing token")
+        logger.warning("[ws] rejected %s connection: bad token", ws.url.path)
+        return False
+    return True
+
 
 # ── WebSocket: Phone ───────────────────────────────────
 
 @app.websocket("/ws/phone")
 async def phone_ws(ws: WebSocket):
+    if not await _ws_auth_check(ws):
+        return
     await ws.accept()
     phone_clients.append(ws)
     log_event("SYSTEM", "Phone connected")
@@ -330,21 +371,6 @@ async def handle_phone_message(msg: dict, ws: WebSocket):
             voice_text=msg.get("voice_text", "sell this"),
         ))
 
-    elif msg_type == "sell_video":
-        # Phone-recorded product video, base64-encoded for WS transport.
-        # Phone sends: {type: "sell_video", video_b64: "<base64 .mp4 or
-        # .mov>", filename?: "clip.mp4", voice_text?: "sell this"}.
-        #
-        # We decode, drop to a temp file (the existing intake pipeline
-        # works with a path, not bytes), kick off run_video_sell_pipeline
-        # which extracts audio + frames, transcribes, and fires the
-        # audio-first pitch via Director.dispatch_audio_first_pitch.
-        #
-        # Acks are sent back to the phone so the recorder UI can
-        # display "received → analyzing → going live". Dashboard also
-        # gets a phone_video_received event for operator visibility.
-        await _handle_phone_sell_video(msg, ws)
-
     elif msg_type == "comment":
         asyncio.ensure_future(run_comment_pipeline(
             comment=msg.get("text", ""),
@@ -358,88 +384,12 @@ async def handle_phone_message(msg: dict, ws: WebSocket):
         })
 
 
-async def _handle_phone_sell_video(msg: dict, ws: WebSocket) -> None:
-    """Decode a phone-uploaded video over WS, write to temp file, kick
-    off run_video_sell_pipeline. Sends progress acks back to the phone
-    so the recorder UI can show received → analyzing → going_live, and
-    a phone_video_received event to the dashboards for operator visibility.
-
-    Phone contract:
-      send: {type: "sell_video", video_b64: <str>,
-             filename?: <str>, voice_text?: <str>, mime?: <str>}
-      recv: {type: "phone_ack", stage: "received", bytes: <int>}
-      recv: {type: "phone_ack", stage: "pipeline_started", session_id: <str>}
-            (any pipeline failure surfaces via the dashboard agent_log.)
-    """
-    import tempfile, uuid as _uuid
-
-    video_b64 = msg.get("video_b64") or ""
-    if not video_b64:
-        try:
-            await ws.send_json({"type": "phone_ack", "stage": "error",
-                                "reason": "missing_video_b64"})
-        except Exception:
-            pass
-        log_event("SYSTEM", "Phone sell_video missing video_b64")
-        return
-
-    try:
-        video_bytes = base64.b64decode(video_b64)
-    except Exception as e:
-        try:
-            await ws.send_json({"type": "phone_ack", "stage": "error",
-                                "reason": f"b64_decode_failed: {e}"})
-        except Exception:
-            pass
-        log_event("SYSTEM", f"Phone sell_video b64 decode failed: {e}")
-        return
-
-    if not video_bytes:
-        try:
-            await ws.send_json({"type": "phone_ack", "stage": "error",
-                                "reason": "empty_after_decode"})
-        except Exception:
-            pass
-        return
-
-    filename = msg.get("filename") or "phone_clip.mp4"
-    suffix = Path(filename).suffix or ".mp4"
-    voice_text = msg.get("voice_text") or "sell this"
-    session_id = f"phone_{_uuid.uuid4().hex[:10]}"
-
-    # Write to a temp file — run_video_sell_pipeline expects a path
-    # because the intake pipeline shells out to ffmpeg/ffprobe which
-    # want a real file on disk.
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(video_bytes)
-        video_path = f.name
-    log_event("SYSTEM", f"Phone video received: {len(video_bytes)} bytes "
-              f"({filename}) session={session_id}")
-    try:
-        await ws.send_json({"type": "phone_ack", "stage": "received",
-                            "bytes": len(video_bytes),
-                            "session_id": session_id})
-    except Exception:
-        pass
-    await broadcast_to_dashboards({
-        "type": "phone_video_received",
-        "bytes": len(video_bytes),
-        "filename": filename,
-        "session_id": session_id,
-    })
-
-    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text))
-    try:
-        await ws.send_json({"type": "phone_ack", "stage": "pipeline_started",
-                            "session_id": session_id})
-    except Exception:
-        pass
-
-
 # ── WebSocket: Dashboard ──────────────────────────────
 
 @app.websocket("/ws/dashboard")
 async def dashboard_ws(ws: WebSocket):
+    if not await _ws_auth_check(ws):
+        return
     await ws.accept()
     dashboard_clients.append(ws)
 
@@ -466,30 +416,9 @@ async def dashboard_ws(ws: WebSocket):
             if msg.get("type") == "simulate_comment":
                 # Route the comment through the 4-tool dispatcher. Local
                 # tools (respond_locally / play_canned_clip / block_comment)
-                # resolve in <300ms; cloud tool forwards to the no-Wav2Lip
-                # api_respond_to_comment audio + speaking-idle pipeline.
+                # resolve in <300ms; cloud tool forwards to the existing
+                # api_respond_to_comment Wav2Lip pipeline.
                 comment_text = msg.get("text", "")
-                # Echo to all dashboards as an audience_comment so the
-                # /stage TikTokShopOverlay chat rail surfaces operator-
-                # typed test comments (mission item 3 — operator can
-                # rehearse without a phone). Tagged username='operator'
-                # so it visually distinguishes from QR submissions.
-                # We forward the optional client_id sent by sendComment so
-                # the originating client's useEmpireSocket can dedup ITS
-                # own optimistic pending pill against ITS own echo —
-                # without false-positiving on a real audience phone that
-                # happened to type the same text within a few seconds.
-                if comment_text.strip():
-                    payload = {
-                        "type": "audience_comment",
-                        "username": "operator",
-                        "text": comment_text,
-                        "ts": int(time.time() * 1000),
-                    }
-                    client_id = msg.get("client_id")
-                    if client_id:
-                        payload["client_id"] = client_id
-                    await broadcast_to_dashboards(payload)
                 async def _run():
                     try:
                         await run_routed_comment(comment_text)
@@ -519,21 +448,14 @@ async def dashboard_ws(ws: WebSocket):
                 logger.info("[clip_ack] %s/%s status=%s",
                             msg.get("intent"), msg.get("url"), msg.get("status"))
 
-            elif msg.get("type") == "mic_pressed":
-                # USE_BACKCHANNEL: VoiceMic fires this on pointer-down BEFORE
-                # the audio recording even starts so the listening-attentive
-                # pose can swap into Tier 1 within ~50ms of the press. Visual
-                # only (REVISIONS §8) — no "mhm" audio.
-                if USE_BACKCHANNEL and director:
-                    asyncio.create_task(director.play_listening_attentive())
-
     except WebSocketDisconnect:
         dashboard_clients.remove(ws)
 
 
 # ── Sell Pipeline ──────────────────────────────────────
 
-async def run_sell_pipeline(frame_b64: str, voice_text: str):
+async def run_sell_pipeline(frame_b64: str, voice_text: str,
+                            request_id: str | None = None):
     pipeline_state["status"] = "analyzing"
     pipeline_state["agent_log"] = []
     logger.info("=" * 60)
@@ -543,15 +465,45 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
     logger.info("=" * 60)
     pipeline_start = time.time()
 
-    # PHASE 1: Single Claude call (vision + script) + background removal in parallel
-    log_event("EYES", "Analyzing product + writing script (single Claude call + bg removal)...")
+    # PHASE 1: Product analysis + pitch script + background removal in parallel.
+    #
+    # PRODUCT_ANALYSIS_MODEL env var (defaults to "auto") picks the vision/
+    # script engine:
+    #   "gemma"  — Cactus Gemma 4 on-device only, raise if unavailable
+    #   "claude" — Claude Haiku on Bedrock only (legacy cloud path)
+    #   "auto"   — try Gemma first, fall back to Claude if it fails
+    #
+    # Cody wants the seller flow to stay local: the iPhone films → Mac
+    # runs Gemma on the seller's narration + product frame → pitch script
+    # comes out. No cloud roundtrip for understanding.
+    pam = os.getenv("PRODUCT_ANALYSIS_MODEL", "auto").lower()
+    log_event("EYES", f"Analyzing product + writing script ({pam} path)...")
+    await _emit_pipeline_step(request_id, "claude", "active",
+                               detail=f"model={pam}")
     t0 = time.time()
 
-    async def _claude_combined():
+    async def _analyze_combined():
+        """Try Gemma first (on-device), fall back to Claude if requested
+        or on Gemma failure. Returns the same `{product, script}` shape
+        from either path so downstream code is agnostic."""
+        if pam in ("gemma", "auto"):
+            try:
+                result = await analyze_and_script_gemma(frame_b64, voice_text)
+                src = result.get("source", "")
+                if src == "cactus_on_device":
+                    return result
+                if pam == "gemma":
+                    # Strict mode — return the failure as-is so the caller
+                    # can surface it; don't fall through to Claude.
+                    return result
+                logger.info("[EYES] Gemma path failed (%s), falling back to Claude",
+                            result.get("reason", "unknown"))
+            except Exception as e:
+                logger.warning("[EYES] Gemma call errored, falling back to Claude: %s", e)
         try:
             return await analyze_and_script_claude(frame_b64, voice_text)
         except Exception as e:
-            logger.error("Claude combined error: %s", e)
+            logger.error("[EYES] Claude combined error: %s", e)
             return {"error": str(e), "source": "claude_error"}
 
     async def _bg_removal():
@@ -562,18 +514,23 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
             return None
 
     claude_result, clean_b64 = await asyncio.gather(
-        _claude_combined(), _bg_removal()
+        _analyze_combined(), _bg_removal()
     )
     phase1_ms = int((time.time() - t0) * 1000)
 
-    # Extract product data and script from combined result
+    # Extract product data and script from combined result. Preserve the
+    # analyzer's own `source` tag (cactus_on_device | claude_cloud |
+    # gemma_failed | claude_error) so the verify curl + dashboards can
+    # tell which engine actually wrote this product — the pipeline shell
+    # shouldn't overwrite truth with a hardcoded label.
     product_data = claude_result.get("product", claude_result)
-    product_data["source"] = "claude_cloud"
+    product_data["source"] = claude_result.get("source", "claude_cloud")
     script = claude_result.get("script", "")
     if not script:
         script = f"Check out this amazing {product_data.get('name', 'product')}!"
 
     log_event("EYES", f"Claude: {product_data.get('name', 'done')} ({phase1_ms}ms)")
+    await _emit_pipeline_step(request_id, "claude", "done", ms=phase1_ms)
     pipeline_state["product_data"] = product_data
     await broadcast_to_dashboards({"type": "product_data", "data": product_data})
 
@@ -590,15 +547,20 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     asyncio.ensure_future(run_3d_generation(frame_b64))
 
-    # PHASE 2: pitch playback. Two paths:
-    #   USE_PITCH_VEO=1 (default): audio-first dispatch. TTS the script,
-    #     save the audio, broadcast pitch_audio + emit a muted looping
-    #     speaking-pose Veo clip on Tier 1. Karaoke captions populate
-    #     word-by-word. ~600-900ms from script ready → first audible
-    #     syllable.
-    #   USE_PITCH_VEO=0 (kill switch): legacy Wav2Lip render (5-7s+).
-    #     Kept as a one-env-flag rollback in case the audio-first path
-    #     misbehaves on stage.
+    # PHASE 2: TTS + Wav2Lip render — real video lipsync via the same fast
+    # path the comment responses use. The legacy LiveTalking WebRTC path was
+    # removed because it required a session handshake that the dashboard no
+    # longer initiates, and its audio-only fallback played MP3 over a silent
+    # idle face — read as "gibberish in a random language" because the mouth
+    # never moved.
+    #
+    # New flow:
+    #   1. Voice pill → RESPONDING so the audience knows we're rendering.
+    #   2. ElevenLabs TTS the Claude-generated script (English-locked).
+    #   3. Wav2Lip render against whichever speaking-substrate the Director
+    #      thinks matches the visible Tier 0 idle (calm by default).
+    #   4. Director crossfades the rendered mp4 onto Tier 1 → settles back
+    #      to the silent idle layer when the video duration elapses.
     pipeline_state["status"] = "selling"
     log_event("SELLER", "Avatar going live...")
     if director:
@@ -606,14 +568,104 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     pitch_t0 = time.time()
     try:
-        if USE_PITCH_VEO:
-            await _run_audio_first_pitch(script, pitch_t0)
-        else:
-            await _run_wav2lip_pitch(script, pitch_t0)
+        # 2a. TTS. If the active avatar declares a voice_id, use it;
+        # otherwise text_to_speech falls back to ELEVENLABS_VOICE_ID.
+        # Item 6: if active_language is non-English, translate the script
+        # first + pass language_code to ElevenLabs. Cache hits are cheap;
+        # misses incur one Claude Haiku call per unique pitch per language.
+        await _emit_pipeline_step(request_id, "eleven", "active")
+        t0 = time.time()
+        active_voice = _active_avatar().get("voice_id") or None
+        active_lang = pipeline_state.get("active_language", "en")
+        tts_script = script
+        if active_lang != "en":
+            tts_script = await translator.translate(script, active_lang)
+            if tts_script != script:
+                log_event("SELLER", f"Script translated to {active_lang} "
+                                    f"({len(script)} → {len(tts_script)} chars)")
+        audio_bytes = await text_to_speech(
+            tts_script,
+            voice=active_voice,
+            language_code=active_lang,
+        )
+        tts_ms = int((time.time() - t0) * 1000)
+        if not audio_bytes:
+            await _emit_pipeline_step(request_id, "eleven", "failed",
+                                       detail="empty audio")
+            raise RuntimeError("TTS returned empty audio")
+        log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
+        await _emit_pipeline_step(request_id, "eleven", "done", ms=tts_ms)
+
+        # 2b. Wav2Lip render against the substrate the Director picked for
+        #     whatever Tier 0 is visible. Falls back to default substrate if
+        #     the configured one isn't on the pod (the Director caches a
+        #     "missing" mark so we don't repeatedly retry the bad path).
+        substrate = director.current_substrate_pod_path() if director else None
+        await _emit_pipeline_step(request_id, "wav2lip", "active")
+        t0 = time.time()
+        try:
+            if substrate:
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, source_path_on_pod=substrate, out_height=1080,
+                )
+            else:
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=1080,
+                )
+        except Exception as e:
+            err_str = str(e).lower()
+            if substrate and director and ("404" in err_str or "400" in err_str or "not found" in err_str):
+                logger.warning("[pitch] substrate %s unavailable, falling back: %s", substrate, e)
+                director.mark_substrate_status(substrate, False)
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=1080,
+                )
+            else:
+                raise
+        lipsync_ms = int((time.time() - t0) * 1000)
+        log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
+        await _emit_pipeline_step(request_id, "wav2lip", "done", ms=lipsync_ms)
+
+        # 2c. Save + broadcast through Director so the carousel crossfade
+        #     machinery and idle-release timing work the same way as comment
+        #     responses (single source of truth for stage state).
+        url = _save_render("pitch", video_bytes)
+        pipeline_state["pitch_video_url"] = url
+        await _emit_pipeline_step(request_id, "going_live", "done",
+                                   ms=lipsync_ms + tts_ms + phase1_ms)
+
+        if director:
+            await director.play_response(url)
+            # Probe rendered duration so the idle release fires precisely as
+            # she finishes the pitch. Falls back to a word-count estimate.
+            rendered_path = RENDER_DIR / Path(url).name
+            play_ms = _probe_video_duration_ms(rendered_path)
+            if play_ms is None:
+                word_count = len(script.split())
+                play_ms = int(max(2500, word_count * 350))
+            play_ms_with_tail = play_ms + 400
+
+            async def _release_pitch_to_idle(delay_ms: int):
+                await asyncio.sleep(delay_ms / 1000)
+                if director:
+                    await director.fade_to_idle()
+                    await director.set_voice_state(None)
+            asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
+
+        await broadcast_to_dashboards({
+            "type": "pitch_video",
+            "url": url,
+            "render_ms": lipsync_ms,
+            "tts_ms": tts_ms,
+            "backend": "wav2lip",
+        })
+        pitch_total_ms = int((time.time() - pitch_t0) * 1000)
+        log_event("SELLER", f"Avatar speaking! ({pitch_total_ms}ms total, lipsynced via Wav2Lip)")
     except Exception as e:
         logger.exception("[pitch] render failed")
         log_event("SELLER", f"Pitch render failed: {e}")
-        # Last-ditch: TTS-only fallback so at least audio plays.
+        # Last-ditch: TTS-only fallback so at least audio plays. This is the
+        # legacy "no video" path, kept only for catastrophic Wav2Lip failures.
         try:
             audio_bytes = await text_to_speech(script)
             if audio_bytes:
@@ -630,142 +682,11 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     pipeline_state["status"] = "live"
     total_ms = int((time.time() - pipeline_start) * 1000)
-    log_event("SYSTEM", f"Zo is LIVE. Total pipeline: {total_ms}ms")
+    log_event("SYSTEM", f"EMPIRE is LIVE. Total pipeline: {total_ms}ms")
     logger.info("=" * 60)
     logger.info("SELL PIPELINE COMPLETE — %dms total", total_ms)
     logger.info("=" * 60)
     await broadcast_to_dashboards({"type": "status", "status": "live"})
-
-
-async def _run_audio_first_pitch(script: str, pitch_t0: float) -> None:
-    """Audio-first pitch: TTS → save → broadcast pitch_audio → muted
-    looping Tier 1 video. Used for the phone-uploaded video pipeline
-    where the script is freshly generated by Claude per upload.
-
-    The dashboard plays the audio through its standalone <audio> element
-    (KaraokeCaptions tracks word-by-word), the looped speaking-pose Veo
-    clip runs underneath muted, the TranslationChip mounts top-right.
-    Total time from script ready → first audible syllable: ~600-900ms.
-    """
-    from agents.seller import _probe_audio_duration_ms
-    t0 = time.time()
-    audio_bytes, word_timings = await text_to_speech(
-        script, return_word_timings=True,
-    )
-    tts_ms = int((time.time() - t0) * 1000)
-    if not audio_bytes:
-        raise RuntimeError("TTS returned empty audio")
-    log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B, {len(word_timings)} words)")
-
-    # Save audio to /response_audio (existing static mount; reused so we
-    # don't add yet another dir for ephemeral pitch dispatches). The
-    # `pitch_dispatch_` prefix distinguishes these from per-comment
-    # response audio in operator debug listings.
-    import uuid as _uuid
-    fname = f"pitch_dispatch_{_uuid.uuid4().hex[:12]}.mp3"
-    audio_path = RESPONSE_AUDIO_DIR / fname
-    audio_path.write_bytes(audio_bytes)
-    audio_url = f"/response_audio/{fname}"
-    audio_ms = await asyncio.to_thread(_probe_audio_duration_ms, audio_bytes) or 0
-
-    # Stash pitch URL for state_sync (replays audio on dashboard refresh
-    # mid-pitch). The pitch_audio event will fire the actual playback.
-    pipeline_state["pitch_video_url"] = audio_url
-
-    if director:
-        await director.dispatch_audio_first_pitch(
-            audio_url=audio_url,
-            word_timings=word_timings,
-            audio_ms=audio_ms,
-            script=script,
-            slug=pipeline_state.get("active_product_id") or "video_upload",
-        )
-
-    # Legacy pitch_video event so the existing dashboard plumbing
-    # (CostTicker, RoutingPanel, anything tracking pitches) sees the
-    # transition. URL points at the audio dispatch since there's no
-    # rendered video file in the audio-first path.
-    await broadcast_to_dashboards({
-        "type": "pitch_video",
-        "url": audio_url,
-        "render_ms": 0,                   # no Wav2Lip render fired
-        "tts_ms": tts_ms,
-        "audio_ms": audio_ms,
-        "backend": "audio_first",
-        "audio_already_playing": True,
-    })
-    pitch_total_ms = int((time.time() - pitch_t0) * 1000)
-    log_event(
-        "SELLER",
-        f"Audio-first pitch dispatched! ({pitch_total_ms}ms total, "
-        f"{audio_ms}ms audio, {len(word_timings)} timed words)",
-    )
-
-
-async def _run_wav2lip_pitch(script: str, pitch_t0: float) -> None:
-    """Legacy Wav2Lip pitch render. Kept as the USE_PITCH_VEO=0 kill switch
-    rollback. Renders TTS audio against the active speaking substrate via
-    the pod's Wav2Lip server; broadcasts a pitch_video event the dashboard
-    plays on Tier 1 with embedded audio. Slower (5-7s+) but lip-synced."""
-    t0 = time.time()
-    audio_bytes = await text_to_speech(script)
-    tts_ms = int((time.time() - t0) * 1000)
-    if not audio_bytes:
-        raise RuntimeError("TTS returned empty audio")
-    log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
-
-    substrate = director.current_substrate_pod_path() if director else None
-    t0 = time.time()
-    try:
-        if substrate:
-            video_bytes, headers = await render_comment_response_wav2lip(
-                audio_bytes, source_path_on_pod=substrate, out_height=1080,
-            )
-        else:
-            video_bytes, headers = await render_comment_response_wav2lip(
-                audio_bytes, out_height=1080,
-            )
-    except Exception as e:
-        err_str = str(e).lower()
-        if substrate and director and ("404" in err_str or "400" in err_str or "not found" in err_str):
-            logger.warning("[pitch] substrate %s unavailable, falling back: %s", substrate, e)
-            director.mark_substrate_status(substrate, False)
-            video_bytes, headers = await render_comment_response_wav2lip(
-                audio_bytes, out_height=1080,
-            )
-        else:
-            raise
-    lipsync_ms = int((time.time() - t0) * 1000)
-    log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
-
-    url = _save_render("pitch", video_bytes)
-    pipeline_state["pitch_video_url"] = url
-
-    if director:
-        await director.play_response(url)
-        rendered_path = RENDER_DIR / Path(url).name
-        play_ms = _probe_video_duration_ms(rendered_path)
-        if play_ms is None:
-            word_count = len(script.split())
-            play_ms = int(max(2500, word_count * 350))
-        play_ms_with_tail = play_ms + 400
-
-        async def _release_pitch_to_idle(delay_ms: int):
-            await asyncio.sleep(delay_ms / 1000)
-            if director:
-                await director.fade_to_idle()
-                await director.set_voice_state(None)
-        asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
-
-    await broadcast_to_dashboards({
-        "type": "pitch_video",
-        "url": url,
-        "render_ms": lipsync_ms,
-        "tts_ms": tts_ms,
-        "backend": "wav2lip",
-    })
-    pitch_total_ms = int((time.time() - pitch_t0) * 1000)
-    log_event("SELLER", f"Avatar speaking! ({pitch_total_ms}ms total, lipsynced via Wav2Lip)")
 
 
 async def run_3d_generation(frame_b64: str):
@@ -874,12 +795,35 @@ async def api_sell(file: UploadFile = File(...), voice_text: str = Form("sell th
     return {"status": "pipeline_started"}
 
 
+async def _emit_pipeline_step(request_id: str | None, step: str, status: str,
+                              ms: int | None = None, detail: str | None = None):
+    """Broadcast a pipeline_step event scoped to a request_id so the iPhone's
+    PipelineProgressView can render the 'Building your avatar' rail. Called
+    from run_video_sell_pipeline + run_sell_pipeline at each major boundary.
+
+    When request_id is None (legacy callers that didn't generate one), this
+    is a no-op — backward-compatible with the pre-Phase-1 flow."""
+    if not request_id:
+        return
+    payload = {"type": "pipeline_step", "request_id": request_id,
+               "step": step, "status": status}
+    if ms is not None:
+        payload["ms"] = ms
+    if detail is not None:
+        payload["detail"] = detail
+    await broadcast_to_dashboards(payload)
+
+
 @app.post("/api/sell-video")
 async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("sell this")):
-    """Upload a product video. Extracts frames + transcript, runs full pipeline."""
+    """Upload a product video. Extracts frames + transcript, runs full pipeline.
+
+    Returns a request_id so the caller (iPhone SellerCaptureView) can scope
+    its pipeline_step subscription on the WS bus and render per-stage progress."""
     import tempfile
-    logger.info("[API] /api/sell-video called — file: %s, size: uploading, voice: %s",
-                file.filename, voice_text[:50])
+    request_id = uuid.uuid4().hex[:12]
+    logger.info("[API] /api/sell-video called — file: %s, voice: %s, request_id: %s",
+                file.filename, voice_text[:50], request_id)
     contents = await file.read()
     logger.info("[API] Video received: %d bytes (%s)", len(contents), file.filename)
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
@@ -888,11 +832,18 @@ async def api_sell_video(file: UploadFile = File(...), voice_text: str = Form("s
         video_path = f.name
     logger.info("[API] Saved to temp: %s", video_path)
 
-    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text))
-    return {"status": "video_pipeline_started", "bytes": len(contents)}
+    # Fire the "uploaded" pipeline_step immediately so the iPhone sees the
+    # first checkmark light up without waiting for intake to start.
+    asyncio.ensure_future(_emit_pipeline_step(request_id, "uploaded", "done",
+                                               ms=0, detail=f"{len(contents)}B"))
+    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text,
+                                                   request_id=request_id))
+    return {"status": "video_pipeline_started", "bytes": len(contents),
+            "request_id": request_id}
 
 
-async def run_video_sell_pipeline(video_path: str, voice_text: str):
+async def run_video_sell_pipeline(video_path: str, voice_text: str,
+                                   request_id: str | None = None):
     """Full pipeline from video: intake → analyze → sell."""
     pipeline_state["status"] = "ingesting"
     pipeline_state["agent_log"] = []
@@ -903,6 +854,7 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
     logger.info("=" * 60)
 
     log_event("SYSTEM", "Video received. Starting intake pipeline...")
+    await _emit_pipeline_step(request_id, "deepgram", "active")
 
     # Run intake (audio+frames+transcript) and carousel (angle spin) in
     # parallel — both consume the same video, neither blocks the other.
@@ -917,12 +869,15 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         logger.error("[INTAKE] FAILED: %s", e)
         logger.error(traceback.format_exc())
         log_event("SYSTEM", f"Video intake failed: {e}")
+        await _emit_pipeline_step(request_id, "deepgram", "failed",
+                                   detail=str(e)[:120])
         Path(video_path).unlink(missing_ok=True)
         return
     finally:
         Path(video_path).unlink(missing_ok=True)
 
     intake_ms = int((time.time() - t0) * 1000)
+    await _emit_pipeline_step(request_id, "deepgram", "done", ms=intake_ms)
     transcript = intake_result["transcript"]
     best_frames_b64 = intake_result["best_frames_b64"]
     timings = intake_result["timings"]
@@ -947,7 +902,8 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
         # waiting and let extract land on the dashboard separately.
         try:
             from agents.transcript_extract import (
-                extract_transcript_signals, hint_block_for_claude,
+                extract_transcript_signals,
+                hint_block_for_claude,
             )
             extract_task = asyncio.create_task(
                 extract_transcript_signals(transcript)
@@ -960,7 +916,7 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
                 log_event("EYES",
                           f"Transcript extract ready in time ({extract.get('latency_ms', 0)}ms)",
                           {"source": extract.get("source")})
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Extract is slow — let Claude run unblocked. The pending
                 # task keeps running and reports when it lands.
                 log_event("EYES", "Transcript extract slow (>1.5s), running unblocked")
@@ -976,9 +932,12 @@ async def run_video_sell_pipeline(video_path: str, voice_text: str):
             combined_voice = f"{combined_voice}\n\n{transcript_extract_hint}"
         pipeline_state["product_photo_b64"] = best_frames_b64[0]
         await broadcast_to_dashboards({"type": "phone_frame", "frame": best_frames_b64[0][:100] + "..."})
-        await run_sell_pipeline(best_frames_b64[0], combined_voice)
+        await run_sell_pipeline(best_frames_b64[0], combined_voice,
+                                 request_id=request_id)
     else:
         log_event("SYSTEM", "No usable frames extracted from video")
+        await _emit_pipeline_step(request_id, "claude", "failed",
+                                   detail="no usable frames")
 
 
 async def _finish_transcript_extract(task: asyncio.Task) -> None:
@@ -1007,30 +966,313 @@ async def _finish_transcript_extract(task: asyncio.Task) -> None:
 
 @app.post("/api/comment")
 async def api_comment(text: str = Form(...)):
-    """Public REST entry-point for a viewer comment. Routes through the
-    4-tool dispatcher (run_routed_comment) which picks between:
-      • respond_locally — pre-rendered LatentSync MP4 from local_answers/
-        (true lip-sync, sub-second response)
-      • play_canned_clip — pre-rendered LatentSync bridge clip
-      • block_comment — spam filter, no avatar response
-      • escalate_to_cloud — api_respond_to_comment, audio + KaraokeCaptions
-        + clean speaking-pose loop on Tier 1 (no Wav2Lip, pristine quality
-        but no precise lip-sync on the novel response)
-    Same path used by the voice agent and the WS simulate_comment message
-    and the QR /comment audience form (POST /api/audience_comment)."""
+    """Public REST entry-point for a viewer comment. Routes through Cody's
+    4-tool dispatcher (run_routed_comment) which picks between local
+    pre-rendered answers, the LIVE_LIPSYNC path (api_respond_to_comment →
+    reading_chat → bridge → Wav2Lip → Director crossfade), or other tools
+    based on classifier output. Same path used by the voice agent and the
+    WS simulate_comment message."""
     asyncio.ensure_future(run_routed_comment(text))
     return {"status": "processing"}
 
 
+# ── Director transport — used by the dashboard's Control Room layout ──────
+#
+# POST /api/director/force_phase — manually advance the stage machine.
+#   Body (form): phase = INTRO | BRIDGE | PITCH | LIVE
+# POST /api/director/on_air — pause/resume broadcasts.
+#   Body (form): on = true | false
+#
+# These are operator affordances: during rehearsal or between takes we want
+# to drop out of LIVE without tearing down the backend. For v1, on_air is a
+# soft flag that the dashboard reads but doesn't gate the response pipeline —
+# Item 5 (Hands agent) will tighten this when real distribution fanout
+# can be paused.
+
+_PHASE_TO_STATUS = {
+    "INTRO": "idle",
+    "BRIDGE": "creating",  # useEmpireSocket derives 'BRIDGE' only from
+                           # comment_response_video; we broadcast an explicit
+                           # force_phase event so the dashboard lands correctly.
+    "PITCH": "selling",
+    "LIVE": "live",
+}
+pipeline_state["on_air"] = True  # default ON so live flow works without toggling
+pipeline_state["active_language"] = "en"  # Item 6 — live-time translation target
+
+
+@app.post("/api/director/force_phase")
+async def api_director_force_phase(phase: str = Form(...)):
+    """Manually advance the stage machine. Operator use."""
+    p = phase.upper().strip()
+    if p not in _PHASE_TO_STATUS:
+        raise HTTPException(400, f"unknown phase {phase!r}, expected one of "
+                                 f"{list(_PHASE_TO_STATUS)}")
+    new_status = _PHASE_TO_STATUS[p]
+    pipeline_state["status"] = new_status
+    log_event("DIRECTOR", f"Phase forced → {p}")
+    await broadcast_to_dashboards({
+        "type": "force_phase",
+        "phase": p,
+        "status": new_status,
+    })
+    # Also broadcast a status event so the dashboard's useEffect-driven
+    # liveStage derivation updates even without the explicit force_phase
+    # handler (backward-compat; handler ships in Item 2).
+    await broadcast_to_dashboards({"type": "status", "status": new_status})
+    return {"status": "ok", "phase": p, "backend_status": new_status}
+
+
+# ── Hands agent (Item 5) ──────────────────────────────────────────────────
+#
+# GET  /api/hands/state        — platforms + enabled + last publish
+# POST /api/hands/toggle       — toggle a single platform on/off
+# POST /api/hands/publish      — fan out the current product to all enabled
+#
+# DistributionToggles (dashboard) hydrates from /api/hands/state on mount
+# and POSTs /api/hands/toggle on each toggle. MetricsStrip subscribes to
+# hands_published events (broadcast by Hands.publish_all) to animate the
+# BASKETS counter in real time.
+
+# ── Multi-language (Item 6) ─────────────────────────────────────────────
+
+@app.get("/api/live/language")
+async def api_get_language():
+    return {
+        "active_language": pipeline_state.get("active_language", "en"),
+        "supported": translator.SUPPORTED,
+        "cache_stats": translator.stats(),
+    }
+
+
+@app.post("/api/live/language")
+async def api_set_language(lang: str = Form(...)):
+    lang = lang.strip().lower()
+    if lang not in translator.SUPPORTED:
+        raise HTTPException(400, f"unsupported language {lang!r}, expected one of "
+                                 f"{list(translator.SUPPORTED)}")
+    pipeline_state["active_language"] = lang
+    log_event("SELLER", f"Live language → {translator.SUPPORTED[lang]['name']} ({lang})")
+    await broadcast_to_dashboards({
+        "type": "language_changed",
+        "lang": lang,
+        "name": translator.SUPPORTED[lang]["name"],
+    })
+    return {"active_language": lang}
+
+
+@app.get("/api/hands/state")
+async def api_hands_state():
+    if hands is None:
+        return {"platforms": {}}
+    return hands.get_state()
+
+
+@app.post("/api/hands/toggle")
+async def api_hands_toggle(platform: str = Form(...),
+                            enabled: str = Form(...)):
+    if hands is None:
+        raise HTTPException(503, "hands not initialized yet")
+    flag = enabled.strip().lower() in ("true", "1", "yes", "on")
+    try:
+        hands.set_enabled(platform, flag)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    await broadcast_to_dashboards({
+        "type": "hands_toggle",
+        "platform": platform,
+        "enabled": flag,
+    })
+    return {"ok": True, "platform": platform, "enabled": flag}
+
+
+@app.post("/api/hands/publish")
+async def api_hands_publish():
+    """Fan out the currently-active product to every enabled platform.
+    Returns per-platform results. Fires hands_published events on each."""
+    if hands is None:
+        raise HTTPException(503, "hands not initialized yet")
+    product = pipeline_state.get("product_data")
+    if not product:
+        raise HTTPException(400, "no active product — POST /api/sell first")
+    results = await hands.publish_all(product)
+    return {
+        "product_name": product.get("name"),
+        "results": {
+            p: {
+                "ok": r.ok,
+                "url": r.url,
+                "listing_id": r.listing_id,
+                "basket_impressions": r.basket_impressions,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+            }
+            for p, r in results.items()
+        },
+    }
+
+
+@app.get("/api/best_frames")
+async def api_best_frames():
+    """Return the most recent intake's best frames as base64 JPEG strings.
+    Used by the iPhone StreamView's "best 6 frames" rotator — the frames
+    themselves are already in pipeline_state['best_frames_b64'] after intake
+    completes; we just surface them via HTTP for the phone to fetch on demand
+    (rather than pushing them over WS, which would bloat the broadcast)."""
+    frames = pipeline_state.get("best_frames_b64") or []
+    # pipeline_state may also store a single "product_photo_b64" from older
+    # paths; include it as index 0 when best_frames_b64 is empty.
+    if not frames:
+        single = pipeline_state.get("product_photo_b64")
+        if single:
+            frames = [single]
+    return {
+        "count": len(frames),
+        "frames": frames,  # each string is base64-encoded JPEG
+        "product_name": (pipeline_state.get("product_data") or {}).get("name"),
+    }
+
+
+@app.get("/api/avatars")
+async def api_avatars():
+    """Return the avatar catalog + currently active id. Used by the
+    dashboard's AvatarRail (Item 2) to render the rail + light up the
+    selected card."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    return {
+        "active_avatar_id": pipeline_state.get("active_avatar_id"),
+        "avatars": [
+            {
+                "id": aid,
+                "name": a.get("name", aid),
+                "language_tags": a.get("language_tags", []),
+                "voice_id": a.get("voice_id", ""),
+            }
+            for aid, a in catalog.items()
+        ],
+    }
+
+
+@app.post("/api/avatars/active")
+async def api_set_active_avatar(avatar_id: str = Form(...)):
+    """Switch the active avatar. Seller's TTS and (future) Director's
+    state-video lookups route through `pipeline_state['active_avatar_id']`
+    via `_active_avatar()` so the swap is live after this call.
+
+    v1: state_videos are identical across avatars until Veo 3.1 renders
+    land, so the visible impact today is the ElevenLabs voice swap (when
+    the avatar has a non-empty voice_id)."""
+    catalog = pipeline_state.get("avatars_catalog") or {}
+    if avatar_id not in catalog:
+        raise HTTPException(404, f"avatar_id {avatar_id!r} not in catalog")
+    pipeline_state["active_avatar_id"] = avatar_id
+    avatar = catalog[avatar_id]
+    log_event("DIRECTOR", f"Avatar switched → {avatar.get('name', avatar_id)}")
+    await broadcast_to_dashboards({
+        "type": "avatar_changed",
+        "avatar_id": avatar_id,
+        "avatar_name": avatar.get("name", avatar_id),
+    })
+    return {
+        "active_avatar_id": avatar_id,
+        "avatar_name": avatar.get("name", avatar_id),
+        "voice_id": avatar.get("voice_id", ""),
+    }
+
+
+@app.post("/api/director/on_air")
+async def api_director_on_air(on: str = Form(...)):
+    """Toggle the on-air flag. Soft v1 — doesn't gate the pipeline yet."""
+    flag = on.strip().lower() in ("true", "1", "yes", "on")
+    pipeline_state["on_air"] = flag
+    log_event("DIRECTOR", f"On Air → {flag}")
+    await broadcast_to_dashboards({"type": "on_air", "on": flag})
+    return {"status": "ok", "on_air": flag}
+
+
 @app.get("/api/state")
 async def api_state():
+    catalog = pipeline_state.get("products_catalog") or {}
     return {
         "status": pipeline_state["status"],
         "product_data": pipeline_state["product_data"],
+        "active_product_id": pipeline_state.get("active_product_id"),
+        "active_avatar_id": pipeline_state.get("active_avatar_id"),
+        # Lightweight catalog summary — id + name only, not full product_data.
+        # Dashboard renders the dropdown from this; full data is available via
+        # /api/state on demand for the active product.
+        "products": [
+            {"id": pid, "name": (p.get("name") or pid),
+             "qa_count": len(p.get("qa_index") or {})}
+            for pid, p in catalog.items()
+        ],
         "has_photo": pipeline_state["product_clean_b64"] is not None,
         "has_3d": pipeline_state["model_3d"] is not None,
         "log_count": len(pipeline_state["agent_log"]),
+        "on_air": pipeline_state.get("on_air", True),
     }
+
+
+@app.post("/api/state/active_product")
+async def api_set_active_product(product_id: str = Form(...)):
+    """Switch the active product. Dashboard's product selector posts here.
+    Broadcasts a state_sync event so all dashboard clients re-pull /api/state
+    and reflect the change without a hard refresh."""
+    product = _set_active_product(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail=f"product_id {product_id!r} not in catalog")
+    await broadcast_to_dashboards({
+        "type": "active_product_changed",
+        "product_id": product_id,
+        "product_name": product.get("name", product_id),
+    })
+    return {
+        "active_product_id": product_id,
+        "product_name": product.get("name", product_id),
+        "qa_count": len(product.get("qa_index") or {}),
+    }
+
+
+@app.get("/api/brain/stats")
+async def api_brain_stats(stream_id: str | None = None, since_seconds: float | None = None):
+    """Aggregate stats for the BRAIN dashboard panel. Defaults to all streams,
+    all time. Pass `?since_seconds=3600` for the last hour, `?stream_id=foo`
+    to scope to one stream."""
+    return brain.get_stats(stream_id=stream_id, since_seconds=since_seconds)
+
+
+@app.post("/api/creator/build")
+async def api_creator_build(
+    file: UploadFile = File(...),
+    include_3d: bool = Form(True),
+):
+    """CREATOR v0: generate 3 marketplace photos + 1 promo video + optional
+    3D model from one input photo + the currently-active product's metadata.
+    Returns URLs to the generated assets under /renders/creator/<request_id>/.
+
+    `include_3d=false` skips the TripoSR call (saves ~15-30s when the pod
+    isn't running TripoSR — Wav2Lip is on :8010, TripoSR would be on :8020)."""
+    product = pipeline_state.get("product_data")
+    if not product:
+        raise HTTPException(
+            status_code=400,
+            detail="no active product loaded — POST /api/state/active_product first",
+        )
+    photo_bytes = await file.read()
+    if not photo_bytes:
+        raise HTTPException(status_code=400, detail="empty file upload")
+    photo_b64 = base64.b64encode(photo_bytes).decode()
+    log_event("CREATOR", f"build_all (include_3d={include_3d})",
+              {"product": product.get("name"), "input_bytes": len(photo_bytes)})
+    try:
+        result = await creator_build_all(photo_b64, product, include_3d=include_3d)
+    except Exception as e:
+        logger.exception("[creator] build_all failed")
+        raise HTTPException(status_code=500, detail=f"creator failed: {e}") from e
+    log_event("CREATOR", f"built {len(result['photos'])} photos + promo "
+              f"({result['timing_ms']['total']}ms)",
+              {"request_id": result["request_id"]})
+    return result
 
 
 # ── Audience-facing endpoints (QR-driven comment intake) ───────────────────
@@ -1054,7 +1296,7 @@ _COMMENT_FORM_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Zo · Live Comment</title>
+  <title>EMPIRE · Live Comment</title>
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
@@ -1133,7 +1375,7 @@ _COMMENT_FORM_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <div class="logo">Zo</div>
+  <div class="logo">EMPIRE</div>
   <span class="pill">Live · Ask anything</span>
   <h1>Drop a question for the seller.</h1>
   <p class="sub">Your comment goes straight to the live chat. The avatar replies in under a second.</p>
@@ -1210,41 +1452,6 @@ async def comment_form() -> HTMLResponse:
     return HTMLResponse(_COMMENT_FORM_HTML, headers={"Cache-Control": "no-store"})
 
 
-# ── Operator phone surface ────────────────────────────────────────────────
-# /phone is the OPERATOR's hand-held control (not the audience comment form
-# above). Scan the QR with the demo presenter's iPhone, get a single-page
-# mobile UI with two buttons: RECORD (camera → /ws/phone sell_video → fires
-# the avatar pitch pipeline) and HOLD TO TALK (mic → /api/voice_comment →
-# routed via on-device Cactus/Gemma 4 → avatar reactive response).
-#
-# This is the web equivalent of the native Cody iOS app at ios/EmpirePhone.
-# Backend contract is identical (/ws/phone + /api/voice_comment) so either
-# surface plugs in interchangeably. Web wins for demo-day setup speed:
-# zero install, scan-and-go, works in any phone browser. The iOS app stays
-# in the repo as future polish (on-device whisper for sub-200ms transcription
-# instead of round-tripping audio to the Mac), but for now the web client
-# is the canonical operator phone.
-_OPERATOR_PHONE_HTML_PATH = (
-    Path(__file__).resolve().parent / "static" / "operator_phone.html"
-)
-
-
-@app.get("/phone", response_class=HTMLResponse)
-async def operator_phone() -> HTMLResponse:
-    """Operator's phone control surface — record product video + push-to-talk.
-    Single self-contained HTML; no build step. Loads on Safari + Chrome
-    over the Cloudflare tunnel printed by start_audience_tunnel.sh."""
-    try:
-        html = _OPERATOR_PHONE_HTML_PATH.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=503,
-            detail=("operator_phone.html missing — should be at "
-                    f"{_OPERATOR_PHONE_HTML_PATH} in shipped builds."),
-        )
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
-
-
 @app.post("/api/audience_comment")
 async def api_audience_comment(payload: dict, request: Request):
     """Audience-submitted comment from a phone. Two side effects:
@@ -1305,87 +1512,48 @@ async def api_audience_comment(payload: dict, request: Request):
     return {"status": "queued", "username": username, "ts": ts}
 
 
-@app.post("/api/dashboard_log")
-async def api_dashboard_log(payload: dict):
-    """Browser-side debug events mirrored into the backend logger so a
-    `tail -f backend.log` shows audio/video/Tier 1 lifecycle events in the
-    SAME terminal as the pipeline trace lines. Cheap fire-and-forget — the
-    dashboard never blocks on this; we just write to logger and return.
-
-    Expected payload shape: {"src": "tier1"|"audio"|"stage", "msg": "...",
-                             "data": {<arbitrary kv pairs>}, "trace": "..."}
-    `trace` is optional; when present it's prefixed inline so dashboard
-    events show up under the same id as the pipeline that triggered them.
-    """
-    src = str(payload.get("src") or "dashboard")[:20]
-    msg = str(payload.get("msg") or "")[:140]
-    data = payload.get("data") or {}
-    extras = " ".join(
-        f"{k}={_dlog_fmt(v)}" for k, v in list(data.items())[:12]
-    )
-    tid = payload.get("trace") or "-------"
-    logger.info("[dash:%s][trace %s] %s %s", src, tid, msg, extras)
-    return {"ok": True}
-
-
-def _dlog_fmt(v):
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)) or v is None:
-        return str(v)
-    s = str(v)
-    if len(s) > 80:
-        s = s[:77] + "..."
-    return f'"{s}"' if isinstance(v, str) else s
-
-
-_WELCOME_CLIP_PATH = Path(__file__).parent.parent / "phase0" / "assets" / "bridges" / "welcome" / "welcome.mp4"
-_WELCOME_CLIP_URL = "/bridges/welcome/welcome.mp4"
-_WELCOME_CLIP_MS = 2200  # video 2.21s; audio fades by 2.1s, then 100ms silent tail
-
-
 @app.post("/api/go_live")
 async def api_go_live():
-    """Stage-view G-hotkey target. Plays the canonical welcome clip
-    (Veo-native render of "Welcome to the stream, guys!" with a
-    two-handed wave + idle-pose closing frame, audio cut at ~2.1s,
-    video ends at 2.2s). The Director then crossfades back to Tier 0
-    idle so the next state takes over cleanly.
+    """Stage-view G-hotkey target. Plays a generic intro clip ("hey
+    everyone, welcome back to the stream") via the Director so the
+    avatar starts speaking instantly when the operator triggers Go Live.
 
-    Falls back to the legacy bridge-clip pick chain only if the canonical
-    welcome MP4 is missing on disk — useful in local dev where someone
-    hasn't pulled the asset yet.
+    Falls back through the bridge_clips manifest chain:
+      1. intro_arbitrary label (added in BRIDGE_SCRIPTS, populated by
+         scripts/render_generic_clips.py)
+      2. neutral fallback pool
+      3. phase0 LatentSync library
+      4. None — returns 503 so the operator knows nothing rendered
 
-    Idempotent: spamming G plays back-to-back welcomes, which the
-    Director's crossfade machinery handles cleanly.
+    Idempotent: spamming G plays back-to-back intros, which the Director's
+    crossfade machinery handles cleanly. Useful for nervous demo restarts.
     """
-    if _WELCOME_CLIP_PATH.exists():
-        url = _WELCOME_CLIP_URL
-        script = "Welcome to the stream, guys!"
-        play_ms = _WELCOME_CLIP_MS
-        log_event("DIRECTOR", "go_live: playing canonical welcome clip", {"url": url})
-    else:
-        # Legacy fallback so dev environments without the rendered asset
-        # still produce SOME opener. Render path: phase0/scripts/render_*.
-        clip = pick_bridge_clip("intro_arbitrary") or pick_bridge_clip("neutral")
-        if not clip:
-            log_event("DIRECTOR", "go_live: no welcome / intro clips on disk")
-            raise HTTPException(
-                status_code=503,
-                detail=("No welcome.mp4 or fallback intro clips on disk. "
-                        "Render `phase0/assets/bridges/welcome/welcome.mp4`."),
-            )
-        url = clip.get("url")
-        script = clip.get("script", "")
-        play_ms = clip.get("ms") or int(max(4, len(script.split())) * 350)
-        log_event("DIRECTOR", f"go_live: fallback intro — {script[:60]}", {"url": url})
+    clip = pick_bridge_clip("intro_arbitrary")
+    if not clip:
+        # No intros rendered yet — fall through to a neutral acknowledgment
+        # so the avatar at least says SOMETHING when the operator presses G.
+        clip = pick_bridge_clip("neutral")
+    if not clip:
+        log_event("DIRECTOR", "go_live: no clips available — render bridges first")
+        raise HTTPException(
+            status_code=503,
+            detail=("No intro/neutral clips on disk. Run "
+                    "`python scripts/render_generic_clips.py` first."),
+        )
+    url = clip.get("url")
+    script = clip.get("script", "")
+    log_event("DIRECTOR", f"go_live: playing intro — {script[:60]}", {"url": url})
 
     if director:
         await director.play_response(url)
-        # Tail buffer so the idle layer takes over only after the video
-        # has fully ended — avoids a hard cut while the wave is still
-        # settling.
-        play_ms_with_tail = play_ms + 200
+        # Probe the actual file duration when it's a renders/ MP4 so the
+        # idle release fires when the avatar finishes. Bridge clips are
+        # short (~2s) so a word-count fallback is tight enough.
+        play_ms = (clip.get("ms") or 0)
+        if not play_ms:
+            words = max(4, len(script.split()))
+            play_ms = int(words * 350)
+        play_ms_with_tail = play_ms + 400
 
         async def _release_after(delay_ms: int):
             await asyncio.sleep(delay_ms / 1000)
@@ -1397,801 +1565,10 @@ async def api_go_live():
     return {"status": "playing", "url": url, "script": script}
 
 
-# ── Dev tooling: bridge-clip preview ──────────────────────────────────────
-# Visit /dev/clips in a browser to scroll through every pre-rendered bridge /
-# compliment / objection / question / intro / neutral clip side-by-side. Used
-# to judge the existing library against the new "bridge = body language
-# substrate underneath the response audio" mental model — current clips are
-# verbal stallers ("hold on a sec"), the new model wants silent body language
-# (gestures + posture) that audio + lip-sync overlays on top.
-#
-# Reads both source dirs at request time so freshly-rendered clips appear on
-# next refresh — no restart needed.
-# ── Dev tooling: Tier 0 + Tier 1 transition simulator ────────────────────
-# Visit /dev/transitions in a browser to watch the same idle-rotation +
-# ambient-interjection loop the live Director runs on stage, but with
-# adjustable speed and a live transition log so visual issues
-# (crossfade artefacts, pose-mismatch pops, audio glitches at swap
-# boundaries, etc.) are easy to spot and reproduce.
-#
-# Implements the same machinery LiveStage uses: 4 stacked <video>
-# elements (Tier 0 A/B ping-pong, Tier 1 A/B ping-pong), prepareFirstFrame
-# seek-to-t=0 before the opacity ramp, weighted random clip selection
-# from the Director's TIER0_LIBRARY + TIER1_INTERJECTIONS tables,
-# 35% chance per rotation tick that a Tier 1 interjection fires instead
-# of a Tier 0 swap.
-@app.get("/dev/transitions", response_class=HTMLResponse)
-async def dev_transitions() -> HTMLResponse:
-    body = """<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8" />
-<title>Zo · transition simulator</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; background: #050507; color: #fafafa;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-                 "Segoe UI", Roboto, Inter, Arial, sans-serif; }
-  body { display: grid; grid-template-columns: 1fr 360px;
-         gap: 18px; padding: 18px; min-height: 100vh;
-         /* Make sizes available to children's calc() — see .stage-wrap */
-         --stage-h: calc(100vh - 36px);
-         --stage-w: calc((100vh - 36px) * 9 / 16); }
-  .stage-col { display: flex; flex-direction: column; align-items: center;
-               gap: 12px; min-width: 0; }
-  /* Explicit width + height keeps the 9:16 frame intact across browsers
-     that flake on `aspect-ratio` + `max-height` inside a flex column
-     (which collapses to 0×0 in Safari and some Chromium versions, leaving
-     the video AND the in-stage badges invisible — that was the bug). */
-  .stage-wrap { background: #000; border-radius: 14px; overflow: hidden;
-                position: relative;
-                width: var(--stage-w); height: var(--stage-h);
-                max-width: 100%; }
-  .stage-wrap video { position: absolute; inset: 0;
-                       width: 100%; height: 100%; object-fit: contain;
-                       background: #000; display: block;
-                       opacity: 0; }
-  /* Wrapper around ONLY the four <video> elements (siblings of .badges).
-     Carrier for the blur trick — a short CSS filter:blur() pulse during
-     each crossfade destroys the high-frequency facial edges (mouth, eyes,
-     jawline) that betray "two faces overlapping" while the opacity ramp
-     is mid-flight. Filter applied to .stage-videos (not .stage-wrap) so
-     the badges + control overlays stay sharp. will-change keeps the GPU
-     layer ready so the first blur tick doesn't jank. */
-  .stage-videos { position: absolute; inset: 0; will-change: filter; }
-  /* In-stage state badges: Tier 0 always shown; Tier 1 only when active.
-     Both pulse for 600ms when the state changes so the eye locks onto the
-     exact transition frame. Designed to be readable at-a-glance from
-     several feet away — same readability target as the live stage. */
-  .badges { position: absolute; top: 14px; left: 14px; right: 14px;
-            display: flex; flex-direction: column; gap: 8px;
-            pointer-events: none; z-index: 100; }
-  .badge { display: inline-flex; align-items: center; gap: 10px;
-           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-           padding: 8px 14px; border-radius: 8px;
-           background: rgba(9,9,11,0.85); backdrop-filter: blur(8px);
-           border: 1px solid #27272a;
-           transition: border-color 220ms ease, box-shadow 220ms ease,
-                       transform 220ms ease;
-           align-self: flex-start; max-width: 100%; }
-  .badge .tier-tag { font-size: 10px; font-weight: 900;
-                     letter-spacing: 2px; padding: 3px 8px;
-                     border-radius: 4px; color: #09090b; }
-  .badge.t0 .tier-tag { background: #38bdf8; }
-  .badge.t1 .tier-tag { background: #fbbf24; }
-  .badge .state-name { font-size: 16px; font-weight: 800;
-                       letter-spacing: 0.5px; color: #fafafa; }
-  .badge .elapsed { font-size: 10px; color: #71717a; font-weight: 600;
-                    letter-spacing: 1px; }
-  .badge.flash { transform: scale(1.04); }
-  .badge.t0.flash { border-color: #38bdf8;
-                    box-shadow: 0 0 24px rgba(56,189,248,0.55); }
-  .badge.t1.flash { border-color: #fbbf24;
-                    box-shadow: 0 0 24px rgba(251,191,36,0.55); }
-  .badge.hidden { display: none; }
-  .panel { background: #0f0f12; border: 1px solid #27272a;
-           border-radius: 10px; padding: 16px;
-           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .panel h2 { font-size: 11px; letter-spacing: 1.5px; margin: 0 0 12px;
-              color: #a78bfa; text-transform: uppercase; font-weight: 800; }
-  .row { display: flex; justify-content: space-between; align-items: baseline;
-         padding: 4px 0; font-size: 12px; gap: 10px; }
-  .row .k { color: #71717a; text-transform: uppercase; letter-spacing: 1px;
-            font-size: 10px; }
-  .row .v { color: #fafafa; font-weight: 700; }
-  .row .v.big { font-size: 16px; color: #22c55e; }
-  .row .v.muted { color: #52525b; }
-  button { background: #27272a; color: #fafafa; border: 1px solid #3f3f46;
-           border-radius: 6px; padding: 6px 12px; font-size: 11px;
-           font-weight: 700; cursor: pointer;
-           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-           letter-spacing: 1px; text-transform: uppercase; }
-  button:hover { border-color: #7c3aed; }
-  button.on { background: linear-gradient(135deg,#ec4899,#7c3aed);
-              border-color: transparent; color: #fff; }
-  .controls { display: flex; flex-wrap: wrap; gap: 6px; }
-  .log { font-size: 11px; color: #d4d4d8; max-height: 280px;
-         overflow-y: auto; line-height: 1.5; }
-  .log .ts { color: #52525b; margin-right: 6px; }
-  .log .lvl-tier0 { color: #38bdf8; }
-  .log .lvl-tier1 { color: #fbbf24; }
-  .log .lvl-skip { color: #52525b; font-style: italic; }
-  .weights { display: grid; grid-template-columns: 1fr auto auto; gap: 6px 12px;
-             font-size: 11px; align-items: center; }
-  .weights label { color: #d4d4d8; }
-  .weights input[type=number] { width: 56px; background: #050507;
-                                  color: #fafafa; border: 1px solid #27272a;
-                                  border-radius: 4px; padding: 3px 6px;
-                                  font-family: inherit; font-size: 11px; }
-  .weights .pct { color: #52525b; min-width: 36px; text-align: right; }
-  hr { border: 0; border-top: 1px solid #18181b; margin: 14px 0; }
-</style>
-</head><body>
-<div class="stage-col">
-  <div class="stage-wrap">
-    <div class="stage-videos" id="stage-videos">
-      <video id="t0a" playsinline muted loop></video>
-      <video id="t0b" playsinline muted loop></video>
-      <video id="t1a" playsinline muted></video>
-      <video id="t1b" playsinline muted></video>
-    </div>
-    <div class="badges">
-      <div class="badge t0" id="badge-t0">
-        <span class="tier-tag">TIER 0</span>
-        <span class="state-name" id="badge-t0-name">—</span>
-        <span class="elapsed" id="badge-t0-elapsed">0.0s</span>
-      </div>
-      <div class="badge t1 hidden" id="badge-t1">
-        <span class="tier-tag">TIER 1</span>
-        <span class="state-name" id="badge-t1-name">—</span>
-        <span class="elapsed" id="badge-t1-elapsed">0.0s</span>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div>
-  <div class="panel">
-    <h2>now playing</h2>
-    <div class="row"><span class="k">tier 0</span>
-      <span class="v big" id="now-t0">—</span></div>
-    <div class="row"><span class="k">tier 1</span>
-      <span class="v" id="now-t1">(idle)</span></div>
-    <div class="row"><span class="k">next rotation</span>
-      <span class="v" id="next-rot">—</span></div>
-    <hr />
-    <div class="controls">
-      <button id="btn-pause">pause</button>
-      <button id="btn-skip">skip to next rotation</button>
-      <button id="btn-force-t1">force interjection now</button>
-    </div>
-    <hr />
-    <div class="row"><span class="k">speed</span>
-      <span class="controls">
-        <button class="speed" data-mult="1">1×</button>
-        <button class="speed on" data-mult="2">2×</button>
-        <button class="speed" data-mult="5">5×</button>
-        <button class="speed" data-mult="10">10×</button>
-      </span></div>
-    <div class="row"><span class="k">interjection p</span>
-      <span><input type="number" id="prob-input"
-        min="0" max="1" step="0.05" value="0.35" /></span></div>
-    <div class="row"><span class="k">rotation min/max (s)</span>
-      <span>
-        <input type="number" id="rot-min" min="1" max="60" step="1" value="8" />
-        –
-        <input type="number" id="rot-max" min="1" max="60" step="1" value="18" />
-      </span></div>
-    <hr />
-    <div class="row"><span class="k">blur peak (px)</span>
-      <span>
-        <input type="range" id="blur-peak" min="0" max="20" step="0.5" value="8"
-               style="vertical-align: middle; width: 140px;" />
-        <span id="blur-peak-val" class="v" style="display:inline-block; min-width: 30px; text-align: right;">8.0</span>
-      </span></div>
-    <div class="row"><span class="k">blur max (ms)</span>
-      <span>
-        <input type="range" id="blur-max" min="60" max="1000" step="20" value="500"
-               style="vertical-align: middle; width: 140px;" />
-        <span id="blur-max-val" class="v" style="display:inline-block; min-width: 36px; text-align: right;">500</span>
-      </span></div>
-  </div>
-
-  <div class="panel" style="margin-top:12px">
-    <h2>tier 0 weights</h2>
-    <div class="weights" id="t0-weights"></div>
-  </div>
-
-  <div class="panel" style="margin-top:12px">
-    <h2>tier 1 weights</h2>
-    <div class="weights" id="t1-weights"></div>
-  </div>
-
-  <div class="panel" style="margin-top:12px">
-    <h2>transition log</h2>
-    <div class="log" id="log"></div>
-  </div>
-</div>
-
-<script>
-// Mirrors backend/agents/avatar_director.py constants. Edit there + here
-// in lockstep when the live Director numbers change.
-const TIER0_CROSSFADE_MS = 600;
-const TIER1_CROSSFADE_MS = 120;
-const TIER1_FADEOUT_MS = 500;
-const PREPARE_TIMEOUT_MS = 4000;
-
-// Mirror of TIER0_LIBRARY in avatar_director.py
-const T0 = [
-  { intent: 'idle_calm',       url: '/states/idle/idle_calm.mp4',       weight: 0.75 },
-  { intent: 'idle_thinking',   url: '/states/idle/idle_thinking.mp4',   weight: 0.10 },
-  { intent: 'misc_hair_touch', url: '/states/idle/misc_hair_touch.mp4', weight: 0.15 },
-];
-
-// Mirror of TIER1_INTERJECTIONS + the new welcome (low probability per
-// the new spec). Editable from the right-side controls.
-const T1 = [
-  { intent: 'misc_sip_drink',       url: '/states/idle/misc_sip_drink.mp4',            weight: 0.40 },
-  { intent: 'misc_walk_off_return', url: '/states/idle/misc_walk_off_return.mp4',      weight: 0.20 },
-  { intent: 'misc_glance_aside',    url: '/states/idle/misc_glance_aside_speaking.mp4',weight: 0.25 },
-  { intent: 'welcome',              url: '/bridges/welcome/welcome.mp4',               weight: 0.15 },
-];
-
-let interjectionProbability = 0.35;
-let rotMinS = 8, rotMaxS = 18;
-let speed = 2;
-let paused = false;
-// Blur trick — symmetric pulse 0 → peak → 0 of CSS filter:blur() on
-// the .stage-videos wrapper during every crossfade. Destroys high-
-// frequency facial edges (mouth, eyes, jawline) so two faces
-// overlapping at intermediate opacity can't be picked apart by the
-// eye. Curve = sin(t * π) → smooth bell, peak at midpoint.
-//   blurPeakPx = 0   disables the trick (A/B baseline against today's
-//                    pure-opacity behaviour)
-//   blurMaxMs        hard cap so long crossfades (Tier 0 600ms) never
-//                    sit blurred — the pulse ends well before the
-//                    opacity ramp does. Short stab only, just enough
-//                    to hide the seam.
-let blurPeakPx = 8;
-let blurMaxMs  = 500;
-let activeBlurRaf = null;
-
-const els = {
-  t0a: document.getElementById('t0a'),
-  t0b: document.getElementById('t0b'),
-  t1a: document.getElementById('t1a'),
-  t1b: document.getElementById('t1b'),
-  nowT0: document.getElementById('now-t0'),
-  nowT1: document.getElementById('now-t1'),
-  nextRot: document.getElementById('next-rot'),
-  badgeT0: document.getElementById('badge-t0'),
-  badgeT0Name: document.getElementById('badge-t0-name'),
-  badgeT0Elapsed: document.getElementById('badge-t0-elapsed'),
-  badgeT1: document.getElementById('badge-t1'),
-  badgeT1Name: document.getElementById('badge-t1-name'),
-  badgeT1Elapsed: document.getElementById('badge-t1-elapsed'),
-  log: document.getElementById('log'),
-};
-
-// Track when each tier last changed so we can show "elapsed on this state"
-// counters and trigger the flash animation right at the swap moment.
-let t0StartedAt = 0;
-let t1StartedAt = 0;
-
-function flashBadge(badgeEl) {
-  badgeEl.classList.add('flash');
-  setTimeout(() => badgeEl.classList.remove('flash'), 600);
-}
-
-let t0ActiveIsA = true;
-let t1ActiveIsA = true;
-let currentT0 = null;
-let currentT1 = null;
-let nextRotationAt = 0;
-let rotationTimer = null;
-
-function logEvt(level, msg) {
-  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-  const div = document.createElement('div');
-  div.innerHTML = `<span class="ts">${ts}</span><span class="lvl-${level}">${msg}</span>`;
-  els.log.prepend(div);
-  while (els.log.children.length > 80) {
-    els.log.removeChild(els.log.lastChild);
-  }
-}
-
-function weightedPick(pool) {
-  const total = pool.reduce((s, p) => s + p.weight, 0);
-  let r = Math.random() * total;
-  for (const p of pool) {
-    r -= p.weight;
-    if (r <= 0) return p;
-  }
-  return pool[pool.length - 1];
-}
-
-// Blur pulse — call at the start of every crossfade. Duration scales
-// with the crossfade itself: Tier 1 in (120ms) → 120ms pulse; Tier 0
-// rotation (600ms) → clipped to blurMaxMs so the blur is OUT well
-// before the opacity ramp finishes. We force a 60ms floor so even
-// the 120ms Tier 1 crossfade gets a perceptible blur arc instead of
-// flickering on/off in two frames. Cancels any in-flight pulse before
-// starting a new one so rapid back-to-back transitions don't stack.
-function blurStage(crossfadeMs) {
-  if (blurPeakPx <= 0) return;
-  const stage = document.getElementById('stage-videos');
-  if (!stage) return;
-  if (activeBlurRaf) cancelAnimationFrame(activeBlurRaf);
-  const dur = Math.max(60, Math.min(crossfadeMs, blurMaxMs));
-  const start = performance.now();
-  function tick(now) {
-    const t = Math.max(0, Math.min(1, (now - start) / dur));
-    const px = blurPeakPx * Math.sin(t * Math.PI);
-    stage.style.filter = px > 0.05 ? `blur(${px.toFixed(2)}px)` : 'none';
-    if (t < 1) {
-      activeBlurRaf = requestAnimationFrame(tick);
-    } else {
-      stage.style.filter = 'none';
-      activeBlurRaf = null;
-    }
-  }
-  activeBlurRaf = requestAnimationFrame(tick);
-}
-
-// Mirror of the LiveStage prepareFirstFrame helper — load the new src,
-// seek to t=0, await the seeked event so the FIRST frame is decoded
-// before the opacity ramp begins. Without this the crossfade can show
-// frames 2-5 of the new clip mid-fade (visible head jump).
-function prepareFirstFrame(el, src) {
-  return new Promise((resolve, reject) => {
-    const cleanup = () => {
-      el.removeEventListener('loadedmetadata', onLoadedMeta);
-      el.removeEventListener('seeked', onSeeked);
-      el.removeEventListener('error', onError);
-      clearTimeout(timer);
-    };
-    function onError() { cleanup(); reject(el.error || 'video_error'); }
-    function trySeek() {
-      if (el.currentTime > 0.001) el.currentTime = 0;
-      else Promise.resolve().then(onSeeked);
-    }
-    function onLoadedMeta() {
-      el.removeEventListener('loadedmetadata', onLoadedMeta);
-      trySeek();
-    }
-    function onSeeked() {
-      if (el.readyState >= 2) { cleanup(); resolve(); }
-      else el.addEventListener('canplay', () => { cleanup(); resolve(); }, { once: true });
-    }
-    el.addEventListener('error', onError, { once: true });
-    el.addEventListener('seeked', onSeeked);
-    const timer = setTimeout(() => { cleanup(); reject(new Error('prepare_timeout')); }, PREPARE_TIMEOUT_MS);
-    if (el.src === src && el.readyState >= 2 && el.currentTime <= 0.01) {
-      cleanup(); resolve(); return;
-    }
-    if (el.src !== src) {
-      el.src = src;
-      el.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
-      try { el.load(); } catch {}
-    } else {
-      trySeek();
-    }
-  });
-}
-
-async function swapTier0(pick) {
-  const incoming = t0ActiveIsA ? els.t0b : els.t0a;
-  const outgoing = t0ActiveIsA ? els.t0a : els.t0b;
-  incoming.muted = true;
-  incoming.loop = true;
-  try {
-    await prepareFirstFrame(incoming, pick.url);
-    await incoming.play();
-    blurStage(TIER0_CROSSFADE_MS);
-    incoming.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
-    outgoing.style.transition = `opacity ${TIER0_CROSSFADE_MS}ms ease`;
-    incoming.style.opacity = 1;
-    outgoing.style.opacity = 0;
-    t0ActiveIsA = !t0ActiveIsA;
-    currentT0 = pick;
-    t0StartedAt = Date.now();
-    els.nowT0.textContent = pick.intent;
-    els.badgeT0Name.textContent = pick.intent;
-    flashBadge(els.badgeT0);
-    setTimeout(() => { try { outgoing.pause(); } catch {} }, TIER0_CROSSFADE_MS + 50);
-    logEvt('tier0', `tier 0 → ${pick.intent} (crossfade ${TIER0_CROSSFADE_MS}ms)`);
-  } catch (e) {
-    logEvt('skip', `tier 0 → ${pick.intent} FAILED: ${e?.message || e}`);
-  }
-}
-
-async function fireTier1(pick) {
-  const incoming = t1ActiveIsA ? els.t1b : els.t1a;
-  const outgoing = t1ActiveIsA ? els.t1a : els.t1b;
-  incoming.muted = true;
-  incoming.loop = false;
-  try {
-    await prepareFirstFrame(incoming, pick.url);
-    await incoming.play();
-    blurStage(TIER1_CROSSFADE_MS);
-    incoming.style.transition = `opacity ${TIER1_CROSSFADE_MS}ms ease`;
-    outgoing.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
-    incoming.style.opacity = 1;
-    if (currentT1) outgoing.style.opacity = 0;
-    t1ActiveIsA = !t1ActiveIsA;
-    currentT1 = pick;
-    t1StartedAt = Date.now();
-    els.nowT1.textContent = pick.intent;
-    els.badgeT1Name.textContent = pick.intent;
-    els.badgeT1.classList.remove('hidden');
-    flashBadge(els.badgeT1);
-    logEvt('tier1', `tier 1 → ${pick.intent} (crossfade ${TIER1_CROSSFADE_MS}ms; auto fade-out on natural end)`);
-    incoming.addEventListener('ended', () => {
-      blurStage(TIER1_FADEOUT_MS);
-      incoming.style.transition = `opacity ${TIER1_FADEOUT_MS}ms ease`;
-      incoming.style.opacity = 0;
-      const ended = pick;
-      currentT1 = null;
-      els.nowT1.textContent = '(idle)';
-      // Hide the Tier 1 badge after the fade-out settles so it disappears
-      // in lockstep with the visual fade — flash Tier 0 to redirect the
-      // eye back to "what's underneath."
-      setTimeout(() => {
-        els.badgeT1.classList.add('hidden');
-        flashBadge(els.badgeT0);
-      }, TIER1_FADEOUT_MS);
-      logEvt('tier1', `tier 1 ← ${ended.intent} ended (fade-out ${TIER1_FADEOUT_MS}ms)`);
-    }, { once: true });
-  } catch (e) {
-    logEvt('skip', `tier 1 → ${pick.intent} FAILED: ${e?.message || e}`);
-  }
-}
-
-function rotationDelay() {
-  const min = rotMinS * 1000, max = rotMaxS * 1000;
-  return Math.round((min + Math.random() * (max - min)) / Math.max(speed, 0.1));
-}
-
-async function rotationTick() {
-  if (paused) { scheduleNext(); return; }
-  // 35% (configurable) chance to fire a tier 1 interjection instead of
-  // swapping tier 0. Mirrors the live Director.
-  if (Math.random() < interjectionProbability && !currentT1) {
-    const pick = weightedPick(T1);
-    await fireTier1(pick);
-  } else {
-    let pick;
-    do { pick = weightedPick(T0); } while (currentT0 && pick.intent === currentT0.intent && T0.length > 1);
-    await swapTier0(pick);
-  }
-  scheduleNext();
-}
-
-function scheduleNext() {
-  if (rotationTimer) clearTimeout(rotationTimer);
-  const ms = rotationDelay();
-  nextRotationAt = Date.now() + ms;
-  rotationTimer = setTimeout(rotationTick, ms);
-}
-
-setInterval(() => {
-  // While paused, freeze the displayed elapsed at pausedAt (not Date.now())
-  // so the badges stop ticking when the videos are stopped.
-  const now = paused ? pausedAt : Date.now();
-  if (!paused) {
-    const remain = Math.max(0, nextRotationAt - Date.now());
-    els.nextRot.textContent = `${(remain / 1000).toFixed(1)}s`;
-  } else {
-    els.nextRot.textContent = '(paused)';
-  }
-  if (currentT0) {
-    els.badgeT0Elapsed.textContent = `${((now - t0StartedAt) / 1000).toFixed(1)}s`;
-  }
-  if (currentT1) {
-    els.badgeT1Elapsed.textContent = `${((now - t1StartedAt) / 1000).toFixed(1)}s`;
-  }
-}, 100);
-
-// Controls
-document.querySelectorAll('button.speed').forEach(b => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('button.speed').forEach(x => x.classList.remove('on'));
-    b.classList.add('on');
-    speed = parseFloat(b.dataset.mult);
-    logEvt('skip', `speed → ${speed}×`);
-  });
-});
-// Pause does THREE things: stop the rotation scheduler, pause whichever
-// video elements are currently playing, and freeze the elapsed counters.
-// Resume reverses all three. Without the video.pause() the playback kept
-// going while the state machine was idle — confusing because "paused" only
-// stopped FUTURE transitions, not the current one.
-let pausedAt = 0;
-function pausedVideos() {
-  const out = [];
-  if (currentT0) out.push(t0ActiveIsA ? els.t0a : els.t0b);
-  if (currentT1) out.push(t1ActiveIsA ? els.t1a : els.t1b);
-  return out;
-}
-document.getElementById('btn-pause').addEventListener('click', (e) => {
-  paused = !paused;
-  e.target.textContent = paused ? 'resume' : 'pause';
-  e.target.classList.toggle('on', paused);
-  if (paused) {
-    pausedAt = Date.now();
-    if (rotationTimer) { clearTimeout(rotationTimer); rotationTimer = null; }
-    pausedVideos().forEach(v => { try { v.pause(); } catch {} });
-    logEvt('skip', 'paused (videos + rotation frozen)');
-  } else {
-    // Shift the startedAt timestamps forward by the pause duration so
-    // the elapsed counters resume from where they were, not from zero.
-    const dt = Date.now() - pausedAt;
-    if (currentT0) t0StartedAt += dt;
-    if (currentT1) t1StartedAt += dt;
-    pausedAt = 0;
-    pausedVideos().forEach(v => { v.play().catch(() => {}); });
-    scheduleNext();
-    logEvt('skip', `resumed (after ${(dt / 1000).toFixed(1)}s pause)`);
-  }
-});
-document.getElementById('btn-skip').addEventListener('click', () => {
-  if (rotationTimer) clearTimeout(rotationTimer);
-  rotationTick();
-});
-document.getElementById('btn-force-t1').addEventListener('click', async () => {
-  if (currentT1) { logEvt('skip', 'force-t1 skipped (already on)'); return; }
-  await fireTier1(weightedPick(T1));
-});
-document.getElementById('prob-input').addEventListener('change', (e) => {
-  interjectionProbability = parseFloat(e.target.value);
-  logEvt('skip', `interjection p → ${interjectionProbability}`);
-});
-document.getElementById('rot-min').addEventListener('change', (e) => {
-  rotMinS = parseInt(e.target.value, 10);
-});
-document.getElementById('rot-max').addEventListener('change', (e) => {
-  rotMaxS = parseInt(e.target.value, 10);
-});
-// Live blur tuning. `input` (not `change`) so dragging the slider
-// updates instantly — pair with btn-skip to fire a transition with
-// each new peak value and dial in the right "tiny" amount visually.
-const blurPeakInput = document.getElementById('blur-peak');
-const blurPeakLabel = document.getElementById('blur-peak-val');
-blurPeakInput.addEventListener('input', (e) => {
-  blurPeakPx = parseFloat(e.target.value);
-  blurPeakLabel.textContent = blurPeakPx.toFixed(1);
-});
-const blurMaxInput = document.getElementById('blur-max');
-const blurMaxLabel = document.getElementById('blur-max-val');
-blurMaxInput.addEventListener('input', (e) => {
-  blurMaxMs = parseInt(e.target.value, 10);
-  blurMaxLabel.textContent = `${blurMaxMs}`;
-});
-
-// Render the editable weight tables
-function renderWeights(pool, target) {
-  const total = pool.reduce((s, p) => s + p.weight, 0);
-  target.innerHTML = '';
-  pool.forEach((p, i) => {
-    const lab = document.createElement('label'); lab.textContent = p.intent;
-    const inp = document.createElement('input');
-    inp.type = 'number'; inp.min = 0; inp.max = 1; inp.step = 0.05;
-    inp.value = p.weight.toFixed(2);
-    inp.addEventListener('change', () => {
-      p.weight = parseFloat(inp.value);
-      renderWeights(pool, target);
-    });
-    const pct = document.createElement('span'); pct.className = 'pct';
-    pct.textContent = total > 0 ? `${Math.round(100 * p.weight / total)}%` : '—';
-    target.append(lab, inp, pct);
-  });
-}
-renderWeights(T0, document.getElementById('t0-weights'));
-renderWeights(T1, document.getElementById('t1-weights'));
-
-// Boot — pick a starting tier 0 then start rotating
-(async () => {
-  await swapTier0(weightedPick(T0));
-  scheduleNext();
-})();
-</script>
-</body></html>"""
-    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
-
-
-@app.get("/dev/clips", response_class=HTMLResponse)
-@app.get("/dev/clips/{intent_filter}", response_class=HTMLResponse)
-async def dev_clips(intent_filter: str | None = None) -> HTMLResponse:
-    """Bridge clip preview gallery.
-
-      /dev/clips                  → all sources, all intents
-      /dev/clips/<intent>         → just the NEW bridges for one intent
-                                     (question | objection | compliment |
-                                      neutral | intro), big tiles, focused
-
-    Used to pick favorites per intent before re-tiering the Director.
-    """
-    import re
-    bridges_root = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
-    bridges_silent_v1 = bridges_root.parent / "bridges_silent_v1"
-    if intent_filter:
-        # Focused per-intent view — only the NEW bridges section, only this
-        # intent. Big tiles for picking favorites.
-        sources = [
-            (f"phase0/bridges · {intent_filter} (Vertex Veo 3.1, talking substrate)",
-             bridges_root, "/bridges", True),
-        ]
-    else:
-        sources = [
-            ("NEW · phase0/bridges (Vertex Veo 3.1, talking substrate — pick favorites per intent)",
-             bridges_root, "/bridges", True),
-            ("phase0 / LatentSync (verbal stallers — to be retired)",
-             CLIPS_DIR, "/clips", False),
-            ("local_answers / _generic (Wav2Lip verbal — to be retired)",
-             LOCAL_ANSWERS_DIR / "_generic", "/local_answers/_generic", False),
-            ("phase0/bridges_silent_v1 (closed-mouth attempt — kept as backup, do not use)",
-             bridges_silent_v1, "/bridges_silent_v1", True),
-        ]
-    # Strip trailing _<hash> from generic filenames so the visible label
-    # reads like "objection_1" instead of "objection_d8528419d0".
-    label_strip = re.compile(r"_[0-9a-f]{6,}$")
-
-    def _categorize(stem: str) -> str:
-        for prefix in ("bridge", "compliment", "objection", "question",
-                       "intro", "neutral", "pitch", "welcome"):
-            if stem.startswith(prefix):
-                return prefix
-        return "other"
-
-    sections_html = []
-    total_clips = 0
-    for src_label, dirpath, url_prefix, recurse in sources:
-        if not dirpath.exists():
-            sections_html.append(
-                f"<section><h2>{src_label}</h2>"
-                f"<p class='empty'>No directory at {dirpath}</p></section>"
-            )
-            continue
-        groups: dict[str, list[tuple[str, str]]] = {}
-        # `recurse=True` for the new bridges dir which is intent-subfoldered;
-        # the legacy dirs have all clips at the top level.
-        files = sorted(dirpath.rglob("*.mp4")) if recurse else sorted(dirpath.glob("*.mp4"))
-        for f in files:
-            stem = f.stem
-            label = label_strip.sub("", stem)
-            cat = _categorize(stem)
-            if intent_filter and cat != intent_filter:
-                continue
-            # Build a URL that mirrors the on-disk relative path so the
-            # /bridges static mount serves the right intent subfolder.
-            rel = f.relative_to(dirpath)
-            url = f"{url_prefix}/{rel.as_posix()}"
-            groups.setdefault(cat, []).append((label, url))
-            total_clips += 1
-        if not groups:
-            sections_html.append(
-                f"<section><h2>{src_label}</h2>"
-                f"<p class='empty'>No .mp4 files found yet — render in progress.</p></section>"
-            )
-            continue
-        cat_html = []
-        for cat in ("question", "objection", "compliment", "bridge",
-                    "neutral", "intro", "pitch", "welcome", "other"):
-            entries = groups.get(cat) or []
-            if not entries:
-                continue
-            tiles = []
-            for label, url in entries:
-                tiles.append(
-                    f'<div class="tile">'
-                    f'<video src="{url}" autoplay loop muted playsinline></video>'
-                    f'<div class="cap">{label}</div>'
-                    f'</div>'
-                )
-            cat_html.append(
-                f'<div class="cat"><h3>{cat} <span class="n">({len(entries)})</span></h3>'
-                f'<div class="grid">{"".join(tiles)}</div></div>'
-            )
-        sections_html.append(
-            f'<section><h2>{src_label}</h2>{"".join(cat_html)}</section>'
-        )
-
-    # Per-intent focused view uses bigger tiles + more spacing so each
-    # clip stands on its own; the all-sources view stays dense.
-    if intent_filter:
-        tile_min, grid_gap = 320, 16
-    else:
-        tile_min, grid_gap = 180, 12
-
-    # `neutral` collapsed into `question` per option-B taxonomy decision;
-    # see phase0/assets/bridges/PICKS.md. The 6 neutral renders were
-    # merged into the question pool as variants G..L.
-    nav_intents = ["question", "objection", "compliment", "intro",
-                   "pitch", "welcome"]
-    nav_html = '<nav class="tabs">'
-    nav_html += (
-        f'<a href="/dev/clips" class="{"active" if not intent_filter else ""}">'
-        f'all</a>'
-    )
-    for it in nav_intents:
-        cls = "active" if intent_filter == it else ""
-        nav_html += f'<a href="/dev/clips/{it}" class="{cls}">{it}</a>'
-    nav_html += '</nav>'
-
-    title_suffix = f" · {intent_filter}" if intent_filter else ""
-
-    body = f"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8" />
-<title>Zo · clip preview{title_suffix}</title>
-<style>
-  :root {{ color-scheme: dark; }}
-  * {{ box-sizing: border-box; }}
-  html, body {{ margin: 0; background: #050507; color: #fafafa;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
-                 "Segoe UI", Roboto, Inter, Arial, sans-serif; }}
-  body {{ padding: 24px 32px 64px; }}
-  header {{ display: flex; align-items: baseline; gap: 16px;
-           border-bottom: 1px solid #27272a; padding-bottom: 12px; }}
-  h1 {{ font-size: 22px; font-weight: 800; letter-spacing: 1.5px; margin: 0;
-        background: linear-gradient(135deg,#ec4899,#7c3aed,#3b82f6);
-        -webkit-background-clip: text; background-clip: text;
-        -webkit-text-fill-color: transparent; }}
-  header .count {{ color: #a1a1aa; font-size: 13px;
-                   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
-  header .hint {{ margin-left: auto; color: #71717a; font-size: 12px;
-                 font-style: italic; }}
-  section {{ margin-top: 32px; }}
-  section > h2 {{ font-size: 13px; font-weight: 800; letter-spacing: 1.5px;
-                 text-transform: uppercase; color: #a78bfa; margin: 0 0 12px;
-                 padding-bottom: 6px; border-bottom: 1px solid #18181b; }}
-  .cat {{ margin: 18px 0 28px; }}
-  .cat h3 {{ font-size: 12px; font-weight: 700; letter-spacing: 1.5px;
-            text-transform: uppercase; color: #fafafa; margin: 0 0 10px; }}
-  .cat h3 .n {{ color: #52525b; font-weight: 500; margin-left: 4px; }}
-  .grid {{ display: grid; gap: {grid_gap}px;
-          grid-template-columns: repeat(auto-fill, minmax({tile_min}px, 1fr)); }}
-  .tile {{ background: #0f0f12; border: 1px solid #18181b;
-           border-radius: 10px; overflow: hidden;
-           transition: border-color 200ms ease, transform 200ms ease; }}
-  .tile:hover {{ border-color: #7c3aed; transform: translateY(-2px); }}
-  .tile video {{ width: 100%; aspect-ratio: 9/16; object-fit: cover;
-                 background: #000; display: block;
-                 max-height: 80vh; }}
-  nav.tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px;
-             padding-bottom: 12px; border-bottom: 1px solid #18181b;
-             position: sticky; top: 0; background: #050507; z-index: 10; }}
-  nav.tabs a {{ display: inline-block; padding: 6px 14px;
-              background: #0f0f12; border: 1px solid #27272a;
-              color: #d4d4d8; text-decoration: none;
-              border-radius: 999px; font-size: 12px; font-weight: 700;
-              letter-spacing: 1px; text-transform: uppercase;
-              transition: border-color 180ms ease, color 180ms ease; }}
-  nav.tabs a:hover {{ border-color: #7c3aed; color: #fafafa; }}
-  nav.tabs a.active {{ background: linear-gradient(135deg,#ec4899,#7c3aed);
-                       color: #fff; border-color: transparent; }}
-  .cap {{ padding: 7px 10px 9px; font-size: 11px; color: #d4d4d8;
-          font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-          letter-spacing: 0.2px; word-break: break-all;
-          border-top: 1px solid #18181b; }}
-  .empty {{ color: #52525b; font-style: italic; margin: 8px 0; }}
-</style>
-</head><body>
-<header>
-  <h1>ZO · CLIPS</h1>
-  <span class="count">{total_clips} clips</span>
-  <span class="hint">all autoplay+loop+muted · use the tabs to focus on one
-    intent · pick favorites + tell the agent</span>
-</header>
-{nav_html}
-{"".join(sections_html)}
-</body></html>"""
-    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
-
-
 # ── Lip-sync endpoints (Phase 1 pipeline) ──────────────
 
 from fastapi.staticfiles import StaticFiles
+
 app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
 
 # Static mount for the pre-rendered avatar clip library:
@@ -2201,22 +1578,9 @@ app.mount("/renders", StaticFiles(directory=str(RENDER_DIR)), name="renders")
 # All under one /clips URL so the Director and dashboard see one namespace.
 CLIPS_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "clips"
 STATES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "states"
-BRIDGES_DIR = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
-BRIDGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=str(CLIPS_DIR)), name="clips")
 app.mount("/states", StaticFiles(directory=str(STATES_DIR)), name="states")
-# /bridges serves the new silent body-language Veo library generated by
-# phase0/scripts/veo_bridges_batch.py. Subfoldered by intent so the URL
-# is /bridges/<intent>/<intent>_<variant>.mp4.
-app.mount("/bridges", StaticFiles(directory=str(BRIDGES_DIR)), name="bridges")
-# bridges_silent_v1 — the closed-mouth first attempt (sub-optimal Wav2Lip
-# substrate). Mounted so /dev/clips can show it as a comparison set.
-_BRIDGES_SILENT_V1 = BRIDGES_DIR.parent / "bridges_silent_v1"
-if _BRIDGES_SILENT_V1.exists():
-    app.mount("/bridges_silent_v1",
-              StaticFiles(directory=str(_BRIDGES_SILENT_V1)),
-              name="bridges_silent_v1")
 
 # Pre-rendered local answers — the sub-300ms respond_locally path. Generated
 # offline by scripts/render_local_answers.py; missing files fall back to
@@ -2225,40 +1589,12 @@ LOCAL_ANSWERS_DIR = Path(__file__).resolve().parent / "local_answers"
 LOCAL_ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/local_answers", StaticFiles(directory=str(LOCAL_ANSWERS_DIR)), name="local_answers")
 
-# Audio-first playback (USE_AUDIO_FIRST). Each cloud-bound comment writes
-# the TTS bytes here and broadcasts a `comment_response_audio` event the
-# moment they're ready — the dashboard plays them immediately while
-# Wav2Lip renders video in the background and crossfades in under the
-# already-playing audio. Uses uuid filenames so concurrent requests can't
-# collide. The dir is gitignored along with backend/renders.
-RESPONSE_AUDIO_DIR = Path(__file__).resolve().parent / "response_audio"
-RESPONSE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/response_audio", StaticFiles(directory=str(RESPONSE_AUDIO_DIR)), name="response_audio")
-
-# Static assets the dashboard preloads at boot (e.g. silent_unlock.mp3 for
-# StartDemoOverlay). Lives under backend/static so it can ship with the
-# backend deploy and not need a separate CDN.
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
 
 def _save_render(label: str, data: bytes) -> str:
     fname = f"{label}_{int(time.time())}.mp4"
     path = RENDER_DIR / fname
     path.write_bytes(data)
     return f"/renders/{fname}"
-
-
-def _save_response_audio(audio_bytes: bytes) -> str:
-    """Save TTS audio to /response_audio/<uuid>.mp3 and return the
-    served URL. Caller is responsible for measuring duration via ffprobe
-    before broadcasting if accurate timing is needed."""
-    import uuid as _uuid
-    fname = f"resp_{_uuid.uuid4().hex[:12]}.mp3"
-    path = RESPONSE_AUDIO_DIR / fname
-    path.write_bytes(audio_bytes)
-    return f"/response_audio/{fname}"
 
 
 def _probe_video_duration_ms(path: Path) -> int | None:
@@ -2318,6 +1654,17 @@ async def api_generate_pitch(
     }
 
 
+# Legacy stub — kept for backwards compat. Real bridge selection now lives
+# in agents/bridge_clips.py (manifest-driven, populated by `python -m
+# agents.bridge_clips render`). This dict is unused at runtime.
+CLIP_LIBRARY: dict[str, list[str]] = {
+    "question":   [],
+    "compliment": [],
+    "objection":  [],
+    "spam":       [],
+}
+
+
 @app.post("/api/classify_comment")
 async def api_classify_comment(comment: str = Form(...)):
     """Lightweight P1.5: classify a comment via on-device Gemma; if a generic
@@ -2353,59 +1700,28 @@ async def api_respond_to_comment(
     comment: str = Form(...),
     out_height: int = Form(1920),
 ):
-    """LIVE comment response on the cloud-escalate path. Pristine quality
-    over precise lip-sync (Wav2Lip's 96px patch + paste-back produces
-    visible artifacts even with GFPGAN at max settings).
+    """LIVE comment response with seamless avatar choreography.
 
     Flow:
-      1. _ensure_reading_chat_visible: reading_chat clip already on Tier 1
-         from run_routed_comment, OR fired now as fallback for direct
-         REST callers. Loops until step 6 fades it out.
-      2. classify + LLM + Bedrock + ElevenLabs TTS (with real
-         per-character word timings via /v1/text-to-speech/.../with-
-         timestamps) — runs while reading_chat is visible.
-      3. _release_reading_chat: fade Tier 1 → Tier 0 idle, 300ms beat.
-         Honors READING_CHAT_MIN_VISIBLE_MS so a fast/cached pipeline
-         doesn't blink past the audience.
-      4. Broadcast comment_response_audio: standalone <audio> element
-         on the dashboard plays the TTS, KaraokeCaptions reveals each
-         word using ElevenLabs character alignments.
-      5. Director.emit Tier 1 with intent="response", muted=True, looping
-         /states/idle/idle_calm_speaking.mp4 for the duration of the
-         audio. Speaking-pose substrate has continuous mouth motion (not
-         word-precise but visually engaged) and ZERO Wav2Lip artifacts.
-      6. Broadcast SYNTHETIC comment_response_video with url=None +
-         audio_already_playing=True. Restores the 4 dashboard contracts
-         the previous video event drove (pendingComments clear, voice
-         state pill clear, ChatPanel new row, floating comment overlay).
-      7. Schedule fade_to_idle for after the audio duration + 400ms tail.
+      1. reading_chat clip fades in instantly (avatar 'reads the comment')
+      2. classify + LLM + TTS run in parallel, classify result picks the bridge
+      3. bridge clip crossfades over reading_chat the moment we know the label
+      4. Wav2Lip renders the response over the same source
+      5. response crossfades over the bridge when ready
+      6. fade_to_idle releases Tier 1 back to the always-on Tier 0 idle layer
 
-    Pre-rendered qa_index entries take a different path
-    (_run_respond_locally) and DO get true lip-sync via LatentSync — only
-    this novel-question cloud-escalate path skips lip-sync.
-
-    Total perceived: ~5-8s comment-arrival → first audio syllable
-    (8s on Cactus CPU prefill classify is the dominant bottleneck;
-    classify and TTS overlap with reading_chat visibility).
+    Target: sub-8s end-to-end (warm pod, warm face cache).
     """
     product_data = pipeline_state.get("product_data") or {}
     total_t0 = time.time()
 
-    # If the caller didn't already mint a trace (e.g. direct REST hit on
-    # /api/respond_to_comment without going through run_routed_comment),
-    # mint one now so phase markers below have an id.
-    if trace.get_id() == "-------":
-        trace.new_trace("respond_to_comment")
-        trace.phase("comment_received", text=comment)
+    # 1) Reading the chat — instant visual feedback. Director holds it briefly
+    #    before the bridge takes over, so the viewer registers the moment.
+    if director:
+        asyncio.create_task(director.reading_chat())
 
-    # 1) Reading visual — make sure it's on screen NOW. run_routed_comment
-    #    fires it pre-classify; for direct REST callers we fire it here as
-    #    a fallback. The clip loops, so it stays visible until we explicitly
-    #    fade it out after the render is done (see step 7).
-    reading_t0 = time.time()
-    await _ensure_reading_chat_visible()
-
-    # 2) Classify + LLM in parallel with the reading visual.
+    # 2) Classify + LLM in parallel. Classify drives bridge selection; LLM gets
+    #    "question" as a safe default if classify is slow.
     class_t0 = time.time()
     classify_task = asyncio.create_task(classify_comment_gemma(comment))
 
@@ -2415,12 +1731,14 @@ async def api_respond_to_comment(
     except Exception:
         response_text = "Great question — let me get back to you on that."
     resp_ms = int((time.time() - t0) * 1000)
-    trace.phase("llm_done", ms=resp_ms, words=len(response_text.split()),
-                text=response_text)
     log_event("SELLER", f"response drafted ({resp_ms}ms)", {"response": response_text})
+    # Stash for degraded-path fallback: if TTS or Wav2Lip fails below, the
+    # wrapper in run_routed_comment reads this so we can still surface the
+    # text answer to the dashboard instead of showing nothing.
     pipeline_state["last_response_text"] = {"comment": comment, "response": response_text}
 
-    # 3) Collect classify result (still useful for telemetry / future hooks).
+    # 3) Collect classify result NOW — needed to pick the right bridge label.
+    #    Don't wait if it hasn't finished; fall back to "neutral" pool.
     comment_type = "question"
     class_ms = int((time.time() - class_t0) * 1000)
     if classify_task.done():
@@ -2430,189 +1748,120 @@ async def api_respond_to_comment(
             pass
     else:
         classify_task.cancel()
-    trace.phase("classify_collected", type=comment_type, ms=class_ms)
     log_event("EYES", f'Comment "{comment[:40]}" → {comment_type} ({class_ms}ms)')
 
-    # 4) TTS — runs in parallel with the rest of the reading_chat hold.
+    # 4) Fire TTS and bridge in parallel. Bridge plays an audible
+    #    acknowledgment over the reading_chat pose while TTS + Wav2Lip cook.
+    #    Without parallelism the bridge would only get the Wav2Lip render
+    #    window (~3.5s) to play; with parallelism it gets the full TTS +
+    #    Wav2Lip window (~4s) so it doesn't end before the response arrives.
+    bridge_task = None
+    if director:
+        bridge_task = asyncio.create_task(director.play_bridge(comment_type))
+
     t0 = time.time()
-    audio_bytes, word_timings = await text_to_speech(
-        response_text, return_word_timings=True,
-    )
+    audio_bytes = await text_to_speech(response_text)
     tts_ms = int((time.time() - t0) * 1000)
-    trace.phase("tts_done", ms=tts_ms, audio_bytes=len(audio_bytes),
-                words=len(word_timings))
 
-    # 5) NO Wav2Lip render. Wav2Lip's 96px-patch + paste-back architecture
-    #    produces visible mouth/face artifacts even with GFPGAN at maximum
-    #    settings (weight=0.9, mouth-only, post-sharpen). The user's quality
-    #    bar is "pristine, no compromises" — so we skip live lip-sync
-    #    entirely on novel questions and instead play a clean speaking-pose
-    #    idle loop on Tier 1 while the response audio + KaraokeCaptions
-    #    carry the actual answer. Pre-rendered qa_index entries (LatentSync)
-    #    still get true lip-sync via _run_respond_locally — only this
-    #    cloud-escalate path skips it. Trade-off: novel responses don't
-    #    show precise lip-sync but show ZERO Wav2Lip artifacts.
-    audio_url: str | None = None
-    audio_duration_ms: int | None = None
+    # Best-effort: collect bridge result without blocking. If the manifest
+    # is empty / the call errored we just keep reading_chat showing.
+    if bridge_task and bridge_task.done():
+        try:
+            bridge_task.result()
+        except Exception:
+            logger.exception("[director] play_bridge failed (non-fatal)")
 
-    # 7a) Audio-first + speaking-idle loop = pristine quality novel response.
-    if audio_bytes:
-        from agents.seller import _probe_audio_duration_ms
-        audio_url = _save_response_audio(audio_bytes)
-        audio_duration_ms = await asyncio.to_thread(
-            _probe_audio_duration_ms, audio_bytes,
-        )
-        total_ms = int((time.time() - total_t0) * 1000)
-        trace.phase("audio_only_path_chosen",
-                    url=audio_url, audio_dur_ms=audio_duration_ms,
-                    reason="wav2lip_skipped_for_quality")
-
-        # Release reading → 300ms idle pause → speaking-idle + audio.
-        await _release_reading_chat(reading_t0)
-
-        # Dispatch standalone audio (powers KaraokeCaptions word reveal).
-        await broadcast_to_dashboards({
-            "type": "comment_response_audio",
-            "comment": comment,
-            "response": response_text,
-            "url": audio_url,
-            "word_timings": word_timings,
-            "expected_duration_ms": audio_duration_ms,
-            "intent": "response",
-            "class_ms": class_ms,
-            "llm_ms": resp_ms,
-            "tts_ms": tts_ms,
-            "ts": time.time_ns(),
-        })
-        trace.phase("audio_dispatched", url=audio_url,
-                    audio_dur_ms=audio_duration_ms)
-
-        # Loop a clean speaking-pose substrate on Tier 1 for the duration
-        # of the audio. The substrate is a continuous "talking pose"
-        # (mouth in motion, generic phonemes) — not synced to specific
-        # words but visually engaged + ZERO Wav2Lip artifacts. The loop
-        # naturally extends past the audio if needed; we fade it out
-        # explicitly when audio ends.
-        #
-        # intent="response" (NOT "response_speaking_idle") so the dashboard's
-        # LiveStage.overlayVisible flag activates and the floating comment
-        # card with latency badge appears, exactly as it does for local
-        # and canned-clip responses.
-        SPEAKING_IDLE_URL = "/states/idle/idle_calm_speaking.mp4"
-        if director:
-            await director.emit(
-                "tier1",
-                "response",
-                SPEAKING_IDLE_URL,
-                loop=True,
-                mode="crossfade",
-                muted=True,  # audio comes from the standalone <audio>
-                expected_duration_ms=audio_duration_ms,
-                emitted_by="api_respond_to_comment_no_wav2lip",
+    # 5) Wav2Lip render — use the substrate of whichever Tier 0 idle is
+    #    currently visible so the response inherits the same body language.
+    #    Eliminates the "different person leaning forward" jump-cut when
+    #    Tier 1 fades in over the calm idle layer.
+    substrate = director.current_substrate_pod_path() if director else None
+    t0 = time.time()
+    try:
+        if substrate:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=substrate, out_height=out_height,
             )
-            trace.phase("speaking_idle_loop_playing", url=SPEAKING_IDLE_URL)
+        else:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=out_height,
+            )
+    except Exception as e:
+        # If the configured substrate doesn't exist on the pod (400 / 404),
+        # mark it unavailable so future calls skip it, then retry with the
+        # default speaking-pose substrate. This keeps the live path alive
+        # when speaking variants haven't shipped yet.
+        if substrate and director:
+            err_str = str(e).lower()
+            if "404" in err_str or "400" in err_str or "not found" in err_str:
+                logger.warning("[lipsync] substrate %s unavailable, falling back: %s",
+                               substrate, e)
+                director.mark_substrate_status(substrate, False)
+                video_bytes, headers = await render_comment_response_wav2lip(
+                    audio_bytes, out_height=out_height,
+                )
+            else:
+                raise
+        else:
+            raise
+    lipsync_ms = int((time.time() - t0) * 1000)
 
-            release_ms = (audio_duration_ms or 0) + 400
-            if release_ms < 2500:
-                release_ms = 2500 + 400
-
-            async def _release_after(delay_ms: int):
-                await asyncio.sleep(delay_ms / 1000)
-                if director:
-                    await director.fade_to_idle()
-            asyncio.create_task(_release_after(release_ms))
-
-        # Synthetic comment_response_video event — restores the dashboard
-        # contracts that the previous "comment_response_video always follows
-        # comment_response_audio on the cloud path" assumption depended on:
-        #   • setPendingComments filter (clears the pending chip)
-        #   • setVoiceStateSafe(null) (drops the voice state pill)
-        #   • setCommentResponse / setResponseVideo (powers ChatPanel + the
-        #     floating comment overlay on /stage)
-        # url=None tells consumers there's no video file to load — the
-        # response visual is the speaking-idle loop emitted above via
-        # play_clip, and the audio is the standalone <audio> element.
-        # audio_already_playing=true matches the existing audio-first
-        # contract; lip_synced=false marks this as the no-Wav2Lip path
-        # for any downstream observer that wants to differentiate.
-        await broadcast_to_dashboards({
-            "type": "comment_response_video",
-            "comment": comment,
-            "response": response_text,
-            "url": None,
-            "total_ms": total_ms,
-            "class_ms": class_ms,
-            "llm_ms": resp_ms,
-            "tts_ms": tts_ms,
-            "lipsync_ms": 0,
-            "audio_already_playing": True,
-            "existing_audio_url": audio_url,
-            "expected_duration_ms": audio_duration_ms,
-            "lip_synced": False,
-        })
-        trace.phase("synthetic_response_video_dispatched", url=None)
-        trace.summary("respond_to_comment.audio_with_speaking_idle",
-                      total_ms=total_ms, audio=True, video=False,
-                      karaoke=True, lip_synced=False,
-                      reason="wav2lip_skipped_pristine_quality")
-        return {
-            "comment": comment,
-            "response": response_text,
-            "url": None,
-            "total_ms": total_ms,
-            "audio_url": audio_url,
-            "audio_duration_ms": audio_duration_ms,
-            "audio_first": True,
-            "lip_synced": False,
-            "breakdown": {
-                "classify_ms": class_ms,
-                "llm_ms": resp_ms,
-                "tts_ms": tts_ms,
-            },
-        }
-
-    # 7b) Last-resort: TTS itself failed (audio_bytes is empty/falsy).
-    # Release reading + tell the dashboard the comment couldn't be
-    # answered so it clears the pending chip; caller (run_routed_comment)
-    # surfaces this as a failure.
-    await _release_reading_chat(reading_t0)
+    url = _save_render("resp", video_bytes)
+    pipeline_state["last_response_video_url"] = url
     total_ms = int((time.time() - total_t0) * 1000)
-    trace.summary("respond_to_comment.tts_failed",
-                  total_ms=total_ms, audio=False, video=False,
-                  reason="tts_returned_empty")
+
+    log_event("SELLER", f"comment response ready in {total_ms}ms", {
+        "url": url, "classify_ms": class_ms, "llm_ms": resp_ms,
+        "tts_ms": tts_ms, "lipsync_ms": lipsync_ms,
+    })
+
+    # 6) Crossfade in the live response, then release back to idle when done.
+    if director:
+        await director.play_response(url)
+        # Probe the actual rendered video duration so the idle release fires
+        # precisely as the avatar finishes speaking. Falls back to a word-count
+        # estimate if ffprobe fails. Adds a small tail (400ms) so the response
+        # gets a beat of post-speech facial relaxation before crossfade.
+        rendered_path = RENDER_DIR / Path(url).name
+        play_ms = _probe_video_duration_ms(rendered_path)
+        if play_ms is None:
+            word_count = len(response_text.split())
+            play_ms = int(max(2500, word_count * 350))
+        play_ms_with_tail = play_ms + 400
+
+        async def _release_after(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            await director.fade_to_idle()
+        asyncio.create_task(_release_after(play_ms_with_tail))
+
     await broadcast_to_dashboards({
-        "type": "comment_failed",
+        "type": "comment_response_video",
         "comment": comment,
         "response": response_text,
-        "reason": "tts_returned_empty",
+        "url": url,
+        "total_ms": total_ms,
+        "class_ms": class_ms,
+        "llm_ms": resp_ms,
+        "tts_ms": tts_ms,
+        "lipsync_ms": lipsync_ms,
     })
     return {
         "comment": comment,
         "response": response_text,
-        "url": None,
+        "url": url,
         "total_ms": total_ms,
-        "audio_first": False,
-        "lip_synced": False,
-        "failed": True,
+        "breakdown": {
+            "classify_ms": class_ms,
+            "llm_ms": resp_ms,
+            "tts_ms": tts_ms,
+            "lipsync_ms": lipsync_ms,
+        },
+        "wav2lip": {
+            "total_sec": headers.get("x-total-sec"),
+            "detect_sec": headers.get("x-detect-sec"),
+            "predict_sec": headers.get("x-predict-sec"),
+        },
     }
-
-
-# ── Removed dead code (Apr 2026) ─────────────────────────────────────────
-# The previous Wav2Lip-based comment-response pipeline lived here:
-#   _render_response_video(audio_bytes, out_height)
-#       Wav2Lip render + USE_LIVE_PAD audio/video alignment helper.
-#   _render_and_broadcast_video(...)
-#       Audio-first background-render coroutine that ran Wav2Lip in the
-#       background after standalone audio dispatch.
-# Both are deleted because api_respond_to_comment switched to a "no-Wav2Lip
-# for novel cloud responses" model (audio + KaraokeCaptions over a clean
-# speaking-pose loop) — the user's quality bar of "pristine, no compromises"
-# rules out Wav2Lip's 96px-patch artifacts even with GFPGAN at max settings.
-# _run_wav2lip_pitch is the only remaining live caller of the Wav2Lip server
-# (legacy USE_PITCH_VEO=0 kill switch path); it calls
-# render_comment_response_wav2lip directly so doesn't need _render_response_
-# video. If a future caller wants a re-usable Wav2Lip helper, restore from
-# git history at sha 2c98beb.
 
 
 async def _fire_speculative_bridge(comment: str) -> None:
@@ -2670,7 +1919,6 @@ async def run_routed_comment(comment: str) -> dict:
     """Route an incoming comment through one of four tools.
 
     Flow:
-      0. Fire reading_chat IMMEDIATELY for sub-100ms visual feedback.
       1. Gemma 4 classify on device (already lock-serialized).
       2. router.decide → {tool, args, reason, ms, was_local, cost_saved_usd}.
       3. Broadcast routing_decision WS event for the RoutingPanel.
@@ -2678,42 +1926,14 @@ async def run_routed_comment(comment: str) -> dict:
          the helpers fade Tier 1 back to idle and broadcast comment_failed
          with the best available fallback text (drafted by Claude before
          the failure, when applicable) so the dashboard never sticks."""
-    # Mint a fresh trace id so this comment's full lifecycle (classify →
-    # router → dispatch → reading_chat → TTS → wav2lip → response) shows up
-    # under one greppable id in the backend log. Every helper called from
-    # here inherits the trace id automatically via contextvars.
-    trace.new_trace("comment")
-    trace.phase("comment_received", text=comment)
-
-    # 0. Fire reading_chat NOW — before classify/router/anything. The
-    #    on-device Cactus classify can take 5-10s on CPU prefill; without
-    #    this immediate emit, the user sees nothing happen on stage for
-    #    that whole window, then a sudden burst of activity. By emitting
-    #    the reading clip first, the avatar visibly "engages" within ~50ms
-    #    of the comment arriving and stays in the reading pose for the
-    #    natural duration of the rest of the pipeline. The clip loops so
-    #    it just keeps showing until a downstream helper fades it out.
-    if director is not None:
-        try:
-            await director.emit_reading_chat()
-            _reading_already_fired.set(True)
-            trace.phase("reading_chat_emitted_immediate")
-        except Exception:
-            logger.exception("[director] emit_reading_chat raised (non-fatal)")
-
     product = pipeline_state.get("product_data")
 
     # 1. Classify (on-device Gemma 4). Never raises — returns a dict with
     #    at least {type, source} even on fallback. Safe to await here.
     classify = await classify_comment_gemma(comment)
-    trace.phase("classify_done",
-                type=classify.get("type"), source=classify.get("source"))
 
     # 2. Decide.
     decision = await comment_router.decide(comment, classify, product)
-    trace.phase("router_decided",
-                tool=decision["tool"], reason=decision["reason"],
-                local=decision["was_local"], ms=decision["ms"])
 
     # 3. Broadcast so RoutingPanel (Hour 7) can tick counters.
     await broadcast_to_dashboards({
@@ -2728,6 +1948,18 @@ async def run_routed_comment(comment: str) -> dict:
     log_event("ROUTER", f'{decision["tool"]} — {decision["reason"]} ({decision["ms"]}ms)',
               {"classify": classify.get("type"), "was_local": decision["was_local"]})
 
+    # 3b. Persist for BRAIN aggregation. Hardcoded stream_id="default" until
+    #     multi-stream isolation lands (Sprint 5+); active_product_id mirrors
+    #     pipeline_state which the dashboard sets via /api/state/active_product
+    #     once multi-product (S1.3) ships.
+    brain.record_event(
+        stream_id="default",
+        product_id=pipeline_state.get("active_product_id") or "unknown",
+        comment=comment,
+        classify=classify,
+        decision=decision,
+    )
+
     # 4. Dispatch.
     tool = decision["tool"]
     args = decision["args"]
@@ -2740,11 +1972,6 @@ async def run_routed_comment(comment: str) -> dict:
     # Default: escalate_to_cloud. Same pattern as the old stub — forward to
     # the existing api_respond_to_comment, and on failure fade + broadcast
     # comment_failed with any drafted text.
-    #
-    # Note: there's intentionally no pitch dispatch case here. Pitches
-    # fire from the video-upload pipeline (run_sell_pipeline → the
-    # _run_audio_first_pitch helper → Director.dispatch_audio_first_pitch).
-    # Comments are audience reactions only.
     return await _run_escalate_to_cloud(comment, args, decision)
 
 
@@ -2767,69 +1994,6 @@ async def _run_escalate_to_cloud(comment: str, args: dict, decision: dict) -> di
             "reason": str(e)[:200],
         })
         raise
-
-
-# Per-task contextvar tracking whether reading_chat was already emitted by
-# an upstream caller (run_routed_comment). Lets dispatch helpers skip a
-# duplicate emit (which would re-crossfade the same clip and look like a
-# visible flash). Defaults to False, so any helper called outside the
-# routed-comment path (direct REST hit, voice, etc.) still fires the
-# reading clip itself as a fallback.
-_reading_already_fired: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "reading_already_fired", default=False
-)
-
-
-async def _ensure_reading_chat_visible() -> None:
-    """Make sure the reading_chat clip is on Tier 1 right now. No-op if
-    run_routed_comment already fired it; otherwise fires it (slow callers
-    that bypass the routed path still get a reading visual).
-
-    Used by dispatch helpers right before they spend time generating the
-    response — guarantees the avatar is visibly engaged while we work."""
-    if director is None:
-        return
-    if _reading_already_fired.get():
-        return
-    try:
-        await director.emit_reading_chat()
-        _reading_already_fired.set(True)
-        trace.phase("reading_chat_emitted_late")
-    except Exception:
-        logger.exception("[director] emit_reading_chat raised (non-fatal)")
-
-
-# Minimum visible duration of the reading_chat clip. If the entire response
-# pipeline (LLM + TTS + Wav2Lip) finishes faster than this, we hold the
-# reading visible for the remainder so the audience actually sees her read.
-# 1.5s is enough to register the pose change without feeling artificial.
-READING_CHAT_MIN_VISIBLE_MS = 1500
-
-
-async def _release_reading_chat(reading_started_at: float) -> None:
-    """Fade the reading_chat clip out and run the brief 'returning to
-    listening' idle pause. Honors a minimum visible duration so a fast
-    pipeline doesn't blink the reading state past the audience.
-
-    Called by dispatch helpers AFTER they've finished generating the
-    response (TTS done, Wav2Lip rendered, etc.) — at this point the
-    response is ready to play and we just need to gracefully transition
-    out of reading first."""
-    if director is None:
-        return
-    elapsed_ms = int((time.time() - reading_started_at) * 1000)
-    if elapsed_ms < READING_CHAT_MIN_VISIBLE_MS:
-        wait_ms = READING_CHAT_MIN_VISIBLE_MS - elapsed_ms
-        trace.phase("reading_chat_min_visible_pad", wait_ms=wait_ms,
-                    elapsed_ms=elapsed_ms)
-        await asyncio.sleep(wait_ms / 1000)
-    try:
-        await director.fade_to_idle()
-    except Exception:
-        logger.exception("[director] fade_to_idle raised (non-fatal)")
-    trace.phase("faded_to_idle")
-    await asyncio.sleep(0.3)
-    trace.phase("idle_pause_done", ms=300)
 
 
 async def _run_respond_locally(comment: str, args: dict, decision: dict) -> dict:
@@ -2855,20 +2019,12 @@ async def _run_respond_locally(comment: str, args: dict, decision: dict) -> dict
             logger.warning("[router] respond_locally file missing: %s — escalating", file_path)
             return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
 
-    # Make sure reading is visible (no-op if upstream already fired it),
-    # then immediately release + play. The classify+router lag upstream
-    # already gave the user a few seconds of reading visual.
-    reading_t0 = time.time()
-    await _ensure_reading_chat_visible()
-    await _release_reading_chat(reading_t0)
-
     # Stage the response via the Director so Tier 0/Tier 1 layering stays
     # intact. Fade to idle after the clip plays — we don't have ffprobe
     # probing on pre-rendered clips, so use a word-count estimate with a
     # small tail. Clips are short (1-2 sentences) so word count is fine.
     if director:
         await director.play_response(url)
-        trace.phase("local_clip_playing", url=url, words=len(text.split()))
         words = max(4, len(text.split()))
         play_ms = int(words * 350) + 400
 
@@ -2906,17 +2062,8 @@ async def _run_play_canned_clip(comment: str, args: dict, decision: dict) -> dic
 
     url = clip.get("url")
     script = clip.get("script", "")
-
-    # Same pattern as respond_locally — ensure reading visible, release.
-    reading_t0 = time.time()
-    await _ensure_reading_chat_visible()
-    await _release_reading_chat(reading_t0)
-
     if director:
         await director.play_response(url)
-        # `label` collides with trace.phase()'s own positional `label` arg
-        # (the phase name). Surface the bridge label as `clip_label` instead.
-        trace.phase("canned_clip_playing", clip_label=label, url=url)
         # Bridge clips are short (~2s). Fade after clip + tail.
         play_ms = (clip.get("ms") or 2500) + 400
 
@@ -3032,9 +2179,6 @@ async def api_build_carousel(
     stabilize: bool = Form(True),
     remove_skin: bool = Form(False),
     keep_central: bool = Form(True),
-    subject_continuity: bool = Form(True),
-    trim_head_seconds: float = Form(0.0),
-    trim_tail_seconds: float = Form(0.0),
 ):
     """Build a 3D-spin carousel from an uploaded video. Tweaks exposed for
     local debugging — defaults match the production pipeline."""
@@ -3049,9 +2193,6 @@ async def api_build_carousel(
             video_path, n_frames=n_frames, out_size=out_size,
             clean_bg=clean_bg, rembg_model=rembg_model, stabilize=stabilize,
             remove_skin=remove_skin, keep_central=keep_central,
-            subject_continuity=subject_continuity,
-            trim_head_seconds=trim_head_seconds,
-            trim_tail_seconds=trim_tail_seconds,
         )
     finally:
         Path(video_path).unlink(missing_ok=True)

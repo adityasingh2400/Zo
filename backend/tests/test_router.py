@@ -21,7 +21,6 @@ sys.path.insert(0, str(BACKEND))
 
 from agents import router  # noqa: E402
 
-
 # The demo product, trimmed to just the fields the router reads.
 WALLET = {
     "name": "Minimal Leather Wallet",

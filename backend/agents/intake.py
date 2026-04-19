@@ -9,11 +9,10 @@ Records a 10-second product video with voiceover, then:
 from __future__ import annotations
 
 import asyncio
-import json
+import base64
 import logging
 import subprocess
 import time
-import base64
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +57,7 @@ async def transcribe_with_gemma(audio_path: str) -> str:
     """Transcribe audio. Uses Deepgram Nova-3 (fast, proven from SwarmSell).
     Falls back to Ollama if no Deepgram key."""
     import os as _os
+
     import httpx
 
     DEEPGRAM_API_KEY = _os.getenv("DEEPGRAM_API_KEY", "")
@@ -221,8 +221,9 @@ async def _get_video_duration(video_path: str) -> float:
 
 def frames_to_base64(frames: list[tuple[int, bytes]]) -> list[str]:
     """Convert frame jpeg bytes to base64 strings, resized to 720px wide for fast inference."""
-    from PIL import Image
     from io import BytesIO
+
+    from PIL import Image
 
     result = []
     for _, data in frames:

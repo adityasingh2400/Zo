@@ -19,8 +19,9 @@ import asyncio
 import logging
 import random
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 from agents.bridge_clips import pick_bridge_clip
 
@@ -190,7 +191,7 @@ class Director:
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     # ── Core emit ──────────────────────────────────────────────────────────

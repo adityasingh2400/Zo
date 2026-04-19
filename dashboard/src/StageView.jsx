@@ -4,6 +4,8 @@ import { TikTokShopOverlay } from './components/TikTokShopOverlay';
 import { CostTicker } from './components/CostTicker';
 import { RoutingPanel } from './components/RoutingPanel';
 import { StartDemoOverlay } from './components/StartDemoOverlay';
+import { Spin3D } from './components/Spin3D';
+import { HeroGallery } from './components/HeroGallery';
 
 /**
  * StageView — the demo's full-screen surface.
@@ -57,6 +59,13 @@ export default function StageView() {
     productData, pitchVideoUrl, responseVideo, pendingComments,
     liveStage, routingDecisions, routingStats, wsRef, connected,
     audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
+    // 3D product viewer + hero carousel data — populated by the backend
+    // /api/build_carousel pipeline (auto-triggered by run_sell_pipeline
+    // on every video upload). Carries `frames` (48-angle stack for Spin3D)
+    // and `heroes` (4 best hero shots for HeroGallery), plus per-hero
+    // metadata. When null, the right bezel shows a placeholder slot so
+    // the layout reads as intentional even before the first product loads.
+    view3d, voiceState,
   } = useEmpireSocket();
   // `connected` flips false→true via ws.onopen — it's the trigger every
   // child WS-listening effect needs in its dep array (CostTicker,
@@ -189,6 +198,63 @@ export default function StageView() {
         minimalChrome={MINIMAL_STAGE}
       />
 
+      {/* Right bezel — 3D product viewer on top, hero carousel underneath.
+          Always rendered (not gated by MINIMAL_STAGE) since these ARE the
+          audience-facing product chrome on the demo stage: the spinning
+          carousel sells "we extracted this from your product video" and
+          the hero shots sell "and we picked the best 4 angles for you".
+          Both gracefully no-op when view3d is null (Spin3D returns null,
+          HeroGallery returns null) — the placeholder slot below shows
+          instead so the layout always reads as intentional.
+
+          Stacked variant (narrow viewports) parks the 3D viewer top-right
+          but skips the hero gallery (no room without overlapping the
+          phone frame). */}
+      {wideBezel ? (
+        <div style={styles.bezelRight}>
+          <div style={styles.spinSlot}>
+            {view3d ? (
+              <Spin3D
+                view={view3d}
+                height={300}
+                label={productData?.title || productData?.name}
+                state={voiceState || 'idle'}
+                theme="studio_dark"
+              />
+            ) : (
+              <div style={styles.spinPlaceholder}>
+                <span style={styles.placeholderIcon}>◎</span>
+                <div style={styles.placeholderLabel}>3D PRODUCT</div>
+                <div style={styles.placeholderSub}>
+                  drop a product video to populate
+                </div>
+              </div>
+            )}
+          </div>
+          {view3d?.heroes?.length > 0 && (
+            <div style={styles.heroSlot}>
+              <HeroGallery
+                heroes={view3d.heroes}
+                heroMeta={view3d.hero_meta || []}
+                theme="studio_dark"
+              />
+            </div>
+          )}
+        </div>
+      ) : (
+        <div style={styles.stackedSpinSlot}>
+          {view3d && (
+            <Spin3D
+              view={view3d}
+              height={180}
+              label={productData?.title || productData?.name}
+              state={voiceState || 'idle'}
+              theme="studio_dark"
+            />
+          )}
+        </div>
+      )}
+
       {/* Bezel chrome — lives in the black bars on either side of 9:16
           at projector widths (≥1280px). At narrower viewports it stacks
           along the top edge so it never overlaps the phone frame. All
@@ -262,6 +328,58 @@ const styles = {
   },
   bezelTopRight: {
     position: 'absolute', top: 24, right: 24, zIndex: 50,
+    pointerEvents: 'auto',
+  },
+  // Right-bezel column for product chrome (Spin3D + HeroGallery). At a
+  // 16:9 projector / 1920×1080 viewport, the centered 9:16 phone is
+  // ~607.5px wide, leaving ~656px on each side. We claim 360px of that
+  // (right-aligned, 24px margin) and stack the 3D viewer on top of the
+  // hero gallery. zIndex 40 sits below the bezel chrome (CostTicker /
+  // RoutingPanel at 50) and above the phone frame's own pills.
+  bezelRight: {
+    position: 'absolute', top: 24, right: 24, bottom: 24, zIndex: 40,
+    width: 360,
+    display: 'flex', flexDirection: 'column', gap: 14,
+    pointerEvents: 'auto',
+    overflow: 'hidden',
+  },
+  spinSlot: {
+    flexShrink: 0,
+    background: '#0a0a0c',
+    border: '1px solid #18181b',
+    borderRadius: 14,
+    overflow: 'hidden',
+  },
+  spinPlaceholder: {
+    height: 300, display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center', gap: 6,
+    color: '#52525b',
+    background: 'radial-gradient(circle at 50% 60%, #18181b, #09090b 78%)',
+  },
+  placeholderIcon: {
+    fontSize: 48, color: '#3f3f46', lineHeight: 1,
+    textShadow: '0 0 24px rgba(124,58,237,0.25)',
+  },
+  placeholderLabel: {
+    fontSize: 11, fontWeight: 800, letterSpacing: 2,
+    color: '#71717a', textTransform: 'uppercase',
+  },
+  placeholderSub: {
+    fontSize: 10, color: '#3f3f46', letterSpacing: 0.5,
+  },
+  heroSlot: {
+    flex: 1, minHeight: 0, overflow: 'auto',
+    background: '#0a0a0c',
+    border: '1px solid #18181b',
+    borderRadius: 14,
+    padding: 12,
+  },
+  // Narrow-viewport fallback. Just the Spin3D, parked top-right at a
+  // smaller height. Hero gallery is omitted since there's no room for
+  // a 2×2 grid without colliding with the phone frame.
+  stackedSpinSlot: {
+    position: 'absolute', top: 12, right: 12, zIndex: 40,
+    width: 220,
     pointerEvents: 'auto',
   },
   bezelBottomRight: {

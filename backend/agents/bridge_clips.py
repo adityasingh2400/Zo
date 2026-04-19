@@ -246,15 +246,9 @@ async def render_all(
     matching the (script, sha256) slug.
 
     `model_id` defaults to eleven_flash_v2_5 to keep the bridge voice
-    matching the rest of the avatar's audio (pitch + Q&A also flash). Tried
-    eleven_v3 with audio tags — better per-clip prosody but the timbre
-    drifted from the established avatar voice and read as "two different
-    people speaking" between bridges and the surrounding flash content.
-    See BRIDGE_SCRIPTS docstring above for the full rationale.
-
-    Pass model_id="eleven_v3" + re-add audio tags to BRIDGE_SCRIPTS if
-    you want to test the v3 path again. Both paths are wired correctly."""
-    from agents.seller import text_to_speech, render_pitch_latentsync
+    matching the rest of the avatar's audio (pitch + Q&A also flash).
+    Pass model_id="eleven_v3" to test alternative path."""
+    from agents.seller import render_pitch_latentsync, text_to_speech
 
     manifest = load_manifest()
     rendered = 0

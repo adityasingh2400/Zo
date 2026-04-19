@@ -118,65 +118,69 @@ Why on-device: Your product might be pre-launch. Sending photos to a cloud serve
 
 ---
 
-**AGENT 2: CREATOR (Content Factory)**
-*Runs on: Gemma 4 vision (on-device) + TripoSR (3D gen) + World Labs Marble API (3D world)*
+**AGENT 2: CREATOR (Content Factory)** — *v0 shipped*
+*Runs on: rembg (bg-strip) + PIL (compositing) + ffmpeg (video) on-device. Optional TripoSR on a GPU pod for 3D mesh.*
 
-Takes the product knowledge from EYES + camera frames. Generates:
-- 7 marketplace-ready product photos (multi-angle, white background, lifestyle context)
-- A 3D model of the product (TripoSR: single image to 3D mesh in 0.5 seconds)
-- A virtual showroom environment (World Labs: text to navigable 3D world in ~5 min)
-- Places the 3D product inside the 3D showroom (customers can explore)
-- A 30-second promo video with cuts, text overlays, and pacing
-- 3-5 short-form clips formatted for TikTok, Reels, Shorts
+Takes the product knowledge from EYES + one camera frame. Today (v0) generates in ~4s warm:
+- 3 marketplace photos at 1080×1920 (background-stripped PNG with alpha; white-bg listing variant; dark-canvas branded variant with name + price baked in as text overlay)
+- A 15-second 9:16 promo video — slideshow of the 3 photos, drops into TikTok / Reels / Shorts as-is
+- (Optional) a 3D mesh via TripoSR if a GPU pod is online
 
----
-
-**AGENT 3: SELLER (Live Commerce)**
-*Runs on: Gemma 4 on-device (brain) + HeyGen LiveAvatar or NVIDIA Audio2Face (face) + Sesame CSM (voice)*
-
-An AI avatar that goes live on TikTok/Instagram. It:
-- Knows everything EYES identified about the product
-- Talks naturally with human-quality voice (Sesame CSM — ums, pauses, emphasis)
-- Demonstrates features it saw through the camera ("Look at the stitching detail here")
-- Responds to live comments in real-time (Gemma 4 on-device reads comments, generates responses, avatar speaks them)
-- Handles objections ("Is it real leather?" — "Yes, full-grain leather. You can see the natural texture variation.")
-- Creates urgency, drives conversions
-- Runs 24/7. You sleep. SELLER sells.
+**Planned for later sprints:** generative photo variants (Vertex AI Imagen / Stability AI) for true lifestyle scenes; multiple short-form cuts beyond the single 15s slideshow; per-Q/A close-up photos (e.g., a leather-grain crop to play alongside the "is it real leather" answer).
 
 ---
 
-**AGENT 4: CLOSER (Customer Intelligence)**
-*Runs on: Gemma 4 on-device*
+**AGENT 3: SELLER (Live Commerce)** — *shipped (single platform: dashboard demo)*
+*Runs on: Gemma 4 on-device (classify) + rule-based router + ElevenLabs flash_v2_5 (TTS, cloud) + Wav2Lip on RunPod 5090 (lipsync) + pre-rendered MP4 cache for the local-first responses.*
 
-Handles all inbound DMs and messages across platforms. "When does it ship?" "Do you have it in blue?" "Can I return it?" — all answered instantly, in the seller's tone, in the buyer's language (140+). Escalates to the human only for genuine edge cases.
+An AI avatar that responds to viewer comments in real-time. Today it:
+- Knows everything EYES identified about the product (loaded from `products.json`)
+- Reads each comment, classifies it on-device (Gemma 4 via Cactus), routes via the 4-tool dispatcher
+- For routine questions matching the local Q/A index: plays a pre-rendered MP4 in <1s (90% of comments)
+- For novel questions: escalates to Bedrock Claude → TTS → live Wav2Lip render in ~5s
+- Handles objections + compliments via canned bridge clips, blocks spam silently
+
+**Today (limitations):** dashboard-only demo. Doesn't actually post to TikTok/Instagram chat — that integration is planned (Sprint 4 for TikTok Shop, separate sprints for IG / WhatsApp).
 
 ---
 
-**AGENT 5: BRAIN (Optimization Loop)**
-*Runs on: Gemma 4 on-device*
+**AGENT 4: CLOSER (Customer Intelligence)** — *planned (Sprint 4)*
+*Will run on: Gemma 4 on-device for classification + the same Q/A index SELLER uses, behind a per-platform webhook adapter.*
 
-Watches everything. Tracks what converts. Learns.
-- "Lifestyle photos convert 3x better than white background for this category"
-- "Mentioning the stitching detail increased add-to-cart by 40%"
-- "Comments about sizing come up in 60% of streams — address it proactively"
+Will handle inbound DMs across TikTok / Instagram / WhatsApp using the same on-device router as live comments. v0 (Sprint 4) ships single-platform via webhook + persistent thread state in BRAIN's SQLite. Per-platform integration is one sprint each.
 
-Feeds improvements back to CREATOR and SELLER in real-time. The system gets smarter every hour it runs.
+Today: no code shipped. Out-of-scope for the current demo.
+
+---
+
+**AGENT 5: BRAIN (Optimization Loop)** — *v0 shipped*
+*Runs on: SQLite (persistent telemetry) + Python aggregation, all on-device.*
+
+Persists every router decision (comment, classify type, tool dispatched, answer matched, was_local, cost saved, latency). Today (v0) the dashboard's BRAIN panel surfaces:
+- Cumulative cost saved + % local routing rate (the moat KPI, made visible)
+- Top matched Q/A entries — which answers do the work
+- Top "miss" tokens — recurring words in `escalate_to_cloud` comments, signaling which questions the local Q/A index is missing (the seller's authoring queue, generated automatically)
+
+**Planned (Sprint 4):** conversion event ingestion + conversion-aware Q/A keyword reranking (e.g., "`is_it_real_leather` correlates with add-to-cart 3× more than `warranty` for this product → boost its keyword priority"). That's the moat — accumulated conversion data per category becomes the proprietary layer once the platform has N sellers and M streams.
 
 ---
 
 ### The tech stack
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| Product understanding | Gemma 4 E4B on Cactus | See the product, understand it, generate knowledge base |
-| Voice interface | Gemma 4 native audio on Cactus | Understand voice commands, direct the swarm |
-| 3D product model | TripoSR | Single photo to 3D mesh in 0.5s |
-| Virtual showroom | World Labs Marble API | Text/image to navigable 3D gaussian splat world |
-| AI avatar face | HeyGen LiveAvatar API or NVIDIA Audio2Face-3D | Real-time photorealistic talking avatar |
-| AI avatar voice | Sesame CSM (open source, 1B params) | Human-quality speech with emotion and natural disfluencies |
-| Agent coordination | CrewAI or custom swarm | Multi-agent orchestration |
-| Content generation | On-device Gemma 4 + cloud image gen | Product photos, videos, clips |
-| Comment handling | Gemma 4 on Cactus | Real-time understanding and response generation |
+| Component | Technology | Status | Purpose |
+|-----------|-----------|--------|---------|
+| Voice transcription | whisper-base via Cactus (on-device) | shipped | Push-to-talk → text. ~244ms on Mac, ~390ms on iPhone A15. |
+| Comment classification | Gemma 4 E4B via Cactus (on-device) | shipped | Comment → {question/compliment/objection/spam}. 2-4s on CPU prefill; <500ms target on the upcoming Cactus NPU mlpackage. |
+| Comment routing | Rule-based 4-tool dispatcher in Python | shipped | 0ms decide. Deterministic. 17 unit tests. |
+| Pre-rendered local response | ElevenLabs flash_v2_5 (TTS) + Wav2Lip on RunPod 5090 (lipsync) | shipped | Rendered once per Q/A entry; played instantly at runtime (<1s). |
+| Cloud-escalate response | Bedrock Claude Haiku + ElevenLabs + Wav2Lip live render | shipped (path); AWS keys optional for the demo | For comments outside the local Q/A index. ~5s warm. |
+| Pre-rendered pitch | LatentSync 1.6 on RunPod | shipped | Studio-grade lipsync for the once-per-product opening pitch (~50s render, played once). |
+| Photo + promo gen (CREATOR) | rembg + PIL + ffmpeg (on-device) | shipped (v0) | 3 photos + 15s 9:16 slideshow. ~4s warm. |
+| 3D product model | TripoSR on RunPod | scaffolded | Single photo → GLB mesh. Server present in repo; not deployed in current pod config. |
+| Telemetry + aggregation (BRAIN) | SQLite (on-device) | shipped (v0) | Every routed comment persisted; dashboard panel shows top-matched answers + miss-token authoring queue. |
+| DM auto-responder (CLOSER) | webhook + same on-device router | **planned (Sprint 4)** | Inbox → router → response, one platform at a time. |
+| Generative photo variants | Vertex AI Imagen or Stability AI | **planned** | Lifestyle scene composition. Skipped in v0 (no API keys today). |
+| 3D world / virtual showroom | World Labs Marble | **dropped from roadmap** | Removed from pitch — no integration plan, marginal value vs. the GLB mesh. |
 
 ### Why on-device (Gemma 4 + Cactus) is core, not cosmetic
 

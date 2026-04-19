@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const WS_URL = `ws://${window.location.hostname}:8000/ws/dashboard`;
+// Backend's /ws/dashboard requires `?token=<value>` when WS_SHARED_SECRET
+// is set in backend .env (Sprint 2.6). We forward VITE_WS_TOKEN if defined;
+// blank token is fine in dev mode (backend default-allows when secret unset).
+const WS_TOKEN = import.meta.env?.VITE_WS_TOKEN || '';
+const WS_URL = `ws://${window.location.hostname}:8000/ws/dashboard`
+  + (WS_TOKEN ? `?token=${encodeURIComponent(WS_TOKEN)}` : '');
 // Live-mode states: how the dashboard chrome interprets `status`.
 // idle → analyzing/creating (INTRO) → selling/live (PITCH/LIVE), with BRIDGE
 // inserted whenever a comment response is mid-flight.
@@ -287,6 +292,21 @@ export function useEmpireSocket() {
                 source: 'audience', username: msg.username || 'guest',
               }];
             });
+          }
+          break;
+        case 'force_phase':
+          // TransportControls fired POST /api/director/force_phase. Backend
+          // broadcasts this event with the target phase so every connected
+          // dashboard updates in sync (not just the one that clicked).
+          if (msg.phase && LIVE_STAGES.includes(msg.phase)) {
+            setLiveStage(msg.phase);
+          }
+          break;
+        case 'on_air':
+          // Operator pressed On Air. Currently soft (doesn't gate pipeline)
+          // — Item 5 wires distribution fanout to this flag.
+          if (typeof msg.on === 'boolean') {
+            setStatus(msg.on ? 'live' : 'idle');
           }
           break;
         case 'voice_transcript':

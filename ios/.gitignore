@@ -15,7 +15,9 @@ libcurl.xcframework/
 libs/
 
 # Bundled model weights — 700+ MB, regenerate via `cactus download`
+# Old path (pre-HANDOFF.md note 2 reorg) + new path (current).
 EmpirePhone/Models/
+Models/
 
 # Bundled response MP4s — mirror of backend/local_answers/ + phase0 bridges.
 # Regenerate by copying from the repo root:

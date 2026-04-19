@@ -29,3 +29,6 @@ backend/local_answers/
 # every pitch (pitches reuse this same dir with a `pitch_dispatch_` prefix).
 backend/response_audio/
 *.log
+
+# Runtime SQLite stores (BRAIN telemetry, future per-stream state)
+*.db

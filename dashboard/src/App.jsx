@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
+import { useEffect } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { LiveStage } from './components/LiveStage';
 import { ProductPanel } from './components/ProductPanel';
@@ -6,43 +7,61 @@ import { AgentLog } from './components/AgentLog';
 import { ChatPanel } from './components/ChatPanel';
 import { VoiceMic } from './components/VoiceMic';
 import { RoutingPanel } from './components/RoutingPanel';
-import { StartDemoOverlay } from './components/StartDemoOverlay';
+import { BrainPanel } from './components/BrainPanel';
+import { ProductSelector } from './components/ProductSelector';
+import { CreatorPanel } from './components/CreatorPanel';
+import { StudioSidebar } from './components/StudioSidebar';
+import { MetricsStrip } from './components/MetricsStrip';
+import { TransportControls } from './components/TransportControls';
+import { AvatarRail } from './components/AvatarRail';
+import { PipelineStrip } from './components/PipelineStrip';
+import { DistributionToggles } from './components/DistributionToggles';
 
 export default function App() {
   const {
-    connected, productData, productPhoto,
+    connected, status, productData, productPhoto,
     agentLog, transcript, sendComment,
-    pitchVideoUrl, responseVideo, liveStage, pendingComments,
+    pitchVideoUrl, responseVideo, liveStage, setLiveStage, pendingComments,
     view3d, transcriptExtract, voiceTranscript,
     routingDecisions, routingStats,
-    audioResponse, setAudioResponse, pitchAudio, setPitchAudio,
     wsRef,
   } = useEmpireSocket();
-
-  // When audio playback ends, parent clears the matching slot so a stale
-  // payload doesn't auto-replay if the same audio element is reused.
-  const handleAudioEnded = (kind) => {
-    if (kind === 'pitch') setPitchAudio(null);
-    else setAudioResponse(null);
-  };
 
   const [sellInput, setSellInput] = useState('sell this for $49');
   const [dragging, setDragging] = useState(false);
   const [showTelemetry, setShowTelemetry] = useState(false);
 
-  // Visibility (Lidwell p202): the close button's tooltip already promised
-  // Esc would close the overlay, but there was no actual handler — a silent
-  // mismatch between system status and what the UI claims. Wire it for real
-  // and (below) surface the hint as a visible kbd chip rather than hiding
-  // it in a hover-only tooltip (Recognition Over Recall, p164).
+  // Control Room mode — Item 2. Flag-gated layout rebuild to match the
+  // empire-mac.jsx mockup. localStorage default is 'off' so everyone who
+  // doesn't opt in gets the existing cinema grid. Flip via the top-right
+  // toggle button (added below).
+  const [controlRoomMode, setControlRoomMode] = useState(() => {
+    return localStorage.getItem('CONTROL_ROOM_MODE') === 'on';
+  });
+  const [sidebarSelection, setSidebarSelection] = useState('live');
+
+  function toggleControlRoom() {
+    const next = !controlRoomMode;
+    localStorage.setItem('CONTROL_ROOM_MODE', next ? 'on' : 'off');
+    setControlRoomMode(next);
+  }
+
+  // Control Room is a viewport-bounded layout. Without this the body can
+  // still scroll if any sub-child temporarily overflows (e.g. ops stack
+  // before internal auto-scroll engages). Lock html/body overflow while
+  // Control Room mode is active; restore on flip back to Legacy.
   useEffect(() => {
-    if (!showTelemetry) return;
-    function onKey(e) {
-      if (e.key === 'Escape') setShowTelemetry(false);
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    const prevBodyOverflow = document.body.style.overflow;
+    if (controlRoomMode) {
+      document.documentElement.style.overflow = 'hidden';
+      document.body.style.overflow = 'hidden';
     }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [showTelemetry]);
+    return () => {
+      document.documentElement.style.overflow = prevHtmlOverflow;
+      document.body.style.overflow = prevBodyOverflow;
+    };
+  }, [controlRoomMode]);
 
   async function uploadFile(file) {
     const formData = new FormData();
@@ -63,16 +82,15 @@ export default function App() {
 
   return (
     <div
-      style={{ ...styles.app, ...(dragging ? styles.appDragging : {}) }}
+      style={{
+        ...styles.app,
+        ...(controlRoomMode ? styles.appControlRoom : {}),
+        ...(dragging ? styles.appDragging : {}),
+      }}
       onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
       onDragLeave={() => setDragging(false)}
       onDrop={handleDrop}
     >
-      {/* One-time autoplay-unlock ceremony so audio-first <audio> elements
-          created at WS-message time can play without browser policy blocking.
-          See REVISIONS §3 in the design doc. */}
-      <StartDemoOverlay />
-
       {dragging && (
         <div style={styles.dropOverlay}>
           <span style={{ fontSize: 64 }}>🎬</span>
@@ -83,12 +101,23 @@ export default function App() {
       {/* Header */}
       <header style={styles.header}>
         <div style={styles.headerLeft}>
-          <h1 style={styles.logo}>Zo</h1>
+          <h1 style={styles.logo}>EMPIRE</h1>
         </div>
       </header>
 
-      {/* Floating top-right: telemetry button + connection status */}
+      {/* Floating top-right: layout toggle + telemetry button + connection status */}
       <div style={styles.floatingTopRight}>
+        <button
+          type="button"
+          onClick={toggleControlRoom}
+          style={{
+            ...styles.telemetryButton,
+            ...(controlRoomMode ? styles.telemetryButtonActive : {}),
+          }}
+          title="Toggle Control Room layout (mockup-driven)"
+        >
+          {controlRoomMode ? '↩︎ Legacy' : '⚙ Control Room'}
+        </button>
         <button
           type="button"
           onClick={() => setShowTelemetry(true)}
@@ -100,86 +129,121 @@ export default function App() {
             <span style={styles.telemetryBadge}>{routingStats.total}</span>
           )}
         </button>
-        {/* Highlighting (Lidwell p108): keep highlighted content under ~10%
-            of the surface or the highlight loses meaning. CONNECTED is the
-            expected resting state — it does not deserve loud green type and
-            a glowing dot every second of the demo. The pill stays small and
-            quiet at rest; only DISCONNECTED gets the full red flare, because
-            that is the one state the operator needs to act on (Signal-to-
-            Noise Ratio, p182: maximize signal, minimize decoration). */}
-        <div
-          style={{
-            ...styles.connectionPill,
-            ...(connected
-              ? styles.connectionPillIdle
-              : styles.connectionPillAlert),
-          }}
-        >
-          <div
-            style={{
-              ...styles.connectionDot,
-              background: connected ? '#22c55e' : '#ef4444',
-              boxShadow: connected ? 'none' : '0 0 10px #ef4444',
-            }}
-          />
-          {connected ? (
-            <span style={styles.connectionLabelIdle}>live</span>
-          ) : (
-            <span style={styles.connectionLabelAlert}>DISCONNECTED</span>
-          )}
+        <div style={styles.connectionPill}>
+          <div style={{
+            ...styles.connectionDot,
+            background: connected ? '#22c55e' : '#ef4444',
+            boxShadow: connected ? '0 0 8px #22c55e' : '0 0 8px #ef4444',
+          }} />
+          <span style={{ color: connected ? '#22c55e' : '#ef4444', fontSize: 12, fontWeight: 700, letterSpacing: 1 }}>
+            {connected ? 'CONNECTED' : 'DISCONNECTED'}
+          </span>
         </div>
       </div>
 
-      {/* Demo Controls */}
-      <div style={styles.controls}>
-        <input
-          value={sellInput}
-          onChange={e => setSellInput(e.target.value)}
-          style={styles.sellInput}
-          placeholder='e.g. "sell this for $49 targeting young professionals"'
-        />
-        <VoiceMic voiceTranscript={voiceTranscript} wsRef={wsRef} />
-        <label style={styles.uploadLabel}>
-          🎬 Upload Video
+      {/* Demo Controls — hidden in Control Room mode (it has its own nav +
+           the mockup doesn't include this kind of demo-ops row). Flip back
+           to Legacy to regain the controls. */}
+      {!controlRoomMode && (
+        <div style={styles.controls}>
+          <ProductSelector />
           <input
-            type="file" accept="video/*" style={{ display: 'none' }}
-            onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            value={sellInput}
+            onChange={e => setSellInput(e.target.value)}
+            style={styles.sellInput}
+            placeholder='e.g. "sell this for $49 targeting young professionals"'
           />
-        </label>
-        <label style={styles.uploadLabel}>
-          📷 Photo
-          <input
-            type="file" accept="image/*" style={{ display: 'none' }}
-            onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
-          />
-        </label>
-      </div>
+          <VoiceMic voiceTranscript={voiceTranscript} />
+          <label style={styles.uploadLabel}>
+            🎬 Upload Video
+            <input
+              type="file" accept="video/*" style={{ display: 'none' }}
+              onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            />
+          </label>
+          <label style={styles.uploadLabel}>
+            📷 Photo
+            <input
+              type="file" accept="image/*" style={{ display: 'none' }}
+              onChange={async (e) => { const f = e.target.files[0]; if (f) await uploadFile(f); }}
+            />
+          </label>
+        </div>
+      )}
 
-      {/* Cinema Layout: big stage on the left, sidebar on the right */}
-      <div style={styles.cinemaGrid}>
-        <div style={styles.stageCol}>
-          <LiveStage
-            productData={productData}
-            pitchVideoUrl={pitchVideoUrl}
-            responseVideo={responseVideo}
-            pendingComments={pendingComments}
-            liveStage={liveStage}
-            wsRef={wsRef}
-            connected={connected}
-            audioResponse={audioResponse}
-            pitchAudio={pitchAudio}
-            onAudioEnded={handleAudioEnded}
+      {controlRoomMode ? (
+        // ── Control Room layout (Item 2, mockup-driven) ─────────────────
+        <div style={styles.controlRoomShell}>
+          <StudioSidebar
+            selectedId={sidebarSelection}
+            onSelect={setSidebarSelection}
           />
+          <main style={styles.controlRoomMain}>
+            <MetricsStrip
+              stage={liveStage}
+              routingStats={routingStats}
+              agentLog={agentLog}
+            />
+            <TransportControls stage={liveStage} />
+            <div style={styles.controlRoomStageRow}>
+              <AvatarRail />
+              <div style={styles.controlRoomStage}>
+                <LiveStage
+                  productData={productData}
+                  pitchVideoUrl={pitchVideoUrl}
+                  responseVideo={responseVideo}
+                  pendingComments={pendingComments}
+                  liveStage={liveStage}
+                  wsRef={wsRef}
+                />
+              </div>
+              <div style={styles.controlRoomOps}>
+                <ProductPanel
+                  productData={productData}
+                  productPhoto={productPhoto}
+                  transcript={transcript}
+                  view3d={view3d}
+                  transcriptExtract={transcriptExtract}
+                  wsRef={wsRef}
+                />
+                <PipelineStrip agentLog={agentLog} />
+                <DistributionToggles />
+              </div>
+            </div>
+            <div style={styles.controlRoomBottomRow}>
+              <ChatPanel
+                onSendComment={sendComment}
+                commentResponse={responseVideo}
+                pendingComments={pendingComments}
+              />
+              <AgentLog log={agentLog} />
+            </div>
+          </main>
         </div>
-        <div style={styles.sideCol}>
-          <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} connected={connected} />
-          <ChatPanel
-            onSendComment={sendComment}
-            commentResponse={responseVideo}
-            pendingComments={pendingComments}
-          />
+      ) : (
+        // ── Legacy cinema grid ─────────────────────────────────────────
+        <div style={styles.cinemaGrid}>
+          <div style={styles.stageCol}>
+            <LiveStage
+              productData={productData}
+              pitchVideoUrl={pitchVideoUrl}
+              responseVideo={responseVideo}
+              pendingComments={pendingComments}
+              liveStage={liveStage}
+              wsRef={wsRef}
+            />
+          </div>
+          <div style={styles.sideCol}>
+            <ProductPanel productData={productData} productPhoto={productPhoto} transcript={transcript} view3d={view3d} transcriptExtract={transcriptExtract} wsRef={wsRef} />
+            <CreatorPanel />
+            <ChatPanel
+              onSendComment={sendComment}
+              commentResponse={responseVideo}
+              pendingComments={pendingComments}
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Telemetry overlay — click "◎ Telemetry" to open */}
       {showTelemetry && (
@@ -187,27 +251,21 @@ export default function App() {
           <div style={styles.telemetryPanel}>
             <div style={styles.telemetryHeader}>
               <h2 style={styles.telemetryTitle}>Telemetry</h2>
-              {/* Recognition Over Recall (Lidwell p164) + Visibility (p202):
-                  show the keyboard escape hatch as a visible kbd chip rather
-                  than burying it in a hover-only tooltip. The chip is the
-                  affordance — clicking the X works, pressing Esc works, and
-                  the user can see both options without having to remember
-                  or hover-discover them. */}
-              <div style={styles.telemetryCloseGroup}>
-                <kbd style={styles.escKbd}>Esc</kbd>
-                <button
-                  type="button"
-                  onClick={() => setShowTelemetry(false)}
-                  style={styles.telemetryClose}
-                  aria-label="Close telemetry (Escape)"
-                >
-                  ✕
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowTelemetry(false)}
+                style={styles.telemetryClose}
+                title="Close (Esc)"
+              >
+                ✕
+              </button>
             </div>
             <div style={styles.telemetryBody}>
               <div style={styles.telemetryCol}>
                 <RoutingPanel routingDecisions={routingDecisions} routingStats={routingStats} />
+              </div>
+              <div style={styles.telemetryCol}>
+                <BrainPanel />
               </div>
               <div style={styles.telemetryCol}>
                 <AgentLog log={agentLog} />
@@ -230,6 +288,11 @@ const styles = {
     minHeight: '100vh', display: 'flex', flexDirection: 'column',
     padding: 16, gap: 12, maxWidth: 1600, margin: '0 auto',
   },
+  // Viewport-bounded variant — applied when Control Room is on, so the
+  // sidebar-driven layout fits without scrolling the outer page.
+  appControlRoom: {
+    height: '100vh', overflow: 'hidden',
+  },
   header: {
     display: 'flex', alignItems: 'center', padding: '8px 0',
   },
@@ -244,31 +307,12 @@ const styles = {
     display: 'flex', alignItems: 'center', gap: 10,
   },
   connectionPill: {
-    display: 'flex', alignItems: 'center', gap: 6,
+    display: 'flex', alignItems: 'center', gap: 8,
     background: 'rgba(15,15,18,0.8)', backdropFilter: 'blur(8px)',
-    borderRadius: 999,
-    transition: 'border-color 200ms ease, padding 200ms ease',
-  },
-  connectionPillIdle: {
-    border: '1px solid #27272a',
-    padding: '4px 10px',
-  },
-  connectionPillAlert: {
-    // The one case the operator must notice, so the pill earns the loud
-    // border + breathing glow. (Highlighting, p108.)
-    border: '1px solid rgba(239,68,68,0.6)',
+    border: '1px solid #27272a', borderRadius: 999,
     padding: '6px 12px',
-    boxShadow: '0 0 18px rgba(239,68,68,0.35)',
-    animation: 'pulse 1.6s ease-in-out infinite',
   },
-  connectionDot: { width: 7, height: 7, borderRadius: 4 },
-  connectionLabelIdle: {
-    color: '#71717a', fontSize: 10, fontWeight: 700, letterSpacing: 1,
-    textTransform: 'lowercase',
-  },
-  connectionLabelAlert: {
-    color: '#ef4444', fontSize: 12, fontWeight: 800, letterSpacing: 1,
-  },
+  connectionDot: { width: 8, height: 8, borderRadius: 4 },
   controls: {
     display: 'flex', gap: 8, padding: '0 0 8px',
   },
@@ -288,9 +332,12 @@ const styles = {
   },
   stageCol: { display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, minWidth: 0 },
   sideCol: {
-    // Two rows: ProductPanel, ChatPanel. Telemetry (routing + agent log)
-    // lives in a separate overlay opened via the header button.
-    display: 'grid', gridTemplateRows: 'minmax(0, 1fr) minmax(0, 1.2fr)',
+    // Three rows: ProductPanel (product info), CreatorPanel (one-click demo),
+    // ChatPanel (comments). Telemetry overlay has Routing + BRAIN + AgentLog.
+    // CreatorPanel is compact when idle (~80px tall) and scrolls internally
+    // after a build, so ChatPanel gets the most room for comment history.
+    display: 'grid',
+    gridTemplateRows: 'minmax(0, 0.9fr) minmax(0, 0.8fr) minmax(0, 1.1fr)',
     gap: 12, minHeight: 0, minWidth: 0,
   },
   telemetryButton: {
@@ -300,6 +347,42 @@ const styles = {
     padding: '6px 12px', fontSize: 12, fontWeight: 700,
     letterSpacing: 1, cursor: 'pointer',
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  },
+  telemetryButtonActive: {
+    background: '#22c55e', color: '#09090b',
+    borderColor: '#22c55e',
+  },
+  // Control Room layout (Item 2)
+  controlRoomShell: {
+    flex: 1, display: 'flex',
+    minHeight: 0, gap: 0,
+    background: '#fbfbfd',
+    borderRadius: 12, overflow: 'hidden',
+    border: '1px solid #18181b',
+  },
+  controlRoomMain: {
+    flex: 1, display: 'flex', flexDirection: 'column',
+    padding: '14px 16px 16px', gap: 12,
+    minWidth: 0, minHeight: 0, overflow: 'hidden',
+    fontFamily: '-apple-system, "SF Pro Text", "Inter", system-ui, sans-serif',
+    color: '#1d1d1f',
+  },
+  controlRoomStageRow: {
+    display: 'grid',
+    gridTemplateColumns: '128px 1fr minmax(0, 360px)',
+    gap: 12, minHeight: 0, flex: 1, overflow: 'hidden',
+  },
+  controlRoomStage: {
+    minHeight: 0, minWidth: 0,
+    display: 'flex', alignItems: 'stretch', justifyContent: 'center',
+  },
+  controlRoomOps: {
+    display: 'flex', flexDirection: 'column', gap: 12,
+    minHeight: 0, minWidth: 0, overflowY: 'auto',
+  },
+  controlRoomBottomRow: {
+    display: 'grid', gridTemplateColumns: '1fr 1.5fr',
+    gap: 12, height: 200, flexShrink: 0,
   },
   telemetryBadge: {
     background: '#22c55e', color: '#09090b', borderRadius: 999,
@@ -326,17 +409,6 @@ const styles = {
     margin: 0, fontSize: 18, fontWeight: 800, letterSpacing: 2,
     textTransform: 'uppercase', color: '#fafafa',
   },
-  telemetryCloseGroup: {
-    display: 'flex', alignItems: 'center', gap: 8,
-  },
-  escKbd: {
-    display: 'inline-block', minWidth: 28, padding: '3px 8px',
-    background: '#18181b', border: '1px solid #3f3f46',
-    borderRadius: 5, fontSize: 11, fontWeight: 700,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    textAlign: 'center', color: '#a1a1aa',
-    letterSpacing: 0.5,
-  },
   telemetryClose: {
     background: 'transparent', color: '#a1a1aa',
     border: '1px solid #3f3f46', borderRadius: 8,
@@ -345,7 +417,7 @@ const styles = {
   },
   telemetryBody: {
     flex: 1, display: 'grid',
-    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)',
     gap: 14, padding: 14, minHeight: 0,
   },
   telemetryCol: { minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' },

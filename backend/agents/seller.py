@@ -1,21 +1,28 @@
-import json
-import base64
 import asyncio
+import json
 import logging
 import re
 import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
+
 import boto3
 import httpx
 from elevenlabs import ElevenLabs
-from pathlib import Path
+
+from agents import _spend
 from config import (
-    AWS_REGION, BEDROCK_MODEL_ID,
-    ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID,
-    RUNPOD_POD_IP, RUNPOD_LIVETALKING_PORT,
-    WAV2LIP_URL, LATENTSYNC_URL, POD_SPEAKING_1080P,
+    AWS_REGION,
+    BEDROCK_MODEL_ID,
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_VOICE_ID,
+    LATENTSYNC_URL,
+    POD_SPEAKING_1080P,
+    RUNPOD_LIVETALKING_PORT,
+    RUNPOD_POD_IP,
+    WAV2LIP_URL,
 )
 
 logger = logging.getLogger("empire.seller")
@@ -88,48 +95,22 @@ async def generate_comment_response(
     comment: str, product_data: dict, comment_type: str = "question"
 ) -> str:
     """Generate a natural response to a viewer comment via Claude on Bedrock.
-
-    Tuned for the judge-item demo: comments arrive about whatever the
-    judge handed up (or about the seller, the stream, anything). product_
-    data may be missing entire fields. Reply must:
-      • Sound spoken, not written (we TTS this immediately)
-      • Hit ≤12 words so it lands in <4 seconds of audio
-      • Never invent specific facts (price, material, dimensions) that
-        aren't in product_data — those become wrong-on-stage moments
-      • Sound confident, not hedgy ("I think", "maybe", "not sure" all banned)
-    """
-    # Render a compact context line so Claude sees what we DO know without
-    # being misled by junk fields. {} => empty product context => seller
-    # answers from a generic livestream-host POV.
-    pd = product_data or {}
-    known_fields = []
-    for k in ("name", "price", "category", "materials", "sizing", "color",
-              "shipping", "returns", "warranty", "target_audience"):
-        v = pd.get(k)
-        if v:
-            known_fields.append(f"  {k}: {v}")
-    known_block = "\n".join(known_fields) if known_fields else "  (no product details — answer in-character as a livestream seller; if the comment asks for a specific spec we don't know, say something honest like 'great question, ping me after the stream and I'll send you the deck')"
+    Guarded by BEDROCK_USD_PER_MIN_CAP — if the rolling 1-min spend would
+    exceed it, returns a graceful placeholder instead of placing the call."""
+    if not _spend.check("bedrock", _spend.EST_BEDROCK_COMMENT_RESPONSE_USD):
+        return "Hold on a sec — let me think about that one."
 
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 60,
         "messages": [{
             "role": "user",
-            "content": f"""You are a TikTok Shop livestream seller answering a viewer comment in real time. Reply in ONE short spoken sentence (≤12 words, ≤4 seconds out loud).
-
+            "content": f"""You are an AI sales avatar on a livestream.
 Viewer comment: "{comment}"
-Comment type: {comment_type}
+Product: {json.dumps(product_data)[:400]}
 
-What you know about the product:
-{known_block}
-
-Rules — non-negotiable:
-- ONE sentence. Spoken dialogue only. No preamble.
-- Do NOT start with "Great question", "Thanks for asking", or any hedge.
-- Do NOT invent specifics (prices, materials, weight, country-of-origin, anything) that aren't in the product context above.
-- Sound confident and warm. Match seller energy — playful is fine, robotic is not.
-- If the comment is a compliment: respond like a seller, not a chatbot ("aww you're so sweet", "literally my favorite too", etc.)
-- If the question genuinely can't be answered from the context: pivot honestly to what you DO know about the item, OR direct them to DM you. Never bluff.""",
+Reply in ONE short sentence (max 15 words). Spoken dialogue only.
+No preamble, no stage directions, no hedging like "Great question". Start with the answer.""",
         }],
     })
 
@@ -140,6 +121,7 @@ Rules — non-negotiable:
         accept="application/json",
         body=body,
     )
+    _spend.record("bedrock", _spend.EST_BEDROCK_COMMENT_RESPONSE_USD)
     result = json.loads(response["body"].read())
     return result["content"][0]["text"]
 
@@ -301,34 +283,20 @@ def _eleven_tts_sync(
     voice_id: str | None = None,
     *,
     model_id: str | None = None,
+    language_code: str = "en",
 ) -> bytes:
     """Sync ElevenLabs TTS call. Wrapped via asyncio.to_thread so the
-    event loop isn't blocked while audio bytes are being generated +
-    streamed; the WS broadcast for play_clip events can interleave.
+    event loop isn't blocked while audio bytes are being generated.
 
-    Default model is eleven_flash_v2_5 (~75ms inference, ~400ms TTFB).
-    That's the right pick for the live escalate path where every ms of
-    latency between mic-release and audio-out is felt by the viewer.
+    Default model is eleven_flash_v2_5 (~75ms inference) — multilingual,
+    29 languages. Pass model_id="eleven_v3" for pre-rendered tiers
+    (bridge clips) that benefit from inline audio tags.
 
-    Pass `model_id="eleven_v3"` for pre-rendered tiers (bridge clips,
-    pre-rendered Q&A, pitch). v3 has >1s inference but honours inline
-    audio tags ([curious], [pauses], [laughs softly], [excited], etc.)
-    that make the voice read as a person reacting, not a chatbot. The
-    extra latency is paid offline at render time, so viewers never feel
-    it. See backend/agents/bridge_clips.BRIDGE_SCRIPTS for tag usage.
-
-    Per-model parameter shaping:
-      - language_code='en' locks Flash to English. Flash is multilingual
-        and auto-detects, but edge cases (mostly-numeric scripts, brand
-        names, ASCII art in product descriptions) flip detection and
-        produce phonetically-warped output that reads as gibberish.
-      - v3 deliberately drops language_code so the model can interpret
-        accent tags ([British accent], etc.) and multi-language inserts
-        without a hard lock fighting the script.
-      - v3 outputs at 192kbps (Creator+ tier; we have the grant) since
-        the render is already slow and the bitrate cost is invisible
-        on disk.
-    """
+    language_code defaults to 'en' to lock auto-detection (avoids
+    gibberish on mostly-numeric / brand-heavy text). Non-English
+    callers (Item 6 multi-language path) pass the target code
+    explicitly AFTER running text through translator.translate().
+    Dropped on v3 so accent tags can interpret naturally."""
     chosen_model = model_id or "eleven_flash_v2_5"
     kwargs: dict = {
         "text": text,
@@ -339,7 +307,7 @@ def _eleven_tts_sync(
         kwargs["output_format"] = "mp3_44100_192"
     else:
         kwargs["output_format"] = "mp3_44100_128"
-        kwargs["language_code"] = "en"
+        kwargs["language_code"] = language_code
     audio_gen = eleven.text_to_speech.convert(**kwargs)
     return b"".join(audio_gen)
 
@@ -722,6 +690,7 @@ async def text_to_speech(
     *,
     voice: str | None = None,
     model_id: str | None = None,
+    language_code: str = "en",
     return_word_timings: bool = False,
 ) -> bytes | tuple[bytes, list[dict]]:
     """ElevenLabs TTS. Default model flash_v2_5 = ~400ms TTFB for a
@@ -744,50 +713,51 @@ async def text_to_speech(
     the env.
 
     `model_id` overrides eleven_flash_v2_5. Pass "eleven_v3" for the
-    pre-rendered expressive tier (audio tags honoured). See
-    `_eleven_tts_sync` docstring for the full tiering rationale.
+    pre-rendered expressive tier (audio tags honoured).
+
+    `language_code` (Item 6) specifies the target language for TTS.
+    Callers should pre-translate `text` via translator.translate() before
+    calling with a non-English code — ElevenLabs expects already-translated
+    content and speaks it in the specified language's phonology.
     """
-    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, model=%s, timings=%s, eleven=%s)",
+    logger.info("[TTS] text_to_speech (text: %d chars, voice=%s, model=%s, lang=%s, timings=%s, eleven=%s)",
                 len(text), voice or "default", model_id or "default(flash)",
-                return_word_timings, "yes" if eleven else "no")
+                language_code, return_word_timings, "yes" if eleven else "no")
     if not eleven:
         if return_word_timings:
             return b"", []
         return b""
 
+    if not _spend.check("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD):
+        if return_word_timings:
+            return b"", []
+        return b""
+
     if return_word_timings:
-        # Real per-character timings via /with-timestamps. ~50-100ms
-        # higher TTFB than convert() because the response is a single
-        # JSON blob, not a streaming generator. Worth it for precise
-        # karaoke sync; live path doesn't request timings unless karaoke
-        # actually needs them.
+        # Real per-character timings via /with-timestamps for ~10ms karaoke
+        # sync accuracy. Falls back to synthesized timings on API error.
         try:
             audio_bytes, word_timings = await asyncio.to_thread(
                 _eleven_tts_with_timestamps_sync, text, voice, model_id=model_id,
             )
-            if audio_bytes and word_timings:
-                logger.info("[TTS] real timings: %d words from API alignment",
-                            len(word_timings))
-                return audio_bytes, word_timings
-            # API returned audio but no alignment (rare, model-specific).
-            # Fall through to synthesize against measured duration so
-            # karaoke still tracks.
             if audio_bytes:
-                duration_ms = await asyncio.to_thread(
-                    _probe_audio_duration_ms, audio_bytes,
-                )
+                _spend.record("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD)
+                if word_timings:
+                    logger.info("[TTS] real timings: %d words from API alignment", len(word_timings))
+                    return audio_bytes, word_timings
+                duration_ms = await asyncio.to_thread(_probe_audio_duration_ms, audio_bytes)
                 synth = synthesize_word_timings(text, duration_ms)
-                logger.info("[TTS] API alignment empty; synthesized %d words "
-                            "over %s ms", len(synth),
-                            duration_ms if duration_ms else "(estimate)")
+                logger.info("[TTS] API alignment empty; synthesized %d words over %s ms",
+                            len(synth), duration_ms if duration_ms else "(estimate)")
                 return audio_bytes, synth
             return b"", []
         except Exception as e:
-            logger.warning("[TTS] with_timestamps failed (%s) — falling back to "
-                           "convert() + synthesize", e)
-            # Fall through to the convert() path below, then synthesize.
+            logger.warning("[TTS] with_timestamps failed (%s) — falling back to convert()", e)
 
-    audio_bytes = await asyncio.to_thread(_eleven_tts_sync, text, voice, model_id=model_id)
+    audio_bytes = await asyncio.to_thread(
+        _eleven_tts_sync, text, voice, model_id=model_id, language_code=language_code,
+    )
+    _spend.record("elevenlabs", _spend.EST_ELEVENLABS_TTS_PER_RESPONSE_USD)
 
     if not return_word_timings:
         return audio_bytes

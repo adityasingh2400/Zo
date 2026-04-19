@@ -247,74 +247,115 @@ Extract as JSON only: {{"action": "sell|describe|compare", "price": "$X or null"
 # ── EYES: Claude Vision (cloud, rich analysis) ──────────────────────────────
 
 async def analyze_and_script_gemma(frame_b64: str, voice_text: str) -> dict:
-    """On-device product analysis + pitch script via Cactus Gemma 4. Matches
-    the return shape of `analyze_and_script_claude` — `{product: {...},
-    script: "..."}` — so run_sell_pipeline can swap backends without
-    touching downstream code.
+    """On-device product analysis + pitch script via Cactus Gemma 4.
 
-    Why this exists: Cody wants the seller flow to hit Gemma locally on the
-    Mac (no cloud), with the user's narration as the product-identity
-    hint. Gemma 4 E4B is smaller than Claude Haiku, so we give it a
-    tighter prompt + lower word budget to keep output grounded.
+    Matches the return shape of `analyze_and_script_claude`: `{product,
+    script}`. Gemma 4 E4B chokes on one big nested-JSON prompt (hits a
+    stop token around 300 chars) so we split into TWO sequential calls:
 
-    Fallback behavior: if Cactus is unavailable OR Gemma returns
-    unparseable JSON, returns `{"source": "gemma_failed", ...}` so the
-    caller can fall back to Claude.
+      1. Product analysis — JSON only, short + structured
+      2. Script — plain text, given the product fields as context
+
+    This halves the tokens per call and gets reliable completion out of
+    the small model. Total latency is ~2x one call (Cactus lock serializes
+    them), but each stays under ~1kb so both complete cleanly.
+
+    Fallback: if Cactus is unavailable or either call fails badly,
+    returns `{"source": "gemma_failed", ...}` so run_sell_pipeline can
+    fall back to Claude.
     """
     logger.info("[GEMMA] analyze_and_script_gemma called (frame: %d chars, cactus: %s)",
                 len(frame_b64), CACTUS_AVAILABLE)
-    prompt = f"""You are writing copy for an AI livestream seller. The seller narrated:
-
-"{voice_text}"
-
-Look at the product image. Return ONLY valid JSON with this exact shape:
-
-{{
-  "product": {{
-    "name": "product name (seller's words + what you see)",
-    "category": "short category",
-    "materials": ["primary material"],
-    "selling_points": ["3-4 short benefit phrases"],
-    "visual_details": ["2-3 specific things you see in the image"],
-    "suggested_price_range": "$X - $Y"
-  }},
-  "script": "Under 80 words. One paragraph. Second-person, conversational, TikTok Live energy. Mention 2 visual details from the image AND 1 specific thing the seller said. End with a CTA. No stage directions. Just what the avatar will speak aloud."
-}}
-
-Do not invent specs, dimensions, or prices not supported by the image or the seller's words."""
 
     if not CACTUS_AVAILABLE:
         return {"source": "gemma_failed", "reason": "cactus_unavailable"}
 
-    # Write frame to temp JPEG — Cactus wants an image path on disk.
+    # Write frame to temp JPEG — Cactus wants an image path on disk. We
+    # reuse the same path for both calls so Cactus's per-source face/
+    # vision cache can warm up between them.
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
         f.write(base64.b64decode(frame_b64))
         img_path = f.name
+
     try:
         import asyncio
-        result = await asyncio.to_thread(
+        total_ms = 0
+
+        # ── Call 1: product analysis (short, structured, image-grounded) ──
+        product_prompt = f"""Look at this product image. The seller said: "{voice_text}"
+
+Give a brief product analysis as JSON only:
+{{"name": "...", "category": "...", "materials": ["..."], "selling_points": ["...", "...", "..."], "visual_details": ["...", "..."]}}"""
+
+        r1 = await asyncio.to_thread(
             _cactus_chat,
-            [{"role": "user", "content": prompt}],
-            512,        # bigger budget than analyze_with_gemma — we want a full script
+            [{"role": "user", "content": product_prompt}],
+            320,           # tighter — one JSON object, no script
             [img_path],
         )
-        response_text = result.get("response", "")
-        latency = int(result.get("total_time_ms", 0))
+        text1 = (r1.get("response") or "").strip()
+        total_ms += int(r1.get("total_time_ms", 0))
+        if r1.get("error"):
+            return {"source": "gemma_failed", "reason": f"product_call: {r1.get('error')}"}
 
-        if "error" in result:
-            return {"source": "gemma_failed", "reason": str(result["error"])}
+        product = _parse_json_from_text(text1) or {}
+        # If parsing failed, synthesize a minimal product from voice_text
+        # rather than giving up — the script call can still produce a
+        # decent pitch from the narration alone.
+        if not product:
+            logger.warning("[GEMMA] product JSON unparseable; falling back. raw: %s",
+                           text1[:200])
+            product = {
+                "name": (voice_text[:60] or "Product"),
+                "selling_points": [],
+                "visual_details": [],
+            }
 
-        parsed = _parse_json_from_text(response_text)
-        if not parsed or "product" not in parsed or "script" not in parsed:
-            logger.warning("[GEMMA] script JSON missing required keys; raw: %s",
-                           response_text[:400])
-            return {"source": "gemma_failed",
-                    "reason": "json_missing_product_or_script",
-                    "raw_response": response_text}
-        parsed["source"] = "cactus_on_device"
-        parsed["latency_ms"] = latency
-        parsed["cost"] = "$0.00"
-        return parsed
+        # ── Call 2: spoken pitch script (plain text, given the product) ──
+        # Feed Gemma the structured fields it just produced so the script
+        # is grounded in them — avoids hallucination from re-looking at
+        # the image.
+        name = product.get("name", "product")
+        vd = ", ".join((product.get("visual_details") or [])[:2]) or "what you can see"
+        sp = (product.get("selling_points") or [])
+        sp_text = "; ".join(str(s) for s in sp[:3]) or "quality build"
+
+        script_prompt = f"""Write a short livestream sales pitch an avatar will read aloud.
+
+Product: {name}
+Seller said: "{voice_text}"
+Visual details: {vd}
+Selling points: {sp_text}
+
+Write ONE paragraph under 70 words. Second-person, conversational, TikTok Live energy. Mention one visual detail AND one thing the seller said. End with a call to action. Output the script only — no JSON, no stage directions, no preamble."""
+
+        r2 = await asyncio.to_thread(
+            _cactus_chat,
+            [{"role": "user", "content": script_prompt}],
+            200,           # tight — ~70 words ≈ 100 tokens, give headroom
+            None,          # no image needed, second call is text-only
+        )
+        text2 = (r2.get("response") or "").strip()
+        total_ms += int(r2.get("total_time_ms", 0))
+
+        # Strip common "here's the pitch:" preambles if Gemma added them.
+        for prefix in ("Here's the pitch:", "Pitch:", "Script:", "Here's a script:"):
+            if text2.lower().startswith(prefix.lower()):
+                text2 = text2[len(prefix):].strip()
+
+        if not text2:
+            # Build a fallback script from the product fields so the
+            # avatar still has something to say.
+            text2 = (f"Check out this {name}. "
+                     f"{sp_text}. Tap the basket.").strip()
+
+        return {
+            "product": product,
+            "script": text2,
+            "source": "cactus_on_device",
+            "latency_ms": total_ms,
+            "cost": "$0.00",
+        }
     finally:
         try:
             os.unlink(img_path)

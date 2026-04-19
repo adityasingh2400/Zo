@@ -60,66 +60,57 @@ GENERIC_MANIFEST_PATH = GENERIC_DIR / "manifest.json"
 # "question" | "compliment" | "objection" | "neutral".
 # Keep utterances 1.5-3s long — they buy us time, not full responses.
 #
-# Tagging rationale (Apr 2026):
-#   These are the ONE bridge tier that's pre-rendered before any demo and
-#   never re-rendered per-product, so they get the eleven_v3 model with
-#   inline audio tags ([curious], [warmly], [excited], etc.). Tags shape
-#   the prosody of the words that follow them and unlock the gap between
-#   "AI voice reading filler" and "person genuinely reacting in real time."
+# Voice + tagging rationale (Apr 2026, after v3 trial):
+#   We tried eleven_v3 with audio tags ([curious], [warmly], [excited],
+#   etc.) on these bridges and the per-clip expressiveness was technically
+#   better — the model honors the directives and the prosody is more
+#   varied. BUT the timbre and cadence v3 produces with our voice ID
+#   drifts noticeably from the avatar voice the audience knows from the
+#   pitch + Q&A clips (which are flash_v2_5). Hearing v3 bridges between
+#   flash pitch + flash Q&A reads as "two different people speaking" —
+#   the realism upgrade got cancelled out by an identity break.
 #
-#   Conservative tag density on purpose: every tag adds a small risk of
-#   the model mis-interpreting a directive as something to read aloud.
-#   We pick one emotional-shape tag at the front of each line.
+#   Reverted to plain text + flash_v2_5 in render_all/render_generic_clips
+#   so the avatar voice is consistent across every audible surface.
 #
-#   Tags we deliberately AVOID:
-#   - [pauses] — inserts ~1s of silence in the audio. Wav2Lip generates
-#     ~25 frames of mouth shapes for that silence and they look random
-#     because the model wasn't trained on extended silent gaps. Use "..."
-#     in the text instead — the model interprets it as natural elongation
-#     of the preceding syllable, no actual silent frames.
-#   - [laughs] / [sighs] / [clears throat] — render as discrete non-verbal
-#     beats the substrate video (continuous "speaking pose") can't match.
-#     The mouth forms a laugh shape while the substrate's mouth keeps the
-#     speaking pose, reads as glitch. Save these for content with matching
-#     substrate footage.
-#
-#   Pair this with `model_id="eleven_v3"` when calling text_to_speech in
-#   the render pipeline below. v3 honors the brackets; flash will read
-#   them aloud.
+#   v3 path is preserved (just pass model_id="eleven_v3" to text_to_speech
+#   or `--model eleven_v3` to the render scripts). If you re-enable v3,
+#   re-add the audio tags and re-run the render — the v3 path defaults
+#   for tag handling are still wired correctly.
 BRIDGE_SCRIPTS: list[tuple[str, str]] = [
-    # questions — show genuine engagement, not a chatbot ack
-    ("question", "[curious] Ooh, great question... let me think about that."),
-    ("question", "[warmly] Yeah, that's a good one. Hold on a sec."),
-    ("question", "[curious] Mmm, totally fair to ask. One sec..."),
-    ("question", "[happily] I love that you asked that — okay, so..."),
-    # compliments — actual gratitude, not a polite reflex
-    ("compliment", "[happily] Aww, thank you so much!"),
-    ("compliment", "[warmly] I appreciate that — seriously, thank you."),
-    ("compliment", "[playfully] You're so sweet, thank you!"),
-    # objections — empathy first, fact second; v3 nails the pivot
-    ("objection", "[reassuring] Totally hear you on that. Here's the thing..."),
-    ("objection", "[calm] I get it. Let me actually address that."),
-    ("objection", "[warmly] That's fair — here's the real deal."),
+    # questions
+    ("question", "Great question — let me think about that."),
+    ("question", "Ooh, good one. Hold on a sec."),
+    ("question", "Yeah, totally fair to ask."),
+    ("question", "I love that you asked that."),
+    # compliments
+    ("compliment", "Aww thank you so much!"),
+    ("compliment", "I appreciate that, seriously."),
+    ("compliment", "You're so sweet, thank you."),
+    # objections
+    ("objection", "Totally hear you on that."),
+    ("objection", "I get it, let me address that."),
+    ("objection", "That's fair, here's the deal."),
     # neutral acks (used as fallback for any label)
-    ("neutral", "[softly] Okay, hang on one second..."),
-    ("neutral", "[warmly] Yeah, let me show you."),
-    ("neutral", "[playfully] Mhm, mhm. Okay so..."),
-    ("neutral", "[curious] Right, so..."),
+    ("neutral", "Okay, hang on one second."),
+    ("neutral", "Yeah, let me show you."),
+    ("neutral", "Mhm, mhm."),
+    ("neutral", "Right, so..."),
     # ── Stage-demo additions (Step 7 of the TikTok Shop overlay plan) ──
     # intro_arbitrary fires from /api/go_live when the operator presses G
     # on /stage. These need to read as natural live-stream openers — like
     # the speaker just hit "Go Live" and is greeting whoever just joined.
     # Keep them ~1.5-2.5s so the overlay's hearts + viewer count have a
     # beat to land before any product-specific pitch follows.
-    ("intro_arbitrary", "[excited] Hey everyone, welcome back to the stream!"),
-    ("intro_arbitrary", "[cheerfully] What's up, we are LIVE — so glad you're here."),
-    ("intro_arbitrary", "[warmly] Good to see y'all dropping in. [excited] Let's get into it."),
+    ("intro_arbitrary", "Hey everyone, welcome back to the stream!"),
+    ("intro_arbitrary", "What's up, we are LIVE — glad you're here."),
+    ("intro_arbitrary", "Good to see y'all dropping in. Let's get into it."),
     # bridge_arbitrary covers the 60s when the avatar is buying time
     # while the on-device vision pipeline analyzes the held-up item.
     # Read as the speaker improvising while looking at something.
-    ("bridge_arbitrary", "[curious] Alright, let me show you what I picked up today."),
-    ("bridge_arbitrary", "[softly] Okay, gonna take a closer look at this one."),
-    ("bridge_arbitrary", "[playfully] One sec — getting this into frame for you."),
+    ("bridge_arbitrary", "Alright, let me show you what I picked up today."),
+    ("bridge_arbitrary", "Okay, gonna take a closer look at this one."),
+    ("bridge_arbitrary", "One sec — getting this into frame for you."),
 ]
 
 
@@ -248,19 +239,21 @@ async def render_all(
     elevenlabs_voice: str = "Rachel",
     avatar_video: str = "/workspace/state_pitching_pose_speaking_1080p.mp4",
     overwrite: bool = False,
-    model_id: str = "eleven_v3",
+    model_id: str = "eleven_flash_v2_5",
 ):
     """Generate TTS for each script, send through LatentSync, save to disk,
     write/update manifest. Idempotent — skips already-rendered clips by
     matching the (script, sha256) slug.
 
-    `model_id` defaults to eleven_v3 because bridges are pre-rendered once
-    and re-used across every demo forever. v3 honours the audio tags in
-    BRIDGE_SCRIPTS ([curious], [warmly], etc.) which is the entire reason
-    these scripts were tagged in the first place. Render time per clip is
-    higher than flash but only paid once. Pass model_id="eleven_flash_v2_5"
-    if you need to re-render fast (the tags will be read aloud — you'll
-    want to strip them from BRIDGE_SCRIPTS first)."""
+    `model_id` defaults to eleven_flash_v2_5 to keep the bridge voice
+    matching the rest of the avatar's audio (pitch + Q&A also flash). Tried
+    eleven_v3 with audio tags — better per-clip prosody but the timbre
+    drifted from the established avatar voice and read as "two different
+    people speaking" between bridges and the surrounding flash content.
+    See BRIDGE_SCRIPTS docstring above for the full rationale.
+
+    Pass model_id="eleven_v3" + re-add audio tags to BRIDGE_SCRIPTS if
+    you want to test the v3 path again. Both paths are wired correctly."""
     from agents.seller import text_to_speech, render_pitch_latentsync
 
     manifest = load_manifest()
@@ -344,9 +337,11 @@ def main():
     r.add_argument("--avatar", default="/workspace/state_pitching_pose_speaking_1080p.mp4",
                    help="path to avatar source video on the RunPod")
     r.add_argument("--overwrite", action="store_true")
-    r.add_argument("--model", default="eleven_v3",
-                   help="ElevenLabs model id. Default eleven_v3 honours audio tags. "
-                        "Pass eleven_flash_v2_5 only if you re-strip the tags from BRIDGE_SCRIPTS.")
+    r.add_argument("--model", default="eleven_flash_v2_5",
+                   help="ElevenLabs model id. Default eleven_flash_v2_5 keeps bridges "
+                        "voice-matched to the rest of the avatar audio. Pass "
+                        "eleven_v3 (and re-add audio tags to BRIDGE_SCRIPTS) to test "
+                        "the more-expressive but voice-drifting path.")
 
     sub.add_parser("manifest", help="print current manifest")
 

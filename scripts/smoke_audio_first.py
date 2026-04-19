@@ -1,23 +1,25 @@
 #!/usr/bin/env python
-"""End-to-end smoke for the avatar realism build (Phases 1-4).
+"""End-to-end smoke for the avatar realism build (comment + mic paths).
 
-Connects a websocket to a running backend and exercises three flows:
-  1. Comment escalate → audio-first dispatch (comment_response_audio
-     fires with audio_url + word_timings + duration).
-  2. Pitch trigger ("sell this for ..." command) → router fires
-     pitch_product → play_clip(pitch_veo, muted, looped) + pitch_audio.
-  3. Mic press → play_clip(listening_attentive, muted, looped) +
+Connects a websocket to a running backend and exercises two flows:
+  1. Comment escalate → reading_chat → wav2lip → comment_response_audio
+     fires with audio_url + word_timings + duration.
+  2. Mic press → play_clip(listening_attentive, muted, looped) +
      voice_state=transcribing.
 
+The third real flow (30s pitch) is exercised by scripts/smoke_phone_video.py
+which uploads a real product video over /ws/phone — that's the only way
+pitches are triggered in production. Chat-typed pitch commands were
+removed entirely; comments are audience reactions only.
+
 Usage:
-    # Start the backend on port 8000 first
-    backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 &
-    # Then run the smoke
+    backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 \\
+      --ws-max-size 67108864 &
     python scripts/smoke_audio_first.py
     # Or against a custom port:
     python scripts/smoke_audio_first.py --port 8001
 
-Exits 0 if all three flows pass, 1 if any fail.
+Exits 0 if all flows pass, 1 if any fail.
 """
 from __future__ import annotations
 
@@ -122,46 +124,6 @@ async def smoke_audio_first(uri: str) -> bool:
     return False
 
 
-async def smoke_pitch(uri: str) -> bool:
-    print("\n=== PITCH: simulate_comment 'sell this for forty dollars to gen z' ===")
-    async with websockets.connect(uri) as ws:
-        await _drain_state_sync(ws)
-        await ws.send(json.dumps({"type": "stage_ready"}))
-        await ws.send(json.dumps({
-            "type": "simulate_comment",
-            "text": "sell this for forty dollars to gen z",
-        }))
-        events = await _collect(
-            ws, timeout=10, stop_when={"pitch_audio"},
-        )
-
-    decision = _has_event(events, "routing_decision", tool="pitch_product")
-    pitch_audio = _has_event(events, "pitch_audio")
-    pitch_clip = next(
-        (e for e in events
-         if e.get("type") == "play_clip" and e.get("intent") == "pitch_veo"),
-        None,
-    )
-    if not decision:
-        print("  FAIL — router didn't pick pitch_product")
-        return False
-    if not pitch_clip:
-        print("  FAIL — no play_clip(pitch_veo) event")
-        return False
-    if not pitch_audio:
-        print("  FAIL — no pitch_audio event")
-        return False
-    if not pitch_clip.get("loop") or not pitch_clip.get("muted"):
-        print(f"  FAIL — pitch_veo clip should be loop=True muted=True, got "
-              f"loop={pitch_clip.get('loop')} muted={pitch_clip.get('muted')}")
-        return False
-    words = len(pitch_audio.get("word_timings") or [])
-    dur = pitch_audio.get("expected_duration_ms")
-    print(f"  PASS — router=pitch_product, pitch_veo loop=True muted=True, "
-          f"audio words={words} dur={dur}ms")
-    return True
-
-
 async def smoke_mic_press(uri: str) -> bool:
     print("\n=== MIC PRESS: mic_pressed → listening_attentive ===")
     async with websockets.connect(uri) as ws:
@@ -214,8 +176,9 @@ async def smoke_mic_press(uri: str) -> bool:
 async def main_async(host: str, port: int) -> int:
     uri = f"ws://{host}:{port}/ws/dashboard"
     print(f"smoke target: {uri}")
+    suites = [smoke_audio_first, smoke_mic_press]
     failed = 0
-    for fn in (smoke_audio_first, smoke_pitch, smoke_mic_press):
+    for fn in suites:
         try:
             ok = await fn(uri)
         except Exception as e:
@@ -224,7 +187,9 @@ async def main_async(host: str, port: int) -> int:
         if not ok:
             failed += 1
     print("\n" + "=" * 50)
-    print(f"smoke: {3 - failed}/3 passed")
+    print(f"smoke: {len(suites) - failed}/{len(suites)} passed")
+    print("(pitch path lives in scripts/smoke_phone_video.py — runs the real "
+          "video-upload entry point via /ws/phone sell_video)")
     return failed
 
 

@@ -16,7 +16,6 @@ they never talk to the dashboard directly.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 import time
@@ -27,13 +26,6 @@ from agents.bridge_clips import pick_bridge_clip
 
 logger = logging.getLogger("empire.director")
 
-# Pitch asset manifest written by scripts/render_pitch_assets.py. Loaded
-# lazily on first play_pitch_veo() call so backend boot doesn't depend on
-# pitch_assets/ existing yet (CI / first run won't have it).
-_PITCH_MANIFEST_PATH = (
-    Path(__file__).resolve().parent.parent / "pitch_assets" / "manifest.json"
-)
-
 # Listening-attentive substrate for the backchannel. Reuses the existing
 # `idle_reading_comments` pose (eyes scanning chat panel, head turned slightly
 # toward camera-left, micro-nods) — closer to "I'm listening to you" than
@@ -42,10 +34,10 @@ _PITCH_MANIFEST_PATH = (
 _LISTENING_ATTENTIVE_URL = "/states/idle/idle_reading_comments.mp4"
 
 # Default pitch video — looped 8s "pitching pose, speaking motion" Veo
-# clip already on disk. Used by both the cached pitch path (play_pitch_veo)
-# and the ephemeral path (dispatch_audio_first_pitch) when the caller
-# doesn't override video_url. Karaoke captions divert eye gaze from the
-# loop so the 30s audio overlay reads as continuous live speech.
+# clip already on disk. Used by dispatch_audio_first_pitch (the only
+# remaining pitch entry point — driven by the video-upload pipeline,
+# not by chat). Karaoke captions divert eye gaze from the 8s loop so
+# the 30s audio overlay reads as continuous live speech.
 _DEFAULT_PITCH_VIDEO_URL = "/states/state_pitching_pose_speaking_1080p.mp4"
 
 # ── Tunables ────────────────────────────────────────────────────────────────
@@ -341,95 +333,20 @@ class Director:
             emitted_by="play_pitch",
         )
 
-    # ── Pitch-Veo path (USE_PITCH_VEO) ─────────────────────────────────────
-    # The opening 30s of the demo. Caller supplies a product slug; we look
-    # the slug up in the pitch manifest (rendered offline by
-    # scripts/render_pitch_assets.py) and emit BOTH the muted looping video
-    # AND the standalone audio + word_timings via a `pitch_audio` event.
-    # The dashboard's <audio> element plays the audio while the looping
-    # 8s pitching-pose video runs underneath. Karaoke captions divert eye
-    # gaze from the mouth so the video loop is invisible.
-    @classmethod
-    def _load_pitch_manifest(cls) -> dict:
-        """Reload the pitch manifest from disk on each lookup so we pick up
-        new renders without restarting the backend."""
-        if not _PITCH_MANIFEST_PATH.exists():
-            return {}
-        try:
-            return json.loads(_PITCH_MANIFEST_PATH.read_text())
-        except Exception as e:
-            logger.warning("[director] pitch manifest read failed: %s", e)
-            return {}
-
-    async def play_pitch_veo(self, slug: str) -> dict | None:
-        """Audio-first pitch playback for `slug`. Emits the muted looping
-        video on Tier 1 AND broadcasts a `pitch_audio` event with the
-        cached audio_url + word_timings + expected_duration_ms.
-
-        Returns the manifest entry, or None if the slug isn't in the
-        manifest (caller falls back to legacy pitch path)."""
-        manifest = self._load_pitch_manifest()
-        entry = manifest.get(slug)
-        if not entry:
-            logger.warning("[director] play_pitch_veo: no manifest entry for slug=%s", slug)
-            return None
-
-        video_url = entry.get("video_url") or ""
-        audio_ms = int(entry.get("audio_ms") or 0)
-
-        # Fire the muted looping video first (no duration handshake — the
-        # loop never ends naturally; the audio's `ended` event drives the
-        # release timeline).
-        await self.emit(
-            "tier1",
-            "pitch_veo",
-            video_url,
-            loop=True,
-            mode="crossfade",
-            emitted_by="play_pitch_veo",
-            muted=True,
-        )
-
-        # Audio + karaoke chip. Audience hears this immediately and
-        # KaraokeCaptions starts populating word-by-word.
-        pitch_audio_msg = {
-            "type": "pitch_audio",
-            "slug": slug,
-            "url": entry.get("audio_url"),
-            "word_timings": entry.get("word_timings") or [],
-            "expected_duration_ms": audio_ms or None,
-            "script": entry.get("script", ""),
-            "ts": time.time_ns(),
-        }
-        try:
-            await self._broadcast(pitch_audio_msg)
-        except Exception:
-            logger.exception("[director] pitch_audio broadcast failed")
-
-        # Schedule fade_to_idle when the audio is done (+500ms tail so the
-        # last word has a beat before the looping video crossfades out).
-        if audio_ms > 0:
-            release_ms = audio_ms + 500
-
-            async def _release():
-                await asyncio.sleep(release_ms / 1000)
-                try:
-                    await self._broadcast({
-                        "type": "pitch_audio_end",
-                        "slug": slug,
-                        "ts": time.time_ns(),
-                    })
-                except Exception:
-                    pass
-                await self.fade_to_idle()
-
-            asyncio.create_task(_release())
-
-        logger.info("[director] play_pitch_veo slug=%s video=%s audio=%s words=%d dur=%dms",
-                    slug, Path(video_url).name, Path(entry.get("audio_url", "")).name,
-                    len(entry.get("word_timings") or []), audio_ms)
-        return entry
-
+    # ── Pitch dispatch (audio-first, ephemeral) ────────────────────────────
+    # The opening 30s of the demo. Driven exclusively by the video-upload
+    # pipeline (run_sell_pipeline → _run_audio_first_pitch in main.py).
+    # Caller has already TTS'd the freshly-Claude-generated pitch script,
+    # saved the audio to a static URL, and produced per-word timings — we
+    # just emit the muted looping speaking-pose video on Tier 1 + broadcast
+    # the pitch_audio WS event the dashboard plays through its standalone
+    # <audio> element with karaoke captions on top.
+    #
+    # Note: there's intentionally no slug→manifest lookup path. Pre-rendered
+    # cached pitches existed for the chat-trigger flow ("sell this for $X");
+    # that flow was removed because production never gets a typed pitch
+    # command. Every pitch is dynamically generated from the recorded
+    # video transcript.
     async def dispatch_audio_first_pitch(
         self,
         *,
@@ -440,23 +357,20 @@ class Director:
         video_url: str | None = None,
         slug: str | None = None,
     ) -> None:
-        """Ephemeral pitch dispatch — same on-stage behaviour as
-        play_pitch_veo, but driven by a freshly-rendered pitch (typically
-        from the phone-uploaded video pipeline) instead of the cached
-        manifest. Caller has already saved the audio bytes to a static-
-        served URL and produced word timings.
+        """Pitch dispatch driven by the video-upload pipeline. Caller has
+        already saved the audio bytes to a static-served URL and produced
+        word timings.
 
         `video_url` defaults to the universal speaking-pose clip; pass a
         product-specific Veo render here if one exists.
         `slug` is informational (logged + included in the pitch_audio
-        event) — not used for any lookup since the manifest path is
-        bypassed entirely.
+        event) — useful for telemetry / dashboard chip variants.
         """
         url = video_url or _DEFAULT_PITCH_VIDEO_URL
 
-        # Tier 1 muted looping pose — same emit as play_pitch_veo so the
-        # dashboard treats this identically (mute incoming video, run no
-        # duration handshake because loop is True).
+        # Tier 1 muted looping pose. Dashboard mutes the video element
+        # (audio is owned by the standalone <audio>) and skips the
+        # duration handshake because loop=True (no natural end).
         await self.emit(
             "tier1",
             "pitch_veo",

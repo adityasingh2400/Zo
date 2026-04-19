@@ -612,7 +612,8 @@ def pad_wav2lip_video_to_audio(
 _WORD_SPLIT_RE = re.compile(r"\S+")
 _INTER_WORD_GAP_MS = 25
 # Speaking rate fallback (chars/sec) when we have no audio_duration_ms
-# (degraded path: render_pitch_assets without ffprobe). 12 chars/sec is
+# (degraded path: any caller that hits text_to_speech without ffprobe).
+# 12 chars/sec is
 # eleven_flash_v2_5's measured average over the demo's response set.
 _FALLBACK_CHARS_PER_SEC = 12.0
 

@@ -25,10 +25,13 @@ export function useEmpireSocket() {
   // Cleared by the matching comment_response_video or video_failed event so
   // KaraokeCaptions stop tracking once the audio source is exhausted.
   const [audioResponse, setAudioResponse] = useState(null);
-  // Pitch dispatch — fires when /api/pitch (or director.play_pitch_veo) is
-  // invoked. Same shape as audioResponse but tagged so LiveStage knows to
-  // mount the TranslationChip overlay (the audio is a 30s pre-rendered
-  // pitch, not a live response). Cleared after audio_duration_ms expires.
+  // Pitch dispatch — fires when run_sell_pipeline → _run_audio_first_pitch
+  // → Director.dispatch_audio_first_pitch broadcasts pitch_audio. Driven
+  // exclusively by the video-upload pipeline (chat doesn't trigger pitches).
+  // Same shape as audioResponse but tagged so LiveStage knows to mount the
+  // TranslationChip overlay's pitch variant (the audio is the freshly-
+  // generated ~30s pitch, not a live response). Cleared after the audio
+  // ends or pitch_audio_end fires.
   const [pitchAudio, setPitchAudio] = useState(null);
   const audioSeqRef = useRef(0);
   const [liveStage, setLiveStage] = useState('INTRO');

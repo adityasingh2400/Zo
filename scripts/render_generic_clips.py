@@ -98,27 +98,28 @@ def save_manifest(manifest: dict[str, list[dict]]) -> None:
 
 async def render_one(
     label: str, text: str, out_path: Path, substrate: str,
-    *, model_id: str = "eleven_v3",
+    *, model_id: str = "eleven_flash_v2_5",
 ) -> tuple[float, int]:
     """TTS → trim → Wav2Lip → pad → write. Returns (elapsed_s, bytes).
     Raises on failure so the caller can record + continue with the next clip.
 
-    `model_id` defaults to eleven_v3 because BRIDGE_SCRIPTS is tagged with
-    inline audio directives ([curious], [warmly], etc.) that flash would
-    read aloud. v3 honours them. Render time per clip is ~6-8s (vs ~4-5s
-    on flash) but bridges are pre-rendered once and re-used across every
-    demo, so the extra render cost is paid in the past tense forever.
+    `model_id` defaults to eleven_flash_v2_5 to match the avatar voice on
+    the rest of the audio surfaces (pitch + Q&A). v3 was trialed and
+    sounded technically more expressive but the timbre drift made the
+    bridges feel like a different person — see BRIDGE_SCRIPTS docstring
+    in backend/agents/bridge_clips.py for the full reasoning.
 
-    Two post-processing steps wrap the wav2lip call:
-      1. trim_audio_silence BEFORE wav2lip — strips head/tail silence so
-         wav2lip's mouth predictor only runs on speech frames (kills the
-         random mouth-flap on silent edges that v3's breathy intro/outro
-         would otherwise produce).
+    Two post-processing steps wrap the wav2lip call (apply on both flash
+    and v3 paths):
+      1. trim_audio_silence BEFORE wav2lip — crops head/tail silence so
+         wav2lip's mouth predictor only runs on speech frames. Helps on
+         flash too (~50ms head, ~100ms tail typical) though less than v3.
       2. pad_video_to_audio AFTER wav2lip — wav2lip's mel-chunking always
-         produces a video ~120-150ms shorter than the audio. The server's
-         `-shortest` mux cuts the audio tail; we re-mux locally with the
-         FULL trimmed audio + video padded by holding the last frame.
-         End result: drift drops from -150ms to ±20ms, no audio cut."""
+         produces a video ~120-150ms shorter than the audio (structural,
+         not model-specific). The server's `-shortest` mux cuts the audio
+         tail; we re-mux locally with the FULL trimmed audio + video
+         padded by holding the last frame. Drift drops from ~140ms to
+         ±20ms regardless of TTS model."""
     t0 = time.perf_counter()
     audio_raw = await text_to_speech(text, model_id=model_id)
     if not audio_raw:
@@ -174,10 +175,11 @@ async def main() -> None:
     )
     ap.add_argument(
         "--model",
-        default="eleven_v3",
-        help="ElevenLabs model id. Default eleven_v3 honours the audio "
-             "tags in BRIDGE_SCRIPTS. Pass eleven_flash_v2_5 only after "
-             "stripping tags from the scripts (otherwise flash reads them aloud).",
+        default="eleven_flash_v2_5",
+        help="ElevenLabs model id. Default eleven_flash_v2_5 keeps bridges "
+             "voice-matched to the rest of the avatar audio. Pass eleven_v3 "
+             "(and re-add audio tags to BRIDGE_SCRIPTS) to test the more-"
+             "expressive but voice-drifting path.",
     )
     ap.add_argument(
         "--reset",

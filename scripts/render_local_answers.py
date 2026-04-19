@@ -36,7 +36,12 @@ sys.path.insert(0, str(BACKEND))
 from dotenv import load_dotenv  # type: ignore
 load_dotenv(ROOT / ".env")
 
-from agents.seller import text_to_speech, render_comment_response_wav2lip  # noqa: E402
+from agents.seller import (  # noqa: E402
+    text_to_speech,
+    render_comment_response_wav2lip,
+    trim_audio_silence,
+    pad_wav2lip_video_to_audio,
+)
 from config import POD_SPEAKING_1080P  # noqa: E402
 
 PRODUCTS_PATH = BACKEND / "data" / "products.json"
@@ -50,27 +55,60 @@ def url_to_path(url: str) -> Path:
 
 
 async def render_one(slug: str, text: str, out_path: Path, substrate: str) -> tuple[float, int]:
-    """TTS → Wav2Lip → write. Returns (elapsed_s, bytes)."""
+    """TTS → trim → Wav2Lip → pad → write. Returns (elapsed_s, bytes).
+
+    Mirrors the alignment pipeline in scripts/render_generic_clips.py so
+    every per-product Q&A clip gets the same drift fix the bridges got:
+
+      - trim_audio_silence (BEFORE wav2lip): crops head/tail silence from
+        the TTS output so wav2lip's mouth predictor only runs on speech
+        frames. Avoids the random mouth-flap on silent edges.
+
+      - pad_wav2lip_video_to_audio (AFTER wav2lip): re-mux locally with
+        the FULL trimmed audio + video padded by holding the last frame
+        for the structural ~120-180ms wav2lip mel-chunking shortfall.
+        Without this, the pod's `-shortest` ffmpeg mux truncates the
+        audio tail (the trailing word-end / breath gets cut).
+
+    These clips are played from disk at runtime via the respond_locally
+    path with their muxed audio. Drift here = audience-perceived drift,
+    full stop. With the fix: ±50ms typical (well under the dashboard's
+    250ms handshake and well below human-perceptible lipsync mismatch)."""
     t0 = time.perf_counter()
-    audio = await text_to_speech(text)
-    if not audio:
+    audio_raw = await text_to_speech(text)
+    if not audio_raw:
         raise RuntimeError("TTS returned empty audio (ElevenLabs not configured?)")
     t_tts = time.perf_counter() - t0
 
+    t_trim_start = time.perf_counter()
+    audio = trim_audio_silence(audio_raw)
+    t_trim = time.perf_counter() - t_trim_start
+    trim_pct = (1 - len(audio) / len(audio_raw)) * 100 if audio_raw else 0
+
     t1 = time.perf_counter()
-    mp4, _headers = await render_comment_response_wav2lip(
+    mp4_raw, _headers = await render_comment_response_wav2lip(
         audio_bytes=audio,
         source_path_on_pod=substrate,
         out_height=1920,
     )
     t_lip = time.perf_counter() - t1
 
+    t_pad_start = time.perf_counter()
+    mp4, pad_diag = pad_wav2lip_video_to_audio(mp4_raw, audio)
+    t_pad = time.perf_counter() - t_pad_start
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(mp4)
     total = time.perf_counter() - t0
+    drift_after = (
+        pad_diag.get("audio_ms", 0) - pad_diag.get("video_ms_after", 0)
+        if pad_diag.get("padded") else None
+    )
+    drift_str = f" drift={drift_after:+d}ms" if drift_after is not None else ""
     print(
-        f"  ✓ {slug}: tts={t_tts:.1f}s lip={t_lip:.1f}s total={total:.1f}s "
-        f"size={len(mp4) / 1024:.0f}KB → {out_path.relative_to(ROOT)}",
+        f"  ✓ {slug}: tts={t_tts:.1f}s trim={t_trim:.2f}s({trim_pct:.0f}%) "
+        f"lip={t_lip:.1f}s pad={t_pad:.2f}s{drift_str} "
+        f"total={total:.1f}s size={len(mp4) / 1024:.0f}KB → {out_path.relative_to(ROOT)}",
         flush=True,
     )
     return total, len(mp4)

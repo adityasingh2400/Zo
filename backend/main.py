@@ -267,6 +267,21 @@ async def handle_phone_message(msg: dict, ws: WebSocket):
             voice_text=msg.get("voice_text", "sell this"),
         ))
 
+    elif msg_type == "sell_video":
+        # Phone-recorded product video, base64-encoded for WS transport.
+        # Phone sends: {type: "sell_video", video_b64: "<base64 .mp4 or
+        # .mov>", filename?: "clip.mp4", voice_text?: "sell this"}.
+        #
+        # We decode, drop to a temp file (the existing intake pipeline
+        # works with a path, not bytes), kick off run_video_sell_pipeline
+        # which extracts audio + frames, transcribes, and fires the
+        # audio-first pitch via Director.dispatch_audio_first_pitch.
+        #
+        # Acks are sent back to the phone so the recorder UI can
+        # display "received → analyzing → going live". Dashboard also
+        # gets a phone_video_received event for operator visibility.
+        await _handle_phone_sell_video(msg, ws)
+
     elif msg_type == "comment":
         asyncio.ensure_future(run_comment_pipeline(
             comment=msg.get("text", ""),
@@ -278,6 +293,84 @@ async def handle_phone_message(msg: dict, ws: WebSocket):
             "type": "phone_frame",
             "frame": msg.get("frame", "")[:100] + "...",
         })
+
+
+async def _handle_phone_sell_video(msg: dict, ws: WebSocket) -> None:
+    """Decode a phone-uploaded video over WS, write to temp file, kick
+    off run_video_sell_pipeline. Sends progress acks back to the phone
+    so the recorder UI can show received → analyzing → going_live, and
+    a phone_video_received event to the dashboards for operator visibility.
+
+    Phone contract:
+      send: {type: "sell_video", video_b64: <str>,
+             filename?: <str>, voice_text?: <str>, mime?: <str>}
+      recv: {type: "phone_ack", stage: "received", bytes: <int>}
+      recv: {type: "phone_ack", stage: "pipeline_started", session_id: <str>}
+            (any pipeline failure surfaces via the dashboard agent_log.)
+    """
+    import tempfile, uuid as _uuid
+
+    video_b64 = msg.get("video_b64") or ""
+    if not video_b64:
+        try:
+            await ws.send_json({"type": "phone_ack", "stage": "error",
+                                "reason": "missing_video_b64"})
+        except Exception:
+            pass
+        log_event("SYSTEM", "Phone sell_video missing video_b64")
+        return
+
+    try:
+        video_bytes = base64.b64decode(video_b64)
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "phone_ack", "stage": "error",
+                                "reason": f"b64_decode_failed: {e}"})
+        except Exception:
+            pass
+        log_event("SYSTEM", f"Phone sell_video b64 decode failed: {e}")
+        return
+
+    if not video_bytes:
+        try:
+            await ws.send_json({"type": "phone_ack", "stage": "error",
+                                "reason": "empty_after_decode"})
+        except Exception:
+            pass
+        return
+
+    filename = msg.get("filename") or "phone_clip.mp4"
+    suffix = Path(filename).suffix or ".mp4"
+    voice_text = msg.get("voice_text") or "sell this"
+    session_id = f"phone_{_uuid.uuid4().hex[:10]}"
+
+    # Write to a temp file — run_video_sell_pipeline expects a path
+    # because the intake pipeline shells out to ffmpeg/ffprobe which
+    # want a real file on disk.
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(video_bytes)
+        video_path = f.name
+    log_event("SYSTEM", f"Phone video received: {len(video_bytes)} bytes "
+              f"({filename}) session={session_id}")
+    try:
+        await ws.send_json({"type": "phone_ack", "stage": "received",
+                            "bytes": len(video_bytes),
+                            "session_id": session_id})
+    except Exception:
+        pass
+    await broadcast_to_dashboards({
+        "type": "phone_video_received",
+        "bytes": len(video_bytes),
+        "filename": filename,
+        "session_id": session_id,
+    })
+
+    asyncio.ensure_future(run_video_sell_pipeline(video_path, voice_text))
+    try:
+        await ws.send_json({"type": "phone_ack", "stage": "pipeline_started",
+                            "session_id": session_id})
+    except Exception:
+        pass
 
 
 # ── WebSocket: Dashboard ──────────────────────────────
@@ -413,20 +506,15 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     asyncio.ensure_future(run_3d_generation(frame_b64))
 
-    # PHASE 2: TTS + Wav2Lip render — real video lipsync via the same fast
-    # path the comment responses use. The legacy LiveTalking WebRTC path was
-    # removed because it required a session handshake that the dashboard no
-    # longer initiates, and its audio-only fallback played MP3 over a silent
-    # idle face — read as "gibberish in a random language" because the mouth
-    # never moved.
-    #
-    # New flow:
-    #   1. Voice pill → RESPONDING so the audience knows we're rendering.
-    #   2. ElevenLabs TTS the Claude-generated script (English-locked).
-    #   3. Wav2Lip render against whichever speaking-substrate the Director
-    #      thinks matches the visible Tier 0 idle (calm by default).
-    #   4. Director crossfades the rendered mp4 onto Tier 1 → settles back
-    #      to the silent idle layer when the video duration elapses.
+    # PHASE 2: pitch playback. Two paths:
+    #   USE_PITCH_VEO=1 (default): audio-first dispatch. TTS the script,
+    #     save the audio, broadcast pitch_audio + emit a muted looping
+    #     speaking-pose Veo clip on Tier 1. Karaoke captions populate
+    #     word-by-word. ~600-900ms from script ready → first audible
+    #     syllable.
+    #   USE_PITCH_VEO=0 (kill switch): legacy Wav2Lip render (5-7s+).
+    #     Kept as a one-env-flag rollback in case the audio-first path
+    #     misbehaves on stage.
     pipeline_state["status"] = "selling"
     log_event("SELLER", "Avatar going live...")
     if director:
@@ -434,80 +522,14 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
 
     pitch_t0 = time.time()
     try:
-        # 2a. TTS
-        t0 = time.time()
-        audio_bytes = await text_to_speech(script)
-        tts_ms = int((time.time() - t0) * 1000)
-        if not audio_bytes:
-            raise RuntimeError("TTS returned empty audio")
-        log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
-
-        # 2b. Wav2Lip render against the substrate the Director picked for
-        #     whatever Tier 0 is visible. Falls back to default substrate if
-        #     the configured one isn't on the pod (the Director caches a
-        #     "missing" mark so we don't repeatedly retry the bad path).
-        substrate = director.current_substrate_pod_path() if director else None
-        t0 = time.time()
-        try:
-            if substrate:
-                video_bytes, headers = await render_comment_response_wav2lip(
-                    audio_bytes, source_path_on_pod=substrate, out_height=1080,
-                )
-            else:
-                video_bytes, headers = await render_comment_response_wav2lip(
-                    audio_bytes, out_height=1080,
-                )
-        except Exception as e:
-            err_str = str(e).lower()
-            if substrate and director and ("404" in err_str or "400" in err_str or "not found" in err_str):
-                logger.warning("[pitch] substrate %s unavailable, falling back: %s", substrate, e)
-                director.mark_substrate_status(substrate, False)
-                video_bytes, headers = await render_comment_response_wav2lip(
-                    audio_bytes, out_height=1080,
-                )
-            else:
-                raise
-        lipsync_ms = int((time.time() - t0) * 1000)
-        log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
-
-        # 2c. Save + broadcast through Director so the carousel crossfade
-        #     machinery and idle-release timing work the same way as comment
-        #     responses (single source of truth for stage state).
-        url = _save_render("pitch", video_bytes)
-        pipeline_state["pitch_video_url"] = url
-
-        if director:
-            await director.play_response(url)
-            # Probe rendered duration so the idle release fires precisely as
-            # she finishes the pitch. Falls back to a word-count estimate.
-            rendered_path = RENDER_DIR / Path(url).name
-            play_ms = _probe_video_duration_ms(rendered_path)
-            if play_ms is None:
-                word_count = len(script.split())
-                play_ms = int(max(2500, word_count * 350))
-            play_ms_with_tail = play_ms + 400
-
-            async def _release_pitch_to_idle(delay_ms: int):
-                await asyncio.sleep(delay_ms / 1000)
-                if director:
-                    await director.fade_to_idle()
-                    await director.set_voice_state(None)
-            asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
-
-        await broadcast_to_dashboards({
-            "type": "pitch_video",
-            "url": url,
-            "render_ms": lipsync_ms,
-            "tts_ms": tts_ms,
-            "backend": "wav2lip",
-        })
-        pitch_total_ms = int((time.time() - pitch_t0) * 1000)
-        log_event("SELLER", f"Avatar speaking! ({pitch_total_ms}ms total, lipsynced via Wav2Lip)")
+        if USE_PITCH_VEO:
+            await _run_audio_first_pitch(script, pitch_t0)
+        else:
+            await _run_wav2lip_pitch(script, pitch_t0)
     except Exception as e:
         logger.exception("[pitch] render failed")
         log_event("SELLER", f"Pitch render failed: {e}")
-        # Last-ditch: TTS-only fallback so at least audio plays. This is the
-        # legacy "no video" path, kept only for catastrophic Wav2Lip failures.
+        # Last-ditch: TTS-only fallback so at least audio plays.
         try:
             audio_bytes = await text_to_speech(script)
             if audio_bytes:
@@ -529,6 +551,137 @@ async def run_sell_pipeline(frame_b64: str, voice_text: str):
     logger.info("SELL PIPELINE COMPLETE — %dms total", total_ms)
     logger.info("=" * 60)
     await broadcast_to_dashboards({"type": "status", "status": "live"})
+
+
+async def _run_audio_first_pitch(script: str, pitch_t0: float) -> None:
+    """Audio-first pitch: TTS → save → broadcast pitch_audio → muted
+    looping Tier 1 video. Used for the phone-uploaded video pipeline
+    where the script is freshly generated by Claude per upload.
+
+    The dashboard plays the audio through its standalone <audio> element
+    (KaraokeCaptions tracks word-by-word), the looped speaking-pose Veo
+    clip runs underneath muted, the TranslationChip mounts top-right.
+    Total time from script ready → first audible syllable: ~600-900ms.
+    """
+    from agents.seller import _probe_audio_duration_ms
+    t0 = time.time()
+    audio_bytes, word_timings = await text_to_speech(
+        script, return_word_timings=True,
+    )
+    tts_ms = int((time.time() - t0) * 1000)
+    if not audio_bytes:
+        raise RuntimeError("TTS returned empty audio")
+    log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B, {len(word_timings)} words)")
+
+    # Save audio to /response_audio (existing static mount; reused so we
+    # don't add yet another dir for ephemeral pitch dispatches). The
+    # `pitch_dispatch_` prefix distinguishes these from per-comment
+    # response audio in operator debug listings.
+    import uuid as _uuid
+    fname = f"pitch_dispatch_{_uuid.uuid4().hex[:12]}.mp3"
+    audio_path = RESPONSE_AUDIO_DIR / fname
+    audio_path.write_bytes(audio_bytes)
+    audio_url = f"/response_audio/{fname}"
+    audio_ms = await asyncio.to_thread(_probe_audio_duration_ms, audio_bytes) or 0
+
+    # Stash pitch URL for state_sync (replays audio on dashboard refresh
+    # mid-pitch). The pitch_audio event will fire the actual playback.
+    pipeline_state["pitch_video_url"] = audio_url
+
+    if director:
+        await director.dispatch_audio_first_pitch(
+            audio_url=audio_url,
+            word_timings=word_timings,
+            audio_ms=audio_ms,
+            script=script,
+            slug=pipeline_state.get("active_product_id") or "video_upload",
+        )
+
+    # Legacy pitch_video event so the existing dashboard plumbing
+    # (CostTicker, RoutingPanel, anything tracking pitches) sees the
+    # transition. URL points at the audio dispatch since there's no
+    # rendered video file in the audio-first path.
+    await broadcast_to_dashboards({
+        "type": "pitch_video",
+        "url": audio_url,
+        "render_ms": 0,                   # no Wav2Lip render fired
+        "tts_ms": tts_ms,
+        "audio_ms": audio_ms,
+        "backend": "audio_first",
+        "audio_already_playing": True,
+    })
+    pitch_total_ms = int((time.time() - pitch_t0) * 1000)
+    log_event(
+        "SELLER",
+        f"Audio-first pitch dispatched! ({pitch_total_ms}ms total, "
+        f"{audio_ms}ms audio, {len(word_timings)} timed words)",
+    )
+
+
+async def _run_wav2lip_pitch(script: str, pitch_t0: float) -> None:
+    """Legacy Wav2Lip pitch render. Kept as the USE_PITCH_VEO=0 kill switch
+    rollback. Renders TTS audio against the active speaking substrate via
+    the pod's Wav2Lip server; broadcasts a pitch_video event the dashboard
+    plays on Tier 1 with embedded audio. Slower (5-7s+) but lip-synced."""
+    t0 = time.time()
+    audio_bytes = await text_to_speech(script)
+    tts_ms = int((time.time() - t0) * 1000)
+    if not audio_bytes:
+        raise RuntimeError("TTS returned empty audio")
+    log_event("SELLER", f"TTS ready ({tts_ms}ms, {len(audio_bytes)}B)")
+
+    substrate = director.current_substrate_pod_path() if director else None
+    t0 = time.time()
+    try:
+        if substrate:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, source_path_on_pod=substrate, out_height=1080,
+            )
+        else:
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=1080,
+            )
+    except Exception as e:
+        err_str = str(e).lower()
+        if substrate and director and ("404" in err_str or "400" in err_str or "not found" in err_str):
+            logger.warning("[pitch] substrate %s unavailable, falling back: %s", substrate, e)
+            director.mark_substrate_status(substrate, False)
+            video_bytes, headers = await render_comment_response_wav2lip(
+                audio_bytes, out_height=1080,
+            )
+        else:
+            raise
+    lipsync_ms = int((time.time() - t0) * 1000)
+    log_event("SELLER", f"Wav2Lip pitch rendered ({lipsync_ms}ms)")
+
+    url = _save_render("pitch", video_bytes)
+    pipeline_state["pitch_video_url"] = url
+
+    if director:
+        await director.play_response(url)
+        rendered_path = RENDER_DIR / Path(url).name
+        play_ms = _probe_video_duration_ms(rendered_path)
+        if play_ms is None:
+            word_count = len(script.split())
+            play_ms = int(max(2500, word_count * 350))
+        play_ms_with_tail = play_ms + 400
+
+        async def _release_pitch_to_idle(delay_ms: int):
+            await asyncio.sleep(delay_ms / 1000)
+            if director:
+                await director.fade_to_idle()
+                await director.set_voice_state(None)
+        asyncio.ensure_future(_release_pitch_to_idle(play_ms_with_tail))
+
+    await broadcast_to_dashboards({
+        "type": "pitch_video",
+        "url": url,
+        "render_ms": lipsync_ms,
+        "tts_ms": tts_ms,
+        "backend": "wav2lip",
+    })
+    pitch_total_ms = int((time.time() - pitch_t0) * 1000)
+    log_event("SELLER", f"Avatar speaking! ({pitch_total_ms}ms total, lipsynced via Wav2Lip)")
 
 
 async def run_3d_generation(frame_b64: str):
@@ -1252,26 +1405,37 @@ async def api_respond_to_comment(
 ):
     """LIVE comment response with seamless avatar choreography.
 
-    Flow:
-      1. reading_chat clip fades in instantly (avatar 'reads the comment')
-      2. classify + LLM + TTS run in parallel, classify result picks the bridge
-      3. bridge clip crossfades over reading_chat the moment we know the label
-      4. Wav2Lip renders the response over the same source
-      5. response crossfades over the bridge when ready
-      6. fade_to_idle releases Tier 1 back to the always-on Tier 0 idle layer
+    Flow (the "she actually read it like a human" sequence):
+      1. reading_chat clip fades in instantly — avatar visibly reads the comment
+      2. While reading_chat HOLDS for 3.5s, classify + LLM + TTS run in parallel
+      3. After reading_chat, fade Tier 1 OUT to the Tier 0 idle layer (she
+         "returns to listening" between question and answer)
+      4. Brief 300ms idle pause for human-feeling beat
+      5. Audio-first broadcast (standalone <audio> starts playing the response)
+      6. Wav2Lip renders in background, video crossfades in under the audio
+      7. fade_to_idle releases Tier 1 back to the always-on Tier 0 idle layer
 
-    Target: sub-8s end-to-end (warm pod, warm face cache).
+    Bridge clips (the "great question, let me check" pre-recorded acks) are
+    intentionally OMITTED here — they previously played in parallel with the
+    audio-first response, producing two simultaneous voices ("dual audio"
+    bug). The 3.5s reading_chat hold + brief idle beat replaces the bridge
+    as the latency-masking element.
+
+    Target: ~5-6s perceived from comment-arrival to first response-audio
+    syllable, with the avatar visibly reading for 3.5 of those seconds.
     """
     product_data = pipeline_state.get("product_data") or {}
     total_t0 = time.time()
 
-    # 1) Reading the chat — instant visual feedback. Director holds it briefly
-    #    before the bridge takes over, so the viewer registers the moment.
+    # 1) Reading the chat — fire the visual + remember the hold task. The
+    #    Director's reading_chat() awaits READING_CHAT_HOLD_MS internally;
+    #    we let it run as a background task so the rest of the pipeline
+    #    (classify, LLM, TTS) can race ahead in parallel during the hold.
+    reading_chat_task = None
     if director:
-        asyncio.create_task(director.reading_chat())
+        reading_chat_task = asyncio.create_task(director.reading_chat())
 
-    # 2) Classify + LLM in parallel. Classify drives bridge selection; LLM gets
-    #    "question" as a safe default if classify is slow.
+    # 2) Classify + LLM in parallel with the reading_chat hold.
     class_t0 = time.time()
     classify_task = asyncio.create_task(classify_comment_gemma(comment))
 
@@ -1287,8 +1451,7 @@ async def api_respond_to_comment(
     # text answer to the dashboard instead of showing nothing.
     pipeline_state["last_response_text"] = {"comment": comment, "response": response_text}
 
-    # 3) Collect classify result NOW — needed to pick the right bridge label.
-    #    Don't wait if it hasn't finished; fall back to "neutral" pool.
+    # 3) Collect classify result (still useful for telemetry / future hooks).
     comment_type = "question"
     class_ms = int((time.time() - class_t0) * 1000)
     if classify_task.done():
@@ -1300,31 +1463,26 @@ async def api_respond_to_comment(
         classify_task.cancel()
     log_event("EYES", f'Comment "{comment[:40]}" → {comment_type} ({class_ms}ms)')
 
-    # 4) Fire TTS and bridge in parallel. Bridge plays an audible
-    #    acknowledgment over the reading_chat pose while TTS + Wav2Lip cook.
-    #    Without parallelism the bridge would only get the Wav2Lip render
-    #    window (~3.5s) to play; with parallelism it gets the full TTS +
-    #    Wav2Lip window (~4s) so it doesn't end before the response arrives.
-    bridge_task = None
-    if director:
-        bridge_task = asyncio.create_task(director.play_bridge(comment_type))
-
+    # 4) TTS — runs in parallel with the rest of the reading_chat hold.
     t0 = time.time()
-    # Always request word_timings — they're cheap (one ffprobe call) and
-    # Karaoke needs them on the audio-first path. With USE_KARAOKE off the
-    # dashboard ignores the field, so the cost is the ffprobe overhead only.
     audio_bytes, word_timings = await text_to_speech(
         response_text, return_word_timings=True,
     )
     tts_ms = int((time.time() - t0) * 1000)
 
-    # Best-effort: collect bridge result without blocking. If the manifest
-    # is empty / the call errored we just keep reading_chat showing.
-    if bridge_task and bridge_task.done():
+    # 5) Wait for the reading_chat hold to complete, then fade Tier 1 back
+    #    to idle. This is what makes her look like she "finished reading"
+    #    and "returned to listening" before responding — a human beat that
+    #    bridge clips were not delivering. Brief 300ms idle pause after the
+    #    fade lands so the response doesn't feel like it interrupts itself.
+    if reading_chat_task:
         try:
-            bridge_task.result()
+            await reading_chat_task
         except Exception:
-            logger.exception("[director] play_bridge failed (non-fatal)")
+            logger.exception("[director] reading_chat task raised (non-fatal)")
+        if director:
+            await director.fade_to_idle()
+        await asyncio.sleep(0.3)
 
     # ── 4.5) Audio-first broadcast (USE_AUDIO_FIRST) ──────────────────────
     # The biggest single perceived-latency win in this build. The moment TTS

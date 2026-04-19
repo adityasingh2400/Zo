@@ -41,12 +41,36 @@ _PITCH_MANIFEST_PATH = (
 # stays on stage until the actual response (or pitch) crossfades over.
 _LISTENING_ATTENTIVE_URL = "/states/idle/idle_reading_comments.mp4"
 
+# Default pitch video — looped 8s "pitching pose, speaking motion" Veo
+# clip already on disk. Used by both the cached pitch path (play_pitch_veo)
+# and the ephemeral path (dispatch_audio_first_pitch) when the caller
+# doesn't override video_url. Karaoke captions divert eye gaze from the
+# loop so the 30s audio overlay reads as continuous live speech.
+_DEFAULT_PITCH_VIDEO_URL = "/states/state_pitching_pose_speaking_1080p.mp4"
+
 # ── Tunables ────────────────────────────────────────────────────────────────
 # Mirrored on the dashboard side (LiveStage.jsx). Keep these in sync.
-TIER1_CROSSFADE_MS_DEFAULT = 350
+# Tier 1 transitions (bridge → response, idle → reading_chat, etc.) shortened
+# from 350ms → 120ms because Tier 1 clips have very different facial poses
+# (looking down, looking aside, speaking) and the long crossfade exposed both
+# faces simultaneously — two mouths in different positions overlapping at
+# 50% opacity each, which read as crystalline/diamond mouth artifacts.
+# 120ms is fast enough that the overlap window is barely perceptible while
+# still feeling like a smooth transition rather than a hard cut. Tier 0 idle
+# rotation stays at 600ms (idle poses have similar face positions, so the
+# longer fade is graceful, not ghosting). Fade-out stays at 500ms — the
+# avatar releasing back to idle reads better as a deliberate fade.
+TIER1_CROSSFADE_MS_DEFAULT = 120
 TIER0_CROSSFADE_MS_DEFAULT = 600
 TIER1_FADEOUT_MS_DEFAULT = 500
-READING_CHAT_HOLD_MS = 800   # how long the attentive idle plays before bridge replaces it
+READING_CHAT_HOLD_MS = 3500  # how long the avatar visibly "reads the comment"
+                             # before responding. 3.5s sells the human beat
+                             # ("she's actually reading what I typed") and
+                             # absorbs LLM + TTS latency so the audio drop
+                             # feels like she just finished thinking, not
+                             # like she pre-cached the response. Bridge
+                             # clips were removed from the comment pipeline
+                             # — this hold replaces them as the latency mask.
 IDLE_ROTATE_MIN_MS = 8_000   # tighter cadence so demo viewer sees variety quickly
 IDLE_ROTATE_MAX_MS = 18_000
 
@@ -379,6 +403,86 @@ class Director:
                     slug, Path(video_url).name, Path(entry.get("audio_url", "")).name,
                     len(entry.get("word_timings") or []), audio_ms)
         return entry
+
+    async def dispatch_audio_first_pitch(
+        self,
+        *,
+        audio_url: str,
+        word_timings: list[dict],
+        audio_ms: int,
+        script: str = "",
+        video_url: str | None = None,
+        slug: str | None = None,
+    ) -> None:
+        """Ephemeral pitch dispatch — same on-stage behaviour as
+        play_pitch_veo, but driven by a freshly-rendered pitch (typically
+        from the phone-uploaded video pipeline) instead of the cached
+        manifest. Caller has already saved the audio bytes to a static-
+        served URL and produced word timings.
+
+        `video_url` defaults to the universal speaking-pose clip; pass a
+        product-specific Veo render here if one exists.
+        `slug` is informational (logged + included in the pitch_audio
+        event) — not used for any lookup since the manifest path is
+        bypassed entirely.
+        """
+        url = video_url or _DEFAULT_PITCH_VIDEO_URL
+
+        # Tier 1 muted looping pose — same emit as play_pitch_veo so the
+        # dashboard treats this identically (mute incoming video, run no
+        # duration handshake because loop is True).
+        await self.emit(
+            "tier1",
+            "pitch_veo",
+            url,
+            loop=True,
+            mode="crossfade",
+            emitted_by="dispatch_audio_first_pitch",
+            muted=True,
+        )
+
+        # pitch_audio WS event — the dashboard's <audio> element plays this
+        # immediately and KaraokeCaptions tracks word-by-word. Same shape
+        # as the cached path so the dashboard handler is one code path.
+        pitch_audio_msg = {
+            "type": "pitch_audio",
+            "slug": slug or "ephemeral",
+            "url": audio_url,
+            "word_timings": word_timings or [],
+            "expected_duration_ms": audio_ms or None,
+            "script": script,
+            "ts": time.time_ns(),
+        }
+        try:
+            await self._broadcast(pitch_audio_msg)
+        except Exception:
+            logger.exception("[director] dispatch_audio_first_pitch broadcast failed")
+
+        # Schedule the fade-to-idle when audio ends (+500ms tail). We use
+        # the audio duration as the canonical timing source — the looping
+        # video has no inherent end.
+        if audio_ms and audio_ms > 0:
+            release_ms = audio_ms + 500
+
+            async def _release():
+                await asyncio.sleep(release_ms / 1000)
+                try:
+                    await self._broadcast({
+                        "type": "pitch_audio_end",
+                        "slug": slug or "ephemeral",
+                        "ts": time.time_ns(),
+                    })
+                except Exception:
+                    pass
+                await self.fade_to_idle()
+                await self.set_voice_state(None)
+
+            asyncio.create_task(_release())
+
+        logger.info("[director] dispatch_audio_first_pitch slug=%s "
+                    "video=%s audio=%s words=%d dur=%dms",
+                    slug or "ephemeral", Path(url).name,
+                    Path(audio_url).name, len(word_timings or []), audio_ms)
 
     # ── Listening backchannel (USE_BACKCHANNEL) ─────────────────────────────
     # Mic press → instantly swap Tier 1 to a "listening attentive" loop.

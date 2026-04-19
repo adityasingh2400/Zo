@@ -46,7 +46,7 @@ t0=$(date +%s)
 if state=$(curl -fsS "$BACKEND_URL/api/state" --max-time 3 2>/dev/null); then
   ok "backend reachable at $BACKEND_URL"
 else
-  fail "backend not reachable at $BACKEND_URL — start it: cd backend && uvicorn main:app --reload"
+  fail "backend not reachable at $BACKEND_URL — start it: cd backend && uvicorn main:app --host 0.0.0.0 --port 8000 --ws-max-size 67108864 --reload"
   state=""
 fi
 

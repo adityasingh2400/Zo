@@ -46,6 +46,14 @@ export function LiveStage({
   const tier1ARef = useRef(null);
   const tier1BRef = useRef(null);
 
+  // Tracks the in-flight Tier 1 volume-fade rAF id so a rapidly-arriving new
+  // Tier 1 clip can cancel the previous fade before starting its own. Without
+  // this, two rAF loops were running simultaneously over the same A/B
+  // elements — fighting over each other's volume targets — which produced
+  // dual-audio bleed (bridge audio + response audio playing together) plus
+  // the IndexSizeError volume crashes from out-of-range t values.
+  const tier1FadeRafRef = useRef(null);
+
   // Hidden <audio> element owned by LiveStage. Drives both audio-first
   // comment responses AND 30s pitch playback. KaraokeCaptions (Phase 4)
   // reads currentTime off this element via the ref. Single instance reused
@@ -109,9 +117,25 @@ export function LiveStage({
     const url = stream.tier1.url;
     const fadeMs = stream.tier1.fadeMs;
 
+    // Cancel any in-flight volume-fade rAF from a previous Tier 1 transition.
+    // Without this, rapid back-to-back Tier 1 clips (reading_chat → bridge →
+    // response, all within ~200ms in the cloud-escalate path) leave multiple
+    // rAF loops running concurrently, each setting volumes on the same A/B
+    // pair. The result was bridge audio bleeding into response audio (the
+    // "two audios at once" bug) and occasional IndexSizeError crashes when
+    // the loops disagreed about which element should be at volume 0.
+    if (tier1FadeRafRef.current) {
+      cancelAnimationFrame(tier1FadeRafRef.current);
+      tier1FadeRafRef.current = null;
+    }
+
     // Idle release — fade Tier 1 out, reveal Tier 0 underneath.
     if (!url) {
       const activeEl = tier1ActiveIsA ? tier1ARef.current : tier1BRef.current;
+      // Hard-mute the active element immediately so the audio drops with the
+      // visual, not 500ms after. Volume = 0 instead of muted=true so the
+      // playback continues (CSS opacity handles the visual fade), just silent.
+      try { if (activeEl) activeEl.volume = 0; } catch {}
       setTier1Opacity(0);
       setOverlayVisible(false);
       // After the fade settles, pause the active element so the decoder is free.
@@ -127,6 +151,15 @@ export function LiveStage({
     const incomingEl = activeIsA ? tier1BRef.current : tier1ARef.current;
     const outgoingEl = activeIsA ? tier1ARef.current : tier1BRef.current;
     if (!incomingEl) return;
+
+    // Force-mute the outgoing element NOW (before the new clip even loads)
+    // so the previous bridge/response can't keep blasting audio for the
+    // canplay → play() round trip (~150-300ms cold) while the new clip is
+    // preparing. The video continues playing visually under the new opacity
+    // crossfade — only the audio is silenced. This is the second half of the
+    // dual-audio fix: even if the previous fade's rAF was mid-flight when
+    // the new event arrived, this clamp guarantees no audio bleed.
+    try { if (outgoingEl) outgoingEl.volume = 0; } catch {}
 
     incomingEl.src = `${API_BASE}${url}`;
     // Audio-first path: Director sets muted=true on the play_clip event. The
@@ -182,19 +215,34 @@ export function LiveStage({
         }
 
         // Default path: rAF audio fade alongside the CSS opacity transition.
+        // t is clamped to [0, 1] on BOTH ends — without the lower clamp,
+        // performance.now() jitter (or any handler that re-fires the effect
+        // mid-tick) could produce a slightly negative t, throwing
+        // IndexSizeError on `el.volume = -0.025…` and aborting the fade.
+        // Storing the rAF id in a ref lets the NEXT Tier 1 transition cancel
+        // this loop before starting its own — eliminating concurrent fades
+        // fighting over the same A/B element volumes.
         const start = performance.now();
         function tick(now) {
-          const t = Math.min(1, (now - start) / fadeMs);
-          incomingEl.volume = t;
-          if (outgoingEl) outgoingEl.volume = 1 - t;
-          if (t < 1) requestAnimationFrame(tick);
-          else {
+          const t = Math.max(0, Math.min(1, (now - start) / fadeMs));
+          try {
+            incomingEl.volume = t;
+            if (outgoingEl) outgoingEl.volume = 1 - t;
+          } catch {
+            // Element was detached / src changed mid-tick — bail.
+            tier1FadeRafRef.current = null;
+            return;
+          }
+          if (t < 1) {
+            tier1FadeRafRef.current = requestAnimationFrame(tick);
+          } else {
+            tier1FadeRafRef.current = null;
             // Pause outgoing after the fade so the decoder is free for the
             // next preload.
             try { outgoingEl?.pause(); } catch {}
           }
         }
-        requestAnimationFrame(tick);
+        tier1FadeRafRef.current = requestAnimationFrame(tick);
       }).catch(err => {
         console.warn('[LiveStage] tier1 play() rejected', err);
         stream.sendAck(stream.tier1.intent, url, 'stalled');
@@ -263,6 +311,16 @@ export function LiveStage({
     a.preload = 'auto';
     a.volume = 1;
     setAudioPlaying(next);
+
+    // Defense-in-depth: when the standalone <audio> takes over the
+    // soundtrack, force-mute both Tier 1 video elements. This prevents the
+    // dual-audio bug where a still-playing bridge clip (or a response video
+    // that arrived with embedded audio while the standalone audio was also
+    // playing) keeps blasting its own TTS audio over the standalone audio.
+    // Their VIDEO continues — only the audio is silenced. The next regular
+    // Tier 1 emit will reset muted=audioFirstMuted as part of its setup.
+    try { if (tier1ARef.current) tier1ARef.current.muted = true; } catch {}
+    try { if (tier1BRef.current) tier1BRef.current.muted = true; } catch {}
 
     const playPromise = a.play();
     if (playPromise && typeof playPromise.catch === 'function') {

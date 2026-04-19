@@ -333,6 +333,14 @@ async def dashboard_ws(ws: WebSocket):
                 logger.info("[clip_ack] %s/%s status=%s",
                             msg.get("intent"), msg.get("url"), msg.get("status"))
 
+            elif msg.get("type") == "mic_pressed":
+                # USE_BACKCHANNEL: VoiceMic fires this on pointer-down BEFORE
+                # the audio recording even starts so the listening-attentive
+                # pose can swap into Tier 1 within ~50ms of the press. Visual
+                # only (REVISIONS §8) — no "mhm" audio.
+                if USE_BACKCHANNEL and director:
+                    asyncio.create_task(director.play_listening_attentive())
+
     except WebSocketDisconnect:
         dashboard_clients.remove(ws)
 
@@ -1655,6 +1663,8 @@ async def run_routed_comment(comment: str) -> dict:
     # 4. Dispatch.
     tool = decision["tool"]
     args = decision["args"]
+    if tool == "pitch_product":
+        return await _run_pitch_product(comment, args, decision)
     if tool == "respond_locally":
         return await _run_respond_locally(comment, args, decision)
     if tool == "play_canned_clip":
@@ -1665,6 +1675,50 @@ async def run_routed_comment(comment: str) -> dict:
     # the existing api_respond_to_comment, and on failure fade + broadcast
     # comment_failed with any drafted text.
     return await _run_escalate_to_cloud(comment, args, decision)
+
+
+async def _run_pitch_product(comment: str, args: dict, decision: dict) -> dict:
+    """Trigger the pre-rendered pitch flow for the active product. The
+    Director.play_pitch_veo path emits a muted looping Tier 1 video AND
+    broadcasts a `pitch_audio` event the dashboard plays through its
+    standalone <audio> element with karaoke captions on top.
+
+    Falls back to escalate_to_cloud if:
+      • No active product (nothing to look up in the manifest)
+      • USE_PITCH_VEO=0 (kill switch)
+      • The product slug isn't in the pitch manifest yet (operator hasn't
+        run scripts/render_pitch_assets.py for it)
+    Cloud fallback uses the existing /api/respond_to_comment which produces
+    a generic LLM-drafted answer through Wav2Lip — fine but slow.
+    """
+    if not USE_PITCH_VEO:
+        logger.info("[router] pitch_product but USE_PITCH_VEO=0 — escalating")
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    slug = pipeline_state.get("active_product_id")
+    if not slug or director is None:
+        logger.warning("[router] pitch_product but no active product / director — escalating")
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    entry = await director.play_pitch_veo(slug)
+    if entry is None:
+        logger.warning("[router] pitch_product slug=%s not in manifest — escalating", slug)
+        return await _run_escalate_to_cloud(comment, {"comment": comment}, decision)
+
+    # The dashboard owns the rest: <audio> plays the cached MP3, KaraokeCaptions
+    # populates word-by-word, fade_to_idle scheduled by the Director. Nothing
+    # else to do here besides return telemetry.
+    audio_ms = int(entry.get("audio_ms") or 0)
+    return {
+        "dispatch": "pitch_product",
+        "routing": decision,
+        "comment": comment,
+        "slug": slug,
+        "audio_url": entry.get("audio_url"),
+        "video_url": entry.get("video_url"),
+        "expected_duration_ms": audio_ms,
+        "total_ms": decision["ms"],
+    }
 
 
 async def _run_escalate_to_cloud(comment: str, args: dict, decision: dict) -> dict:

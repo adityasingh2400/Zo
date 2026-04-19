@@ -106,7 +106,7 @@ export default function App() {
           style={styles.sellInput}
           placeholder='e.g. "sell this for $49 targeting young professionals"'
         />
-        <VoiceMic voiceTranscript={voiceTranscript} />
+        <VoiceMic voiceTranscript={voiceTranscript} wsRef={wsRef} />
         <label style={styles.uploadLabel}>
           🎬 Upload Video
           <input

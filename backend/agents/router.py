@@ -39,6 +39,9 @@ COST_SAVED_USD_PER_TOOL = {
     # the comment was spam — we'd pay for the draft even if we never rendered
     # an avatar response. Blocking pre-draft is a real avoided cost.
     "block_comment":    COST_PER_CLOUD_COMMENT_USD,
+    # Pitch playback is pre-rendered: cached audio + cached video + zero
+    # cloud LLM/TTS hit at runtime. Saves the equivalent of a comment.
+    "pitch_product":    COST_PER_CLOUD_COMMENT_USD,
     "escalate_to_cloud": 0.0,
 }
 
@@ -104,6 +107,20 @@ TOOL_SCHEMA: list[dict[str, Any]] = [
             "type": "object",
             "properties": {"reason": {"type": "string"}},
             "required": ["reason"],
+        },
+    },
+    {
+        "name": "pitch_product",
+        "description": (
+            "Use for seller pitch commands like 'sell this for $40 to Gen Z'. "
+            "Plays the pre-rendered 30s pitch audio + Veo video + karaoke "
+            "captions. Triggered by the seller, not the audience. Args: the "
+            "original command text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"comment": {"type": "string"}},
+            "required": ["comment"],
         },
     },
 ]
@@ -193,10 +210,51 @@ _SPAM_CUES = ("http://", "https://", ".com/", ".net/", "www.",
               "promo code", "subscribe to", "check out my")
 
 
+# ── Pitch command detection ──────────────────────────────────────────────────
+# Seller commands ("sell this", "pitch the wallet") are different from
+# audience comments — they trigger the 30s pitch Veo path. Detected up-front
+# in the router so the dispatcher can fork to pitch_product before the
+# question/compliment/objection logic ever runs. Permissive on purpose: false
+# positives just trigger the pitch (on-brand for any "sell" command); false
+# negatives read as unresponsive on stage.
+_PITCH_TRIGGERS = (
+    "sell this", "sell it", "sell them", "sell the",
+    "pitch this", "pitch it", "pitch the", "pitch them",
+    "tell them about", "tell people about", "tell the audience",
+    "do the pitch", "give the pitch", "go ahead and sell",
+    "let's sell", "let us sell", "lets sell",
+    "introduce this", "showcase this",
+)
+
+
+def _detect_pitch_command(comment: str, product: dict | None) -> dict | None:
+    """Return a pitch_product decision dict if `comment` looks like a seller
+    pitch command, else None. Requires an active product — without one
+    there's nothing to look up in the pitch manifest."""
+    if not product:
+        return None
+    c_lower = (comment or "").lower().strip()
+    if not c_lower:
+        return None
+    if not any(trigger in c_lower for trigger in _PITCH_TRIGGERS):
+        return None
+    return {
+        "tool": "pitch_product",
+        "args": {"comment": comment},
+        "reason": f"Pitch trigger matched in: '{c_lower[:60]}'",
+    }
+
+
 def _rule_based_decide(comment: str, classify: dict, product: dict | None) -> dict:
     """Decision logic when Cactus FunctionGemma isn't available (Hour 4-5
     default; Hour 6-7 promotes FunctionGemma to primary and keeps this as
     the fallback). Returns {tool, args, reason}."""
+    # 0. Pitch command check FIRST — "sell this for $40 to Gen Z" should
+    #    fire the 30s pitch Veo path before any question/compliment logic.
+    pitch_decision = _detect_pitch_command(comment, product)
+    if pitch_decision:
+        return pitch_decision
+
     t = (classify or {}).get("type", "question")
     c_lower = (comment or "").lower()
     c_tokens = _tokens(comment)

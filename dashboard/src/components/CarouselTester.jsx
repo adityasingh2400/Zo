@@ -16,13 +16,34 @@ export function CarouselTester() {
   const [view, setView] = useState(null);          // { kind, frames, stats, ... } from /api/build_carousel
   const [stats, setStats] = useState(null);
   const [params, setParams] = useState({
-    n_frames: 36,
+    // Bumped from 36 → 48 — the carousel_from_video function default. The
+    // first test render came back fast enough that there's headroom to
+    // capture more angles without exceeding the 5-6s demo budget.
+    n_frames: 48,
     out_size: 1024,
     clean_bg: true,
-    rembg_model: 'u2net',
+    // Switched default from u2net → isnet-general-use. Newer (2022 vs 2020),
+    // generally better edge fidelity on small product details (logos,
+    // textures, jewelry), comparable speed since both models internally
+    // resize to 320x320. ~170MB one-time download — backend prewarms it
+    // at startup alongside u2net so the first render isn't paying for it.
+    rembg_model: 'isnet-general-use',
     stabilize: true,
     remove_skin: false,
     keep_central: true,
+    // Hard trim of seconds from the head/tail of the video BEFORE frames
+    // are extracted. Predictable + explicit — the user-preferred way to
+    // handle "operator filmed the product but panned onto the MacBook
+    // in the last 1-2 seconds". Default tail trim of 1.0s catches that
+    // common case without accidentally killing real product frames.
+    // Future clean videos: dial both to 0.
+    trim_head_seconds: 0.0,
+    trim_tail_seconds: 1.0,
+    // Auto-detection of a wandering subject (different mean color/coverage
+    // than the median) — kept available but defaulted OFF in favor of the
+    // explicit trim above. Flip on for belt-and-suspenders if a video has
+    // unpredictable bad frames mid-shot, not just at the ends.
+    subject_continuity: false,
   });
   const [busy, setBusy] = useState(false);
   const [busyMs, setBusyMs] = useState(0);
@@ -62,6 +83,9 @@ export function CarouselTester() {
       fd.append('stabilize', String(params.stabilize));
       fd.append('remove_skin', String(params.remove_skin));
       fd.append('keep_central', String(params.keep_central));
+      fd.append('subject_continuity', String(params.subject_continuity));
+      fd.append('trim_head_seconds', String(params.trim_head_seconds));
+      fd.append('trim_tail_seconds', String(params.trim_tail_seconds));
       const t0 = performance.now();
       const res = await fetch(`${API_BASE}/api/build_carousel`, { method: 'POST', body: fd });
       const elapsed = Math.round(performance.now() - t0);
@@ -235,13 +259,27 @@ export function CarouselTester() {
                      onChange={(v) => setParams(p => ({ ...p, remove_skin: v }))} />
               <Param label="keep_central" type="checkbox" value={params.keep_central}
                      onChange={(v) => setParams(p => ({ ...p, keep_central: v }))} />
+              <Param label="trim_head_seconds" type="number" value={params.trim_head_seconds}
+                     min={0} max={5} step={0.5}
+                     onChange={(v) => setParams(p => ({ ...p, trim_head_seconds: parseFloat(v) || 0 }))} />
+              <Param label="trim_tail_seconds" type="number" value={params.trim_tail_seconds}
+                     min={0} max={5} step={0.5}
+                     onChange={(v) => setParams(p => ({ ...p, trim_tail_seconds: parseFloat(v) || 0 }))} />
+              <Param label="subject_continuity" type="checkbox" value={params.subject_continuity}
+                     onChange={(v) => setParams(p => ({ ...p, subject_continuity: v }))} />
             </div>
             <div style={styles.paramsHint}>
+              <strong style={{color:'#a1a1aa'}}>trim_head/tail_seconds</strong>{' '}
+              chops time off either end of the video before frame extraction.
+              Use for "operator panned onto the MacBook at the end" (1.0s default).
+              Set both 0 for clean videos that don't need trimming.{' '}
               <strong style={{color:'#a1a1aa'}}>keep_central</strong> drops
               notebook / stand props from the alpha — leave on for shoots where
               the product sits on something.{' '}
               <strong style={{color:'#a1a1aa'}}>remove_skin</strong> kills hand
-              pixels (don't enable for tan-leather products).
+              pixels (don't enable for tan-leather products).{' '}
+              <strong style={{color:'#a1a1aa'}}>subject_continuity</strong>{' '}
+              auto-detects wandering subjects (off by default in favor of explicit trim).
             </div>
           </div>
 
@@ -352,6 +390,26 @@ function StatsTable({ stats }) {
            hint={keptPct != null ? `${keptPct.toFixed(0)}%` : ''}
            color={keptPct == null ? '#fafafa' : band(-keptPct, -80, -50)} />
       <Row label="dropped" value={`${dropped ?? 0}`} />
+      {stats.subject_outliers_dropped > 0 && (
+        <Row
+          label="  ↳ wrong subject"
+          value={`${stats.subject_outliers_dropped}`}
+          color="#fbbf24"
+          hint={
+            stats.subject_outlier_debug?.dropped_indices?.length > 0
+              ? `frames ${stats.subject_outlier_debug.dropped_indices.join(',')}`
+              : 'camera wandered off the product'
+          }
+        />
+      )}
+      {(stats.trim_head_seconds > 0 || stats.trim_tail_seconds > 0) && (
+        <Row
+          label="trim window"
+          value={`-${stats.trim_head_seconds}s / -${stats.trim_tail_seconds}s`}
+          color="#a78bfa"
+          hint={`${stats.video_duration_sec}s → ${stats.effective_duration_sec}s effective`}
+        />
+      )}
       <Row label="rembg model" value={stats.rembg_model || '—'} />
       <Row label="median crop side" value={`${orbit.median_side_px ?? '—'} px`} />
       <Row label="center drift" value={`${orbit.center_stddev_px ?? '—'} px`}

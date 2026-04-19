@@ -448,6 +448,17 @@ function CarouselSpin({
   // crossfade. Scheduling setPhase every tick would re-render at 60Hz, so
   // we throttle to whole-frame transitions.
   const phaseRef = useRef(0);
+  // Ping-pong state. The carousel is NOT a true 360° capture — the seller
+  // films a partial sweep, so wrapping from frame N back to frame 0 produces
+  // a visible jump cut. Instead we bounce at the ends: forward → 1s dwell at
+  // the last frame → reverse at the same speed → 1s dwell at frame 0 → repeat.
+  // direction = +1 (forward) or -1 (reverse). dwellUntil = perf.now() ts;
+  // while now < dwellUntil the spin holds still on the boundary frame.
+  const directionRef = useRef(1);
+  const dwellUntilRef = useRef(0);
+  // Dwell time at each end before reversing. 1000ms reads as a deliberate
+  // "look at this side" beat without feeling like the demo froze.
+  const PINGPONG_DWELL_MS = 1000;
 
   const [phase, setPhase] = useState(0);
   const [paused, setPaused] = useState(false);
@@ -626,10 +637,18 @@ function CarouselSpin({
       const canDrawGL = !glFailed && s && s.tex;
 
       // Compute target speed in frames-per-second based on state + drag/inertia.
-      // Direction: positive = clockwise spin.
+      // Direction: signed via directionRef (+1 forward, -1 reverse) so the
+      // ping-pong reversal at each end happens for free in the speed signal.
       const baseFps = (frames.length / Math.max(0.5, secondsPerRev)) * stateStyle.speedMul;
-      let targetSpeed = autoSpin && !paused ? baseFps : 0;
+      const inDwell = now < dwellUntilRef.current;
+      // While dwelling at an end, the target is 0 — the spring decelerates
+      // smoothly into the boundary frame instead of snapping.
+      let targetSpeed = (autoSpin && !paused && !inDwell)
+        ? baseFps * directionRef.current
+        : 0;
       // Inertia: when user releases a fast drag, ride that velocity for a beat.
+      // Drag inertia is signed by the drag itself, so it can carry the spin
+      // either direction independent of directionRef.
       if (Math.abs(inertiaVelRef.current) > 0.01) {
         targetSpeed = inertiaVelRef.current;
         // Decay
@@ -642,23 +661,48 @@ function CarouselSpin({
       const [c1, v1] = stepSpring(sp.curr, targetSpeed, sp.vel, 14, 6, dt);
       sp.curr = c1; sp.vel = v1;
 
-      // Subtle sinusoidal wobble at the "seam" so the eye doesn't catch the loop.
-      // Slowest when crossing frame 0; fastest in between. Tiny effect (±5%).
-      let speed = sp.curr;
-      const seamPos = (phaseRef.current / frames.length); // 0..1
-      const seamMod = 1.0 + 0.05 * Math.sin(seamPos * Math.PI * 2 - Math.PI / 2);
-      speed *= seamMod;
+      // Direct speed from the spring. The legacy "seam wobble" was a hack to
+      // disguise the wrap from frame N → 0 — irrelevant in ping-pong mode
+      // because there's no wrap, so we drop the ±5% sinusoidal modulation.
+      const speed = sp.curr;
 
       // Advance the ref-truth. We never read React `phase` here.
       const prevWhole = Math.floor(phaseRef.current);
+      const lastIdx = frames.length - 1;
       const nextPhase = phaseRef.current + speed * dt;
-      const wrapped = ((nextPhase % frames.length) + frames.length) % frames.length;
-      phaseRef.current = wrapped;
-      // Re-render UI affordances only on whole-frame transitions to avoid 60Hz reflow.
-      if (Math.floor(wrapped) !== prevWhole) {
-        setPhase(wrapped);
+
+      // Ping-pong boundary handling. When the spin would cross either end,
+      // clamp to the boundary frame and either:
+      //   (a) under inertia/drag → kill the velocity (no bounce; release
+      //       inertia hitting a wall should feel like hitting a wall, not
+      //       like a magic ricochet)
+      //   (b) under auto-spin → enter a 1s dwell on this boundary, then
+      //       flip direction so the next non-dwell tick spins back.
+      let resolved = nextPhase;
+      if (nextPhase >= lastIdx) {
+        resolved = lastIdx;
+        if (Math.abs(inertiaVelRef.current) > 0.01) {
+          inertiaVelRef.current = 0;
+        } else if (autoSpin && !paused && !inDwell) {
+          dwellUntilRef.current = now + PINGPONG_DWELL_MS;
+          directionRef.current = -1;
+        }
+      } else if (nextPhase <= 0) {
+        resolved = 0;
+        if (Math.abs(inertiaVelRef.current) > 0.01) {
+          inertiaVelRef.current = 0;
+        } else if (autoSpin && !paused && !inDwell) {
+          dwellUntilRef.current = now + PINGPONG_DWELL_MS;
+          directionRef.current = 1;
+        }
       }
-      const renderPhase = wrapped;
+
+      phaseRef.current = resolved;
+      // Re-render UI affordances only on whole-frame transitions to avoid 60Hz reflow.
+      if (Math.floor(resolved) !== prevWhole) {
+        setPhase(resolved);
+      }
+      const renderPhase = resolved;
 
       // Highlight ramp — ease toward 1 then back to 0.
       const targetHi = state === 'responding' ? 1.0 : 0.0;
@@ -715,9 +759,14 @@ function CarouselSpin({
 
   // ── Pointer drag → scrub + inertia ────────────────────────────────────────
   function setPhaseBoth(v) {
-    const w = ((v % frames.length) + frames.length) % frames.length;
-    phaseRef.current = w;
-    setPhase(w);
+    // Ping-pong mode: the carousel isn't a true 360° capture, so dragging
+    // (or arrow-key scrubbing) past either end shouldn't wrap to the other
+    // side — that creates the same jump-cut we removed from auto-spin.
+    // Clamp to [0, lastIdx] so the user's manual scrub respects the same
+    // physical bounds as the autospin.
+    const clamped = Math.max(0, Math.min(frames.length - 1, v));
+    phaseRef.current = clamped;
+    setPhase(clamped);
   }
   function onPointerDown(e) {
     setPaused(true);

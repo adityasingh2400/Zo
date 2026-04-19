@@ -273,10 +273,18 @@ async def lifespan(app: FastAPI):
     # given model — paying that cost here means the first user video upload
     # doesn't eat 30+ extra seconds. Fire and forget; if it fails the live
     # path still works (just pays the compile cost on first real call).
+    #
+    # We warm BOTH u2net (production carousel default) and isnet-general-use
+    # (carousel tester default — newer model with better edge fidelity for
+    # product textures). Warming both in parallel costs the same wall-clock
+    # as warming one (each model uses its own session pool); the upside is
+    # that switching rembg_model in the tester UI doesn't trigger a 170MB
+    # download mid-demo.
     try:
         from agents.threed import prewarm_rembg
         import asyncio as _aio
         _aio.create_task(prewarm_rembg("u2net"))
+        _aio.create_task(prewarm_rembg("isnet-general-use"))
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
 
@@ -2179,6 +2187,9 @@ async def api_build_carousel(
     stabilize: bool = Form(True),
     remove_skin: bool = Form(False),
     keep_central: bool = Form(True),
+    subject_continuity: bool = Form(True),
+    trim_head_seconds: float = Form(0.0),
+    trim_tail_seconds: float = Form(0.0),
 ):
     """Build a 3D-spin carousel from an uploaded video. Tweaks exposed for
     local debugging — defaults match the production pipeline."""
@@ -2193,6 +2204,9 @@ async def api_build_carousel(
             video_path, n_frames=n_frames, out_size=out_size,
             clean_bg=clean_bg, rembg_model=rembg_model, stabilize=stabilize,
             remove_skin=remove_skin, keep_central=keep_central,
+            subject_continuity=subject_continuity,
+            trim_head_seconds=trim_head_seconds,
+            trim_tail_seconds=trim_tail_seconds,
         )
     finally:
         Path(video_path).unlink(missing_ok=True)

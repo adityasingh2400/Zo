@@ -310,6 +310,9 @@ async def carousel_from_video(
     smooth_window: int = 7,
     remove_skin: bool = False,
     keep_central: bool = True,
+    subject_continuity: bool = True,
+    trim_head_seconds: float = 0.0,
+    trim_tail_seconds: float = 0.0,
     n_heroes: int = 4,
     hero_size: int = 1536,
 ) -> dict[str, Any]:
@@ -375,12 +378,21 @@ async def carousel_from_video(
         }
 
     # 1. Extract 3x candidates so we can drop blurry / motion-corrupt shots.
+    # Effective duration accounts for head/tail trim — fps is computed
+    # against the trimmed window so we still get target_frames spread
+    # across the kept portion of the video.
+    effective_duration = max(0.5, duration - trim_head_seconds - trim_tail_seconds)
     candidates_per_slot = 3
     target_frames = n_frames * candidates_per_slot
-    fps = max(target_frames / duration, 0.5)
+    fps = max(target_frames / effective_duration, 0.5)
 
     t0 = time.perf_counter()
-    raw = await _ffmpeg_extract_jpegs(video_path, fps=fps)
+    raw = await _ffmpeg_extract_jpegs(
+        video_path, fps=fps,
+        trim_head_seconds=trim_head_seconds,
+        trim_tail_seconds=trim_tail_seconds,
+        duration=duration,
+    )
     extract_ms = int((time.perf_counter() - t0) * 1000)
     if not raw:
         return {"kind": "frame_carousel", "frames": [], "ms": 0, "source": "video", "error": "extract_failed"}
@@ -493,6 +505,28 @@ async def carousel_from_video(
                 "source": "video", "error": "all_frames_dropped",
                 "stats": {"sharpness_dropped": sharpness_dropped,
                           "coverage_dropped": coverage_dropped,
+                          "candidates": len(picks),
+                          "sharpness_cutoff": round(cutoff, 2)}}
+
+    # 4b. Subject-continuity filter. Drops frames where the camera wandered
+    #     off the product (operator pans onto their MacBook in the last few
+    #     frames is the canonical case — rembg cuts the laptop and it ends
+    #     up in the spin). Uses coverage + mean foreground color outliers
+    #     against the median of the sequence; safe-guarded so it never
+    #     drops more than 30% (returns unfiltered if it would).
+    subject_outliers_dropped = 0
+    subject_outlier_debug: dict[str, Any] = {}
+    if subject_continuity and len(frame_records) >= 4:
+        frame_records, subject_outliers_dropped, subject_outlier_debug = (
+            _drop_subject_outliers(frame_records)
+        )
+
+    if not frame_records:
+        return {"kind": "frame_carousel", "frames": [], "ms": 0,
+                "source": "video", "error": "all_frames_dropped_post_continuity",
+                "stats": {"sharpness_dropped": sharpness_dropped,
+                          "coverage_dropped": coverage_dropped,
+                          "subject_outliers_dropped": subject_outliers_dropped,
                           "candidates": len(picks),
                           "sharpness_cutoff": round(cutoff, 2)}}
 
@@ -615,6 +649,20 @@ async def carousel_from_video(
             "dropped": len(picks) - len(frame_records),
             "sharpness_dropped": sharpness_dropped,
             "coverage_dropped": coverage_dropped,
+            # Subject-continuity stats: how many frames got cut because the
+            # camera wandered onto a different subject (e.g. operator's
+            # MacBook in the last few frames of an orbit shot). Includes the
+            # exact dropped frame indices + the median band so the tester
+            # can show WHY a frame was dropped if a real product gets killed.
+            "subject_outliers_dropped": subject_outliers_dropped,
+            "subject_outlier_debug": subject_outlier_debug,
+            # Trim window applied at ffmpeg-time. Original video duration
+            # vs. effective_duration (= original − head − tail) tells the
+            # tester how much footage the seek+cap actually saw.
+            "trim_head_seconds": round(trim_head_seconds, 2),
+            "trim_tail_seconds": round(trim_tail_seconds, 2),
+            "video_duration_sec": round(duration, 2),
+            "effective_duration_sec": round(effective_duration, 2),
             "sharpness_cutoff": round(cutoff, 2),
             "rembg_model": rembg_model if session is not None else None,
             "stabilized": stabilize,
@@ -701,9 +749,36 @@ async def _video_duration(video_path: str) -> float:
         return 0.0
 
 
-async def _ffmpeg_extract_jpegs(video_path: str, fps: float) -> list[bytes]:
-    cmd = [
-        "ffmpeg", "-i", video_path,
+async def _ffmpeg_extract_jpegs(
+    video_path: str,
+    fps: float,
+    trim_head_seconds: float = 0.0,
+    trim_tail_seconds: float = 0.0,
+    duration: float = 0.0,
+) -> list[bytes]:
+    """Extract frames as a stream of MJPEG bytes via ffmpeg.
+
+    `trim_head_seconds` skips the start of the video (operator fumbling
+    with focus, hand reaching toward the product, etc.). `trim_tail_seconds`
+    chops the end (camera panning away onto a desk, MacBook, coffee cup).
+
+    Both use ffmpeg's INPUT-side seek (`-ss` before `-i`, `-t` after `-i`):
+      - `-ss` before `-i`: fast keyframe seek (cheap; can be ±a frame).
+      - `-t`  after `-i`: cap the decoded duration after the seek.
+    The ±frame imprecision doesn't matter here — we're trimming chunks of
+    seconds, not frame-accurate cuts. `duration` is required when
+    `trim_tail_seconds > 0` so we can compute the post-seek -t window.
+    """
+    cmd = ["ffmpeg"]
+    if trim_head_seconds > 0:
+        cmd += ["-ss", f"{trim_head_seconds:.3f}"]
+    cmd += ["-i", video_path]
+    if trim_tail_seconds > 0 and duration > 0:
+        # -t is relative to the post-seek clock when -ss came before -i,
+        # so it equals (effective duration) directly.
+        new_duration = max(0.1, duration - trim_head_seconds - trim_tail_seconds)
+        cmd += ["-t", f"{new_duration:.3f}"]
+    cmd += [
         "-vf", f"fps={fps:.3f}",
         "-f", "image2pipe", "-vcodec", "mjpeg",
         "-q:v", "2", "-loglevel", "error", "-",
@@ -734,6 +809,121 @@ def _sharpness(jpeg: bytes) -> float:
     if gray is None:
         return 0.0
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _drop_subject_outliers(
+    records: list[dict],
+    coverage_factor: float = 2.0,
+    color_threshold: float = 60.0,
+    min_keep_ratio: float = 0.7,
+) -> tuple[list[dict], int, dict]:
+    """Drop frames whose foreground subject differs strongly from the rest.
+
+    The classic failure mode this catches: the operator's product video
+    pans onto the MacBook (or coffee cup, or hand, or wall) for the last
+    few frames. rembg dutifully extracts the new subject as foreground;
+    without this filter it ends up in the spin carousel and the spin
+    looks "broken" because two unrelated objects rotate past each other.
+
+    Two cheap, complementary signals computed from data rembg already
+    produced — no extra model calls, no perceptual hash, no CLIP embedding:
+
+      1. **Coverage outlier.** Frame coverage (fraction of pixels with
+         alpha > 0) is roughly stable across an orbit shot of one product.
+         A different subject (a MacBook is huge in the frame; a watch is
+         small) shifts coverage by 3-10x. Drop frames whose coverage is
+         outside [median / coverage_factor, median * coverage_factor].
+
+      2. **Mean foreground color outlier.** Average RGB of the alpha-masked
+         region is also roughly stable across an orbit (you're seeing
+         different sides of the SAME object, similar materials). A different
+         subject has a different color signature. Drop frames whose Euclidean
+         distance from the median mean-color exceeds color_threshold (60 in
+         0..255 RGB space ≈ a clearly visible color shift, not metamerism).
+
+    Safety: never drop more than (1 - min_keep_ratio) of the carousel.
+    If the outlier filter would starve the carousel below that threshold
+    (e.g. the entire video is a uniform mess), it returns the unfiltered
+    records and logs the abort. The downstream pipeline still emits a
+    carousel — quality just degrades gracefully instead of erroring.
+
+    Args:
+      records: post-rembg frame records (`rgba`, `bbox`, `coverage`, ...).
+      coverage_factor: outlier band half-width on coverage. Default 2.0
+                       (frame coverage must be 0.5x..2x median to keep).
+      color_threshold: Euclidean RGB distance from median that flags an
+                       outlier. Default 60 (~25% color shift on 0..255).
+      min_keep_ratio: refuse to filter if fewer than this fraction would
+                      survive. Default 0.7 (must keep ≥70% of frames).
+
+    Returns:
+      (kept_records, dropped_count, debug_stats_dict)
+    """
+    if len(records) < 4:
+        # Not enough frames for stable median estimation. Don't filter.
+        return records, 0, {"reason": "too_few_frames", "n": len(records)}
+
+    coverages = np.array([r["coverage"] for r in records], dtype=np.float64)
+    median_cov = float(np.median(coverages))
+    cov_lo = median_cov / coverage_factor
+    cov_hi = median_cov * coverage_factor
+
+    mean_colors = np.zeros((len(records), 3), dtype=np.float64)
+    for i, r in enumerate(records):
+        rgba = np.asarray(r["rgba"])  # (H, W, 4) uint8
+        if rgba.ndim != 3 or rgba.shape[2] < 4:
+            mean_colors[i] = np.array([0.0, 0.0, 0.0])
+            continue
+        alpha = rgba[:, :, 3]
+        mask = alpha > 16  # ignore semi-transparent fringe
+        if mask.sum() < 16:
+            mean_colors[i] = np.array([0.0, 0.0, 0.0])
+            continue
+        rgb = rgba[:, :, :3][mask].astype(np.float32)
+        mean_colors[i] = rgb.mean(axis=0)
+    median_color = np.median(mean_colors, axis=0)
+    color_dists = np.linalg.norm(mean_colors - median_color, axis=1)
+
+    keep: list[dict] = []
+    dropped_indices: list[int] = []
+    for i, r in enumerate(records):
+        cov_ok = cov_lo <= r["coverage"] <= cov_hi
+        color_ok = color_dists[i] <= color_threshold
+        if cov_ok and color_ok:
+            keep.append(r)
+        else:
+            dropped_indices.append(r["idx"])
+            logger.info(
+                "[subject_outlier] drop frame %d: coverage=%.3f (median %.3f, band [%.3f, %.3f]), "
+                "color_dist=%.1f (threshold %.1f)",
+                r["idx"], r["coverage"], median_cov, cov_lo, cov_hi,
+                color_dists[i], color_threshold,
+            )
+
+    kept_ratio = len(keep) / len(records)
+    if kept_ratio < min_keep_ratio:
+        # Filter would drop too many — likely a uniformly weird shoot
+        # (handheld through a window, low-light noise, etc.) where the
+        # outlier signal is unreliable. Bail out, return all records.
+        logger.warning(
+            "[subject_outlier] aborted: would keep only %.0f%% of %d frames "
+            "(min %.0f%%) — returning unfiltered",
+            kept_ratio * 100, len(records), min_keep_ratio * 100,
+        )
+        return records, 0, {
+            "reason": "would_starve_carousel",
+            "would_drop": len(records) - len(keep),
+            "would_keep_ratio": round(kept_ratio, 3),
+        }
+
+    debug = {
+        "median_coverage": round(median_cov, 4),
+        "coverage_band": [round(cov_lo, 4), round(cov_hi, 4)],
+        "median_color_rgb": [int(c) for c in median_color],
+        "color_threshold": color_threshold,
+        "dropped_indices": dropped_indices,
+    }
+    return keep, len(dropped_indices), debug
 
 
 def _pick_sharpest_per_slot(frames: list[bytes], n_slots: int) -> list[bytes]:

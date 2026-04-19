@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useEmpireSocket } from './hooks/useEmpireSocket';
 import { TikTokShopOverlay } from './components/TikTokShopOverlay';
 import { StartDemoOverlay } from './components/StartDemoOverlay';
+import { ChatPanel } from './components/ChatPanel';
 import { LanguagePicker } from './components/LanguagePicker';
 
 /**
@@ -38,6 +39,8 @@ export default function App() {
     view3d,
     activeClips,
     activeLanguage, setActiveLanguage,
+    commentResponse, sendComment,
+    routingDecision,
   } = useEmpireSocket();
 
   const [dragging, setDragging] = useState(false);
@@ -208,6 +211,39 @@ export default function App() {
         <ClipHudRow label="T1" clip={activeClips?.tier1} />
       </div>
 
+      {/* Gemma decision HUD — top-left, directly under the clip HUD.
+          Mirrors the dispatcher's view of an incoming comment in real
+          time:
+            • the moment classify_comment_gemma returns (~300 ms after
+              POST), `routing_decision` lands and we render the comment
+              text + intent badge + Gemma's draft response.
+            • when the Wav2Lip render lands (~5-8 s later),
+              `comment_response_video` lands and we overlay the
+              substrate filename + class/tts/lipsync/total ms breakdown.
+          Color-coded badges match the bridge bucket (green=compliment,
+          orange=objection, blue=question, gray=spam, purple=neutral). */}
+      <GemmaDecisionHud
+        routingDecision={routingDecision}
+        commentResponse={commentResponse}
+      />
+      
+
+      {/* Dev comment-tester panel — bottom-left floating chat. Always
+          visible so we can test the bridge+wav2lip dispatch path even
+          before an upload (Maya responds against whatever active
+          product_data is loaded — leather_wallet by default). Wired to
+          sendComment from useEmpireSocket which posts to /api/comment,
+          and reads commentResponse so the panel renders the AI reply
+          with a latency chip. Same UX as the operator's existing chat
+          surface in /stage; this is the test surface. */}
+      <div style={styles.chatDock}>
+        <ChatPanel
+          onSendComment={sendComment}
+          commentResponse={commentResponse}
+          pendingComments={pendingComments}
+        />
+      </div>
+
       {/* Tiny connection indicator — bottom-right corner. Only loud when
           DISCONNECTED so the operator knows when to refresh. CONNECTED
           state stays whisper-quiet (no green spam during a stable run). */}
@@ -226,6 +262,136 @@ export default function App() {
         />
         {connected ? 'live' : 'DISCONNECTED'}
       </div>
+    </div>
+  );
+}
+
+// Color tokens per Gemma intent bucket. Matches the bridge clip
+// directories under /workspace/bridges/<intent>/ on the pod (and
+// phase0/assets/bridges/<intent>/ locally). Picked for high contrast
+// against the dark stage so the badge reads at-a-glance — green for
+// "yes!", orange for "hmm not sure", blue for "thinking question",
+// gray for blocked spam.
+const INTENT_PALETTE = {
+  compliment: { bg: 'rgba(34,197,94,0.92)',  fg: '#052e16', label: 'COMPLIMENT' },
+  objection:  { bg: 'rgba(249,115,22,0.92)', fg: '#431407', label: 'OBJECTION' },
+  question:   { bg: 'rgba(59,130,246,0.92)', fg: '#172554', label: 'QUESTION' },
+  spam:       { bg: 'rgba(113,113,122,0.92)',fg: '#0a0a0b', label: 'SPAM' },
+  neutral:    { bg: 'rgba(168,85,247,0.92)', fg: '#2e1065', label: 'NEUTRAL' },
+  unknown:    { bg: 'rgba(82,82,91,0.92)',   fg: '#fafafa', label: '?' },
+};
+
+// Compact panel showing the current Gemma + router decision. Two-phase
+// hydration so the operator never sees blank UI:
+//   1. routing_decision arrives ~300 ms after the comment POST. We have
+//      `comment`, `intent`, `intent_hint`, `tool`, `draft_response`,
+//      `classify_ms`. Render that immediately with a "rendering…" hint.
+//   2. comment_response_video arrives ~5-8 s later when Wav2Lip is done.
+//      We pick up `substrate`, full `total_ms`, and per-stage timings.
+// Mismatched comments (response is for a stale comment) are ignored —
+// keyed on comment string equality.
+function GemmaDecisionHud({ routingDecision, commentResponse }) {
+  // Prefer the latest commentResponse fields when they cover the SAME
+  // comment as the routing event. Otherwise show whichever is newer
+  // (the routing decision for an in-flight render, or the response for
+  // the previous comment if no fresh routing has fired yet).
+  const sameComment =
+    routingDecision && commentResponse &&
+    routingDecision.comment === commentResponse.comment;
+  const haveAny = !!(routingDecision || commentResponse);
+  if (!haveAny) {
+    return (
+      <div style={styles.gemmaHud}>
+        <div style={{ ...styles.gemmaRow, opacity: 0.45 }}>
+          <span style={styles.gemmaTier}>GEMMA</span>
+          <span style={styles.gemmaIdle}>idle — waiting for comment</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Choose the source of truth.
+  const fromResp = !!commentResponse;
+  const ds = commentResponse || routingDecision;
+  const comment = ds.comment || '';
+  // Intent priority: explicit `intent` field > router's `intent_hint` >
+  // 'unknown'. Spam suppresses the hint (the dispatcher blocks before
+  // picking a substrate).
+  const isSpam = ds.tool === 'block_comment' || ds.intent === 'spam';
+  const intentKey = isSpam
+    ? 'spam'
+    : (ds.intent_hint || ds.intent || 'unknown').toLowerCase();
+  const palette = INTENT_PALETTE[intentKey] || INTENT_PALETTE.unknown;
+
+  // Substrate filename — appears in TWO places:
+  //   1. routingDecision.substrate — set by comment_substrate_picked
+  //      WS event (fires within ~300 ms of POST, before render starts)
+  //   2. commentResponse.substrate — set by comment_response_video WS
+  //      event (fires 5-15 s later when render completes)
+  // Prefer the freshest one; fall back to the early signal so the HUD
+  // can show the picked clip during the render window instead of just
+  // a "● rendering" pulse.
+  const substrateRaw =
+    commentResponse?.substrate ??
+    routingDecision?.substrate ??
+    null;
+  const substrate = substrateRaw ? String(substrateRaw).split('/').pop() : null;
+
+  // Timing chips.
+  const classMs = commentResponse?.class_ms ?? routingDecision?.classify_ms;
+  const ttsMs = commentResponse?.tts_ms;
+  const lipMs = commentResponse?.lipsync_ms;
+  const totalMs = commentResponse?.total_ms;
+
+  // Draft response (Gemma's 1-sentence) — surfaces what the avatar will
+  // SAY before TTS even runs. Useful debug for "wait, why did Maya say
+  // that?" moments. Truncate to keep the HUD compact.
+  const draft = routingDecision?.draft_response;
+
+  return (
+    <div style={styles.gemmaHud}>
+      <div style={styles.gemmaRow}>
+        <span style={styles.gemmaTier}>GEMMA</span>
+        <span style={{
+          ...styles.gemmaBadge,
+          background: palette.bg,
+          color: palette.fg,
+        }}>
+          {palette.label}
+        </span>
+        {!fromResp && (
+          <span style={styles.gemmaPending}>● rendering</span>
+        )}
+        {fromResp && totalMs != null && (
+          <span style={styles.gemmaTotal}>⚡ {(totalMs / 1000).toFixed(1)}s</span>
+        )}
+      </div>
+      {comment && (
+        <div style={styles.gemmaComment}>
+          <span style={styles.gemmaQuote}>"</span>
+          {comment.length > 60 ? comment.slice(0, 60) + '…' : comment}
+          <span style={styles.gemmaQuote}>"</span>
+        </div>
+      )}
+      {substrate && (
+        <div style={styles.gemmaMeta}>
+          <span style={styles.gemmaSubstrate}>📼 {substrate}</span>
+        </div>
+      )}
+      {draft && (
+        <div style={styles.gemmaMeta}>
+          <span style={styles.gemmaDraft}>
+            draft → "{draft.length > 80 ? draft.slice(0, 80) + '…' : draft}"
+          </span>
+        </div>
+      )}
+      {(classMs != null || ttsMs != null || lipMs != null) && (
+        <div style={styles.gemmaTimings}>
+          {classMs != null && <span>class {classMs}ms</span>}
+          {ttsMs != null && <span>· tts {ttsMs}ms</span>}
+          {lipMs != null && <span>· lip {lipMs}ms</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -301,6 +467,87 @@ const styles = {
     fontWeight: 800, color: '#fbbf24', fontSize: 9,
     background: 'rgba(146,64,14,0.4)',
     padding: '1px 4px', borderRadius: 3, letterSpacing: 1,
+  },
+  // Bottom-left floating chat dock — invisible container. The
+  // ChatPanel's children (message bubbles, preset chips, input pill)
+  // each carry their own translucent backdrop; the dock itself has NO
+  // background, border, or shadow so they read as floating directly
+  // over the stage video à la TikTok Live. Sized to give the chips +
+  // input enough horizontal room without crowding the centered avatar.
+  chatDock: {
+    position: 'fixed', bottom: 14, left: 14, zIndex: 70,
+    width: 340, height: 460, maxHeight: '70vh',
+    background: 'transparent',
+    border: 'none',
+    boxShadow: 'none',
+    overflow: 'visible',
+    display: 'flex',
+  },
+  // Gemma decision HUD — sits just under the clip HUD in the same
+  // top-left stack. Slightly wider than the clip rows because it
+  // surfaces the comment text + the substrate filename, both of which
+  // need horizontal room. Always rendered (even when empty) so its
+  // position never jumps — the empty state is just dimmed.
+  gemmaHud: {
+    position: 'fixed', top: 70, left: 14, zIndex: 80,
+    display: 'flex', flexDirection: 'column', gap: 4,
+    background: 'rgba(15,15,18,0.88)',
+    backdropFilter: 'blur(10px)',
+    border: '1px solid #27272a',
+    borderRadius: 8, padding: '6px 8px',
+    minWidth: 320, maxWidth: 380,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontSize: 10, lineHeight: 1.3,
+    pointerEvents: 'none',
+  },
+  gemmaRow: {
+    display: 'flex', alignItems: 'center', gap: 8,
+  },
+  gemmaTier: {
+    fontWeight: 800, color: '#a1a1aa', letterSpacing: 1,
+    minWidth: 38,
+  },
+  gemmaBadge: {
+    fontWeight: 900, fontSize: 10, letterSpacing: 1.2,
+    padding: '2px 6px', borderRadius: 4,
+  },
+  gemmaPending: {
+    color: '#fbbf24', fontWeight: 700, fontSize: 9,
+    letterSpacing: 0.5,
+    animation: 'pulse 1.4s ease-in-out infinite',
+  },
+  gemmaTotal: {
+    color: '#22c55e', fontWeight: 700, fontSize: 10,
+    marginLeft: 'auto',
+  },
+  gemmaIdle: {
+    color: '#52525b', fontStyle: 'italic',
+  },
+  gemmaComment: {
+    color: '#fafafa', fontSize: 11, fontStyle: 'italic',
+    paddingLeft: 4,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  gemmaQuote: {
+    color: '#52525b', fontWeight: 900,
+  },
+  gemmaMeta: {
+    display: 'flex', gap: 6, alignItems: 'center',
+    paddingLeft: 4,
+    color: '#a1a1aa',
+  },
+  gemmaSubstrate: {
+    fontWeight: 700,
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  gemmaDraft: {
+    color: '#71717a', fontSize: 9, fontStyle: 'italic',
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  },
+  gemmaTimings: {
+    display: 'flex', gap: 4,
+    color: '#71717a', fontSize: 9,
+    paddingLeft: 4,
   },
   // Pre-upload state — centered drop affordance over a black canvas.
   // Intentionally minimal: one icon, one prompt line, one tiny tech-stack

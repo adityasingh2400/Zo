@@ -169,8 +169,22 @@ def _load_products() -> None:
     if initial not in products:
         logger.warning("ACTIVE_PRODUCT_ID=%s not in products.json — falling back", initial)
         initial = next(iter(products.keys()))
-    _set_active_product(initial)
-    logger.info("[products] Loaded %d products: %s", len(products), list(products.keys()))
+    # Set active_product_id ONLY — do NOT seed product_data from the
+    # catalog. The previous behaviour (calling _set_active_product here)
+    # left "Minimal Leather Wallet" as the visible product on every
+    # backend boot, so a dashboard refresh before any upload would flash
+    # the wallet stub. product_data is now reserved for "the product
+    # currently being pitched" and only fills when:
+    #   1. An upload pipeline completes (Gemma analyze writes it), OR
+    #   2. The operator explicitly POSTs /api/state/active_product
+    # The catalog itself + active_product_id are still loaded so the
+    # qa_index keyword router can match a comment to the seeded product
+    # when the operator does opt in via the explicit switch endpoint.
+    pipeline_state["active_product_id"] = initial
+    qa_count = len(products[initial].get("qa_index") or {})
+    logger.info('[products] Loaded %d products: %s — initial active_id=%s '
+                '(%d Q/A); product_data unseeded until first upload',
+                len(products), list(products.keys()), initial, qa_count)
 
 
 def _load_avatars() -> None:
@@ -260,6 +274,104 @@ async def broadcast_to_dashboards(msg: dict):
 
 # ── App ────────────────────────────────────────────────
 
+async def _prewarm_pod_substrates() -> None:
+    """Hit the Wav2Lip pod's /prewarm endpoint for every substrate the
+    live pipeline uses, so face-detect cache is hot from the moment the
+    operator's first upload lands.
+
+    Substrates split into two tiers:
+      • PITCH SUBSTRATES — Maya's idle-pose speaking variants. Used by
+        the pitch render path (POD_SPEAKING_1080P + the per-Tier 0
+        substrate the Director picks based on the visible idle clip).
+        Critical for the upload-to-pitch ≤22 s budget — without prewarm
+        the first pitch's Wav2Lip runs cold (~12-15 s face-detect on
+        top of ~6 s render = ~18-21 s for that single stage).
+      • COMMENT BRIDGES — the 30 intent-bucket clips at /workspace/
+        bridges/<intent>/. Already prewarmed via the manual
+        prewarm_bridge_caches.sh script, but re-running here covers the
+        case where the pod restarts between sessions and the bash
+        script wasn't run.
+
+    Out_height=1920 matches what render_comment_response_wav2lip uses
+    (the comment path) AND the dispatch_audio_first_pitch loop. Cache
+    keys are (path, out_height) so we MUST prewarm at the same height
+    we render at — otherwise prewarm wastes pod cycles building a cache
+    entry the live path never hits.
+
+    Sequential (not parallel) because the pod's RENDER_LOCK serializes
+    /prewarm calls and parallel curls just cause connection contention.
+    Total wall time: ~30-90 s on a fully cold pod, sub-3 s when the
+    cache is mostly warm already (each prewarm returns in <1 s on hit).
+    All non-fatal: a tunnel hiccup just means the live path pays the
+    cold cost on first call, which is the pre-fix behaviour.
+    """
+    # Wait briefly for the SSH tunnel + pod to settle before hammering
+    # /prewarm. The tunnel keepalive (keep_tunnels_alive.sh) reopens
+    # within ~3 s after a drop; giving it a head-start avoids the first
+    # five prewarms failing with ConnectError and then succeeding.
+    await asyncio.sleep(3.0)
+
+    pitch_substrates = [
+        "/workspace/state_pitching_pose_speaking_1080p.mp4",  # POD_SPEAKING_1080P default
+        "/workspace/idle_speaking/idle_calm_speaking.mp4",     # most-used pitch substrate
+        "/workspace/idle_speaking/idle_thinking_speaking.mp4",
+        "/workspace/idle_speaking/idle_reading_comments_speaking.mp4",
+        "/workspace/idle_speaking/misc_hair_touch_speaking.mp4",
+    ]
+    bridge_substrates = []
+    bridges_dir = Path(__file__).resolve().parent.parent / "phase0" / "assets" / "bridges"
+    for intent in ("compliment", "objection", "question", "intro"):
+        intent_dir = bridges_dir / intent
+        if intent_dir.is_dir():
+            for f in sorted(intent_dir.glob("*.mp4")):
+                bridge_substrates.append(f"/workspace/bridges/{intent}/{f.name}")
+
+    all_substrates = pitch_substrates + bridge_substrates
+    logger.info("[prewarm] starting pod-substrate face-cache warmup "
+                "(%d pitch + %d bridge = %d total, out_height=1920)",
+                len(pitch_substrates), len(bridge_substrates), len(all_substrates))
+
+    import httpx
+    from config import WAV2LIP_URL  # local import — avoids top-of-file circular pull
+
+    t_total = time.perf_counter()
+    warmed = 0
+    skipped = 0
+    failed = 0
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for path in all_substrates:
+            try:
+                r = await client.post(
+                    f"{WAV2LIP_URL}/prewarm",
+                    json={"path": path, "out_height": 1920},
+                )
+                if r.status_code == 200:
+                    warmed += 1
+                elif r.status_code == 404:
+                    # Substrate file not present on pod — log once and
+                    # continue. Likely upload_bridge_clips.sh wasn't run
+                    # for this pod, or the path constant drifted.
+                    logger.warning("[prewarm] 404 %s — skipping", path)
+                    skipped += 1
+                else:
+                    logger.warning("[prewarm] HTTP %d %s", r.status_code, path)
+                    failed += 1
+            except Exception as e:
+                # Tunnel hiccup or pod overload — log + move on. The
+                # affected substrate just pays cold cost on first live use.
+                logger.warning("[prewarm] failed %s (%s) — live path will be cold",
+                               path, type(e).__name__)
+                failed += 1
+            # Brief pause between calls so the pod's RENDER_LOCK can
+            # release before the next prewarm grabs it. Without this the
+            # tunnel sees back-to-back POSTs and races its own connection
+            # reuse, which manifests as ConnectError on attempt 2+.
+            await asyncio.sleep(0.25)
+    t_elapsed = int((time.perf_counter() - t_total) * 1000)
+    logger.info("[prewarm] complete in %dms: %d warmed, %d skipped, %d failed",
+                t_elapsed, warmed, skipped, failed)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global director, hands
@@ -297,6 +409,15 @@ async def lifespan(app: FastAPI):
         _aio.create_task(prewarm_rembg("u2net"))
     except Exception as e:
         logger.warning("rembg prewarm scheduling failed: %s", e)
+
+    # Pre-warm the Wav2Lip pod's face-detect cache for the substrates the
+    # pipeline ACTUALLY uses, so the first comment + first pitch render
+    # don't pay the cold ~12-15s face-detect cost. Without this every
+    # backend restart resets the user-visible timing back to 25-30s on
+    # the first run; with it the first run matches the warm steady-state
+    # of 6-8s. Fire-and-forget so backend startup isn't blocked on the
+    # ~5-10s prewarm.
+    asyncio.create_task(_prewarm_pod_substrates())
 
     # Load demo products + pre-select an active one for respond_locally so
     # the router can answer routine questions without any prior /api/sell
@@ -865,14 +986,39 @@ async def _play_upload_bridge() -> None:
     (~7 s vs ~12 s), so without this clear the operator sees the new
     product's frames + the old product's name simultaneously.
     """
-    pipeline_state["product_data"] = None
-    pipeline_state["pitch_video_url"] = None
-    pipeline_state["product_clean_b64"] = None
-    pipeline_state["last_response_text"] = None
+    # FULL state reset — every field touched by the previous upload's
+    # pipeline gets cleared so a fresh drop never inherits stale data.
+    # The user's complaint (and the demo-correctness invariant): "the
+    # carousel says 'wallet' for a moment then loads the watch" —
+    # caused by stale view_3d / product_data leaking. Same risk for
+    # seller_transcript (used by comment dispatch — would let Gemma
+    # quote yesterday's product in today's responses), sales_script,
+    # the 3D model URL, etc. Clear them ALL at the route boundary so
+    # the in-memory state matches the on-screen "fresh upload" promise.
+    for k in (
+        "product_data",          # Gemma analyze output
+        "product_photo_b64",     # raw product frame stash
+        "product_clean_b64",     # rembg'd product PNG
+        "sales_script",          # Gemma-generated pitch text
+        "pitch_video_url",       # rendered pitch mp4 URL
+        "view_3d",               # carousel/heroes payload (root cause of wallet-flash)
+        "model_3d",              # TripoSR .glb result
+        "seller_transcript",     # Deepgram pitch transcript
+        "transcript_extract",    # on-device structured pitch hints
+        "last_response_text",    # most recent comment fallback text
+    ):
+        pipeline_state[k] = None
+    pipeline_state["agent_log"] = []
     try:
+        # Push the cleared product/view state to all dashboards so the
+        # UI doesn't show prior product info during the new pipeline's
+        # processing window. WS clients merge null → empty, which gates
+        # display in TikTokShopOverlay / Spin3D / HeroSlideshow.
         await broadcast_to_dashboards({"type": "product_data", "data": None})
+        await broadcast_to_dashboards({"type": "view_3d", "data": None})
+        await broadcast_to_dashboards({"type": "sales_script", "script": None})
     except Exception:
-        logger.exception("[route] product_data clear broadcast failed (non-fatal)")
+        logger.exception("[route] state clear broadcast failed (non-fatal)")
     if not director:
         return
     try:
@@ -2063,17 +2209,28 @@ async def run_routed_comment(comment: str) -> dict:
 
     # 1. Classify (on-device Gemma 4). Never raises — returns a dict with
     #    at least {type, source} even on fallback. Safe to await here.
-    # Pass product + transcript context so Gemma's draft is grounded in
-    # what the seller actually said + what the product actually is.
-    # Without these the prompt is just the comment string in isolation
-    # and Gemma defaults to generic fallbacks for anything it doesn't
-    # recognise. Both are pulled from pipeline_state — set by the sell
-    # video pipeline and the catalog default loader respectively.
-    classify = await classify_comment_gemma(
-        comment,
-        product=pipeline_state.get("product_data"),
-        transcript=pipeline_state.get("seller_transcript"),
-    )
+    # SKIP Gemma classify for comments by default. On this hardware
+    # (M3 Pro, no model.mlpackage) Gemma's CPU prefill at ~2.5 tok/s
+    # turns a 100-200-token classify prompt into a 10-15 s blocking
+    # call — single-handedly blowing the comment latency budget
+    # (target 6 s end-to-end). The rule-based router uses keyword cues
+    # (compliment / objection / spam) to assign intent_hint without
+    # Gemma; for anything not caught by the cue lists, "question" is
+    # the safe default and the bridge picker handles it correctly.
+    # Re-enable Gemma's per-comment classification (with the new
+    # product+transcript context) by exporting
+    # EMPIRE_GEMMA_CLASSIFY_COMMENTS=1 once model.mlpackage lands and
+    # classify drops to <200 ms. Pitch generation still uses Gemma —
+    # that path is async to the user-facing latency.
+    if os.getenv("EMPIRE_GEMMA_CLASSIFY_COMMENTS") == "1":
+        classify = await classify_comment_gemma(
+            comment,
+            product=pipeline_state.get("product_data"),
+            transcript=pipeline_state.get("seller_transcript"),
+        )
+    else:
+        classify = {"type": "question", "source": "skipped",
+                    "latency_ms": 0, "draft_response": ""}
 
     # 2. Decide.
     decision = await comment_router.decide(comment, classify, product)
@@ -2163,7 +2320,16 @@ async def _run_bridge_with_wav2lip(comment: str, classify: dict, decision: dict)
     even when the bridge upload is stale or the pod's face cache is
     inaccessible.
     """
-    intent = (classify.get("type") or "").lower().strip() or "question"
+    # Intent priority: the router's intent_hint wins (it covers the
+    # cue-list overrides — e.g. comment classified as "question" but
+    # the cue list flagged "love" → intent_hint=compliment). Falls back
+    # to classify.type, then "question" as a safe default that maps to
+    # the question bridge bucket.
+    intent = (
+        decision.get("args", {}).get("intent_hint")
+        or classify.get("type")
+        or "question"
+    ).lower().strip()
     draft = (classify.get("draft_response") or "").strip()
 
     # 1. Pick substrate. None ⇒ default speaking pose (safe path).
@@ -2203,11 +2369,19 @@ async def _run_bridge_with_wav2lip(comment: str, classify: dict, decision: dict)
         text_ms = 0
     else:
         try:
+            # Pass the seller's pitch transcript so Claude grounds its
+            # reply in what the audience actually heard ("you mentioned
+            # same-day shipping…") instead of inventing details. Same
+            # context Gemma gets when EMPIRE_GEMMA_CLASSIFY_COMMENTS=1.
             response_text = await generate_comment_response(
-                comment, pipeline_state.get("product_data") or {}, intent)
-            text_source = "claude_fallback"
+                comment,
+                pipeline_state.get("product_data") or {},
+                intent,
+                transcript=pipeline_state.get("seller_transcript"),
+            )
+            text_source = "claude_primary"
         except Exception as e:
-            logger.warning("[bridge_wav2lip] Claude fallback failed: %s — using stock", e)
+            logger.warning("[bridge_wav2lip] Claude draft failed: %s — using stock", e)
             response_text = "Let me come back to that one."
             text_source = "stock"
         text_ms = int((time.time() - text_t0) * 1000)

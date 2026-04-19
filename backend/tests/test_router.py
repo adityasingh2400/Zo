@@ -54,45 +54,59 @@ def _decide(comment: str, classify_type: str = "question", product=WALLET) -> di
 
 
 @pytest.mark.parametrize(
-    "comment,classify_type,expected_tool",
+    "comment,classify_type,expected_tool,expected_intent",
     [
-        # respond_locally: all three local Q&A keys.
-        ("is it real leather",              "question",   "respond_locally"),
-        ("how much does this cost",         "question",   "respond_locally"),
-        ("what's your return policy",       "question",   "respond_locally"),
-        # escalate_to_cloud: question we can't answer locally.
-        ("how does this compare to the Apple Watch", "question", "escalate_to_cloud"),
-        ("do you ship to Mars",             "question",   "escalate_to_cloud"),
-        # play_canned_clip: compliments + objections.
-        ("I love this wallet",              "compliment", "play_canned_clip"),
-        ("this is amazing",                 "compliment", "play_canned_clip"),
-        ("this is overpriced",              "objection",  "play_canned_clip"),
-        ("feels cheap to me",               "objection",  "play_canned_clip"),
+        # respond_locally: matched product Q&A keys (any classify type —
+        # the local-match check now runs BEFORE intent-based routing so
+        # price / shipping / sizing always hit the sub-300 ms path).
+        ("is it real leather",              "question",   "respond_locally", None),
+        ("how much does this cost",         "question",   "respond_locally", None),
+        ("what's your return policy",       "question",   "respond_locally", None),
+        # escalate_to_cloud (= bridge+wav2lip): everything non-spam,
+        # non-locally-matched. Compliments + objections now also flow
+        # here per the avatar choreography spec — the dispatcher's
+        # _run_bridge_with_wav2lip lip-syncs Gemma's draft response onto
+        # the intent-specific bridge clip as substrate. The intent_hint
+        # arg lets the dispatcher pick the right bucket.
+        ("how does this compare to the Apple Watch", "question",  "escalate_to_cloud", "question"),
+        ("do you ship to Mars",                       "question",  "escalate_to_cloud", "question"),
+        ("I love this wallet",                        "compliment","escalate_to_cloud", "compliment"),
+        ("this is amazing",                           "compliment","escalate_to_cloud", "compliment"),
+        ("this is overpriced",                        "objection", "escalate_to_cloud", "objection"),
+        ("feels cheap to me",                         "objection", "escalate_to_cloud", "objection"),
         # block_comment: Gemma classified as spam OR URL / promo cue.
-        ("buy followers at sketchy.site/promo", "spam",    "block_comment"),
-        ("free money https://scam.com",     "question",   "block_comment"),
-        ("check out my link",               "question",   "block_comment"),
+        ("buy followers at sketchy.site/promo", "spam",    "block_comment", None),
+        ("free money https://scam.com",     "question",   "block_comment", None),
+        ("check out my link",               "question",   "block_comment", None),
     ],
 )
-def test_four_tool_dispatch(comment, classify_type, expected_tool):
+def test_four_tool_dispatch(comment, classify_type, expected_tool, expected_intent):
     decision = _decide(comment, classify_type)
     assert decision["tool"] == expected_tool, (
         f"Expected {expected_tool!r} for {comment!r} (classify={classify_type!r}), "
         f"got {decision['tool']!r} — reason: {decision.get('reason')}"
     )
+    if expected_intent is not None:
+        assert decision["args"].get("intent_hint") == expected_intent, (
+            f"Expected intent_hint={expected_intent!r}, "
+            f"got {decision['args'].get('intent_hint')!r}"
+        )
 
 
 # ── Emoji-only compliments — word-tokenizer strips emoji, so we check the
-# raw-string emoji cue list. Regression target: "❤️" alone got escalated
-# before this was added.
+# raw-string emoji cue list. Regression target: "❤️" alone used to get
+# escalated as a generic question. Now they correctly route to
+# escalate_to_cloud with intent_hint=compliment so the dispatcher fires
+# a compliment-bucket bridge clip.
 
 
 @pytest.mark.parametrize("comment", ["❤️", "this is amazing 🔥", "😍"])
-def test_emoji_compliments_stay_local(comment):
+def test_emoji_compliments_route_as_compliment(comment):
     # Pass classify=question so we're forcing the emoji cue to win, not
     # piggybacking off Gemma's compliment classification.
     decision = _decide(comment, classify_type="question")
-    assert decision["tool"] == "play_canned_clip"
+    assert decision["tool"] == "escalate_to_cloud"
+    assert decision["args"].get("intent_hint") == "compliment"
 
 
 # ── "return" must match only when it's about the product, not when the

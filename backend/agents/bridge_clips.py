@@ -231,6 +231,64 @@ def all_bridges() -> dict[str, list[dict[str, Any]]]:
     return load_manifest()
 
 
+# ── Wav2Lip substrate picker (raw 8s gesture clips) ─────────────────────────
+#
+# The functions above (load_manifest / pick_bridge_clip) serve PRE-RENDERED
+# bridge clips with audio baked in — used as standalone "great question..."
+# acknowledgements that play once and end.
+#
+# This picker is the substrate side of the new comment dispatch path
+# (_run_bridge_with_wav2lip in main.py): the 8s raw bridge clips at
+# phase0/assets/bridges/<intent>/ are uploaded to the pod (via
+# phase0/scripts/upload_bridge_clips.sh) and used as the SOURCE VIDEO
+# for Wav2Lip's /lipsync_fast endpoint. The seller comments draft from
+# Gemma + ElevenLabs TTS produces the audio; Wav2Lip lip-syncs the
+# audio onto the gesture clip so the avatar visibly does an
+# intent-appropriate gesture WHILE speaking the response. Lip warble
+# is acceptable — the intent-specific body language matters more than
+# perfect mouth alignment for a livestream comment.
+#
+# Pod-side path matches the upload script exactly:
+#   /workspace/bridges/<intent>/<file>.mp4
+# Dashboard URL is served by the /bridges static mount in main.py:
+#   /bridges/<intent>/<file>.mp4
+SUBSTRATES_DIR = (Path(__file__).resolve().parent.parent.parent
+                  / "phase0" / "assets" / "bridges")
+SUBSTRATE_POD_PREFIX = "/workspace/bridges"
+
+
+def pick_intent_substrate(intent: str) -> dict[str, Any] | None:
+    """Pick a random raw bridge clip for `intent` to use as a Wav2Lip
+    substrate. Returns dict with `intent`, `file` (local fs path),
+    `url` (dashboard mount), and `pod_path` (Wav2Lip /lipsync_fast
+    source_path), or None if the intent bucket has no clips on disk.
+
+    Caller should treat None as "fall back to the default speaking-pose
+    substrate" (POD_SPEAKING_1080P). Spam comments shouldn't be routed
+    here — they're filtered earlier into block_comment.
+
+    Intents are the same labels Gemma's classify_comment_gemma returns:
+    `compliment` | `objection` | `question`. The classifier never returns
+    `neutral` today but the bucket structure supports it if added later.
+    `spam` returns None by design (caller blocks)."""
+    if not intent or intent == "spam":
+        return None
+    intent_dir = SUBSTRATES_DIR / intent
+    if not intent_dir.is_dir():
+        return None
+    candidates = sorted(intent_dir.glob("*.mp4"))
+    if not candidates:
+        return None
+    pick = random.choice(candidates)
+    name = pick.name
+    return {
+        "intent": intent,
+        "file": str(pick),
+        "url": f"/bridges/{intent}/{name}",
+        "pod_path": f"{SUBSTRATE_POD_PREFIX}/{intent}/{name}",
+    }
+
+
 # ── Pre-render workflow ──────────────────────────────────────────────────────
 
 

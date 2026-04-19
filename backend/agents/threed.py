@@ -363,31 +363,14 @@ async def carousel_from_video(
     out_dir = SPIN_DIR / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Cache hit: every output frame already exists for this video hash.
-    cached = sorted(p for p in out_dir.glob("[0-9]*.png"))
-    cached_heroes = sorted(p.name for p in out_dir.glob("hero_*.png"))
-    cached_raw_heroes = sorted(p.name for p in out_dir.glob("hero_*_raw.jpg"))
-    # Treat the cache as STALE if raw_heroes are missing — they were added
-    # in a later commit and older cached carousels don't have them.
-    # Re-triggering carousel build (~7s cold) is the right call so the
-    # user's slideshow shows real-background images.
-    needs_raw_heroes_rebuild = (
-        n_heroes > 0 and len(cached_heroes) > 0 and len(cached_raw_heroes) == 0
-    )
-    if needs_raw_heroes_rebuild:
-        logger.info("carousel cache stale (raw_heroes missing) for %s — rebuilding", slug)
-    if len(cached) >= n_frames and not needs_raw_heroes_rebuild:
-        urls = [f"/renders/spin/{slug}/{p.name}" for p in cached[:n_frames]]
-        hero_urls = [f"/renders/spin/{slug}/{name}" for name in cached_heroes]
-        raw_hero_urls = [f"/renders/spin/{slug}/{name}" for name in cached_raw_heroes]
-        ms = int((time.perf_counter() - t_all) * 1000)
-        logger.info("carousel cache hit: %s (%d frames, %d heroes, %d raw, %dms)",
-                    slug, len(urls), len(hero_urls), len(raw_hero_urls), ms)
-        return {
-            "kind": "frame_carousel", "frames": urls, "heroes": hero_urls,
-            "raw_heroes": raw_hero_urls,
-            "ms": ms, "source": "video", "slug": slug, "cached": True,
-        }
+    # CACHE INTENTIONALLY DISABLED. Every upload rebuilds the carousel from
+    # scratch so demo timings reflect real cold-start cost — there is no
+    # cache during a live stream where every product the operator drops is
+    # genuinely new. Re-enabling for dev iteration would just make us lie
+    # to ourselves about latency. Output files still get written to
+    # SPIN_DIR/<slug>/ so the previous run's frames are inspectable; we
+    # just don't short-circuit on them. To restore the old behaviour,
+    # restore the cache-hit early-return that used to live here (git blame).
 
     # 1. Extract 3x candidates so we can drop blurry / motion-corrupt shots.
     # Effective duration accounts for head/tail trim — fps is computed
@@ -758,8 +741,12 @@ async def glb_from_image(image_b64: str) -> dict[str, Any]:
     slug = hashlib.sha256(img_bytes).hexdigest()[:10]
     out_path = RENDER_DIR / f"model_{slug}.glb"
 
-    if out_path.exists():
-        return {"kind": "glb", "url": f"/renders/{out_path.name}", "ms": 0, "source": "triposr", "cached": True}
+    # CACHE INTENTIONALLY DISABLED — same rationale as the carousel cache
+    # in spin_from_video(): every demo upload is a brand-new product, so
+    # short-circuiting on a stale .glb hides real cold-start cost. The
+    # write below still overwrites the prior file at this slug; we just
+    # don't skip the render. Restore the `if out_path.exists(): return`
+    # short-circuit here to bring caching back for dev iteration.
 
     t0 = time.perf_counter()
     try:

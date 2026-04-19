@@ -92,24 +92,41 @@ If product_data is sparse or generic (e.g. just "{{name: backpack, category: bag
 
 
 async def generate_comment_response(
-    comment: str, product_data: dict, comment_type: str = "question"
+    comment: str,
+    product_data: dict,
+    comment_type: str = "question",
+    transcript: str | None = None,
 ) -> str:
     """Generate a natural response to a viewer comment via Claude on Bedrock.
+
+    `transcript` is the seller's pitch narration captured by Deepgram
+    during intake — gives Claude the same audio context the audience
+    just heard so replies can quote it ("you mentioned same-day
+    shipping — yes, ships in 24 h") instead of inventing details.
+    Optional so legacy callers stay compatible.
+
     Guarded by BEDROCK_USD_PER_MIN_CAP — if the rolling 1-min spend would
     exceed it, returns a graceful placeholder instead of placing the call."""
     if not _spend.check("bedrock", _spend.EST_BEDROCK_COMMENT_RESPONSE_USD):
         return "Hold on a sec — let me think about that one."
 
+    transcript_block = (
+        f'\nSeller said in pitch: "{transcript[:400]}"\n' if transcript else ""
+    )
+
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 60,
+        "max_tokens": 50,
         "messages": [{
             "role": "user",
             "content": f"""You are an AI sales avatar on a livestream.
-Viewer comment: "{comment}"
-Product: {json.dumps(product_data)[:400]}
 
-Reply in ONE short sentence (max 15 words). Spoken dialogue only.
+Product: {json.dumps(product_data)[:400]}{transcript_block}
+Viewer comment: "{comment}"
+
+Reply in ONE punchy sentence, MAX 10 words. Spoken dialogue only — Wav2Lip render time scales linearly with audio length, so brevity = sub-6s comment latency.
+- Quote the seller's pitch / product fields when the answer is in there.
+- If the answer wasn't covered (e.g., price never mentioned), admit it briefly ("price wasn't mentioned — I'll check").
 No preamble, no stage directions, no hedging like "Great question". Start with the answer.""",
         }],
     })
@@ -202,17 +219,23 @@ async def render_comment_response_wav2lip(
     files = {"audio": ("audio.mp3", audio_bytes, "audio/mpeg")}
     data = {"source_path": source_path_on_pod, "out_height": str(out_height)}
 
-    # Retry loop — Wav2Lip's pod streams the rendered mp4 mid-response, and
-    # SSH-tunnel buffer pressure / transient pod CPU spikes occasionally
-    # produce `RemoteProtocolError: peer closed connection without sending
-    # complete message body (received N bytes, expected M)`. The render
-    # itself usually completed — it's the wire transfer that broke. The
-    # second attempt typically hits the pod's face-detect cache (warm path)
-    # so it's both fast AND much more likely to succeed (no recompute, less
-    # pod CPU contention). Three attempts with linear backoff (2s/4s/6s)
-    # absorb the typical flake without making genuine pod-down failures
-    # take painfully long.
+    # Retry loop. Two failure classes:
+    #   1. Mid-response stream break (RemoteProtocolError after partial
+    #      bytes) — render usually completed, SSH tunnel buffer pressure
+    #      dropped the wire transfer. The second attempt hits the warm
+    #      face-detect cache so it's fast AND much more likely to land.
+    #   2. ConnectError on first request after idle — the SSH tunnel's
+    #      kept-alive connection is stale; httpx tries it, the pod sees
+    #      no SYN, fails immediately. Retry establishes a fresh conn.
+    #
+    # Tight backoff (0.4 s / 1.0 s) — the original 2s/4s/6s ladder was
+    # tuned for pod CPU recovery but most failures here are sub-second
+    # tunnel issues that resolve on the very next packet. 0.4 + 1.0 +
+    # success keeps worst-case overhead at ~1.5 s on top of one render
+    # cycle, dropping retry-tax from 6 s → 1.5 s while still giving the
+    # pod breathing room between attempts.
     MAX_ATTEMPTS = 3
+    BACKOFF_S = (0.4, 1.0)  # sleeps between attempts 1→2 and 2→3
     last_err: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -228,15 +251,12 @@ async def render_comment_response_wav2lip(
             return content, headers
         except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout,
                 httpx.ConnectError, httpx.WriteError) as e:
-            # Transient — pod stream broke / tunnel hiccup / connection
-            # reset. Worth retrying. Sleep briefly so we don't slam the
-            # pod immediately if it's recovering from a CPU spike.
             last_err = e
             if attempt == MAX_ATTEMPTS:
                 logger.error("[LIPSYNC] Wav2Lip exhausted %d attempts (last: %s: %s)",
                              MAX_ATTEMPTS, type(e).__name__, str(e)[:120])
                 break
-            wait_s = 2.0 * attempt
+            wait_s = BACKOFF_S[attempt - 1]
             logger.warning("[LIPSYNC] Wav2Lip attempt %d/%d failed (%s) — "
                            "retrying in %.1fs", attempt, MAX_ATTEMPTS,
                            type(e).__name__, wait_s)

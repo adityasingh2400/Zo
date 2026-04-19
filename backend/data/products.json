@@ -61,5 +61,58 @@
         "url": "/local_answers/wallet_rfid.mp4"
       }
     }
+  },
+  "minimalist_backpack": {
+    "name": "Minimalist Urban Backpack",
+    "price": "$149",
+    "category": "bags",
+    "materials": "cordura 1000D ballistic nylon",
+    "sizing": "18L · 17 in tall × 11 wide × 6 deep",
+    "shipping": "Free US shipping. $12 international.",
+    "returns": "30-day returns, no questions asked.",
+    "warranty": "lifetime warranty against defects.",
+    "target_audience": "commuters and one-bag travelers",
+    "qa_index": {
+      "price": {
+        "keywords": ["price", "cost", "how much", "dollars", "$"],
+        "text": "A hundred forty-nine dollars. Ships free in the US.",
+        "url": "/local_answers/backpack_price.mp4"
+      },
+      "material": {
+        "keywords": ["material", "fabric", "nylon", "waterproof"],
+        "text": "Cordura 1000D ballistic nylon. Water-resistant and basically indestructible.",
+        "url": "/local_answers/backpack_material.mp4"
+      },
+      "capacity": {
+        "keywords": ["capacity", "liters", "fit", "laptop", "hold"],
+        "text": "Eighteen liters. Fits a 16-inch laptop, a change of clothes, and a water bottle.",
+        "url": "/local_answers/backpack_capacity.mp4"
+      },
+      "sizing": {
+        "keywords": ["size", "sizing", "dimension", "big", "small"],
+        "text": "Seventeen inches tall, eleven wide, six deep. Carry-on legal on every major airline.",
+        "url": "/local_answers/backpack_sizing.mp4"
+      },
+      "weight": {
+        "keywords": ["weight", "heavy", "light", "pounds", "lbs"],
+        "text": "Two-point-one pounds empty. Feels like nothing on your back.",
+        "url": "/local_answers/backpack_weight.mp4"
+      },
+      "warranty": {
+        "keywords": ["warranty", "guarantee", "lifetime"],
+        "text": "Lifetime warranty. Anything breaks, we replace it.",
+        "url": "/local_answers/backpack_warranty.mp4"
+      },
+      "color": {
+        "keywords": ["color", "colors", "colour", "shade"],
+        "text": "Two right now — matte black and desert tan. More next season.",
+        "url": "/local_answers/backpack_colors.mp4"
+      },
+      "shipping": {
+        "keywords": ["ship", "shipping", "delivery", "arrive"],
+        "text": "Free US shipping, twelve bucks international, three to five days.",
+        "url": "/local_answers/backpack_shipping.mp4"
+      }
+    }
   }
 }

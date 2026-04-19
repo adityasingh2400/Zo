@@ -1,0 +1,65 @@
+{
+  "leather_wallet": {
+    "name": "Minimal Leather Wallet",
+    "price": "$49",
+    "category": "accessories",
+    "materials": "full-grain vegetable-tanned leather",
+    "sizing": "4.3 in × 3.1 in × 0.3 in",
+    "shipping": "Free US shipping. $8 international.",
+    "returns": "30-day returns, no questions asked.",
+    "warranty": "2-year craftsmanship warranty.",
+    "target_audience": "minimalists and design-conscious professionals",
+    "qa_index": {
+      "is_it_real_leather": {
+        "keywords": ["real leather", "genuine", "material", "leather"],
+        "text": "Yes — full-grain vegetable-tanned leather. The real thing.",
+        "url": "/local_answers/wallet_real_leather.mp4"
+      },
+      "how_does_it_ship": {
+        "keywords": ["ship", "shipping", "delivery", "arrive"],
+        "text": "Ships free in the US, and eight bucks international. Most orders land in three to five days.",
+        "url": "/local_answers/wallet_shipping.mp4"
+      },
+      "return_policy": {
+        "keywords": ["return it", "return policy", "refund", "exchange", "send it back", "returns"],
+        "text": "Thirty-day returns, no questions asked. Just message us.",
+        "url": "/local_answers/wallet_returns.mp4"
+      },
+      "warranty": {
+        "keywords": ["warranty", "guarantee", "last"],
+        "text": "Two-year craftsmanship warranty — if the stitching or hardware fails, we replace it.",
+        "url": "/local_answers/wallet_warranty.mp4"
+      },
+      "sizing": {
+        "keywords": ["size", "sizing", "dimension", "big", "small", "fit"],
+        "text": "Four-point-three inches wide, three-point-one tall, point-three thick. Fits a pocket without bulging.",
+        "url": "/local_answers/wallet_sizing.mp4"
+      },
+      "color": {
+        "keywords": ["color", "colors", "colour", "colours", "shade"],
+        "text": "Three colors right now — black, caramel, and deep oxblood. Caramel is the fan favorite.",
+        "url": "/local_answers/wallet_colors.mp4"
+      },
+      "price": {
+        "keywords": ["price", "cost", "how much", "dollars", "$"],
+        "text": "It's forty-nine dollars, and that includes shipping if you're in the States.",
+        "url": "/local_answers/wallet_price.mp4"
+      },
+      "card_capacity": {
+        "keywords": ["cards", "card", "slots", "hold", "capacity"],
+        "text": "Holds six cards comfortably, eight if you pack it. Plus a cash sleeve in the middle.",
+        "url": "/local_answers/wallet_cards.mp4"
+      },
+      "water_resistance": {
+        "keywords": ["water", "waterproof", "rain", "wet"],
+        "text": "Naturally water-resistant — vegetable-tanned leather beads up rain. Don't swim with it, but you'll be fine in a storm.",
+        "url": "/local_answers/wallet_water.mp4"
+      },
+      "rfid": {
+        "keywords": ["rfid", "blocking", "chip", "secure"],
+        "text": "Full RFID blocking on every card slot. Contactless skimmers get nothing.",
+        "url": "/local_answers/wallet_rfid.mp4"
+      }
+    }
+  }
+}

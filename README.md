@@ -398,3 +398,19 @@ pytest backend/tests/test_router.py -v
 - **Out of scope for the demo:** real TikTok Shop / Instagram Live integration (the chat panel simulates comments, the router itself is identical to what would feed a real platform integration). CLOSER agent (DM auto-responder). Generative photo variants. Multi-stream isolation.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) §"Not in scope today" for the full honest list.
+
+---
+
+## License
+
+Source-available, **not open source**. Licensed under the
+[PolyForm Noncommercial License 1.0.0](./LICENSE).
+
+- ✅ Personal use, research, education, evaluation, hobby projects.
+- ❌ Any commercial use — including building a competing product, internal
+  business use, hosting EMPIRE as a paid service, or training models on
+  this codebase for commercial purposes.
+
+For commercial licensing, contact the repo owner.
+
+Copyright 2026 Aditya Singh. All rights reserved.

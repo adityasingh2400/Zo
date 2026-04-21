@@ -30,10 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("empire")
 
-from agents import brain
+from agents import brain, translator
 from agents import router as comment_router
-from agents import translator
-from agents.hands import Hands
 from agents.avatar_director import Director
 from agents.bridge_clips import all_bridges, pick_bridge_clip, pick_intent_substrate
 from agents.creator import build_all as creator_build_all
@@ -46,6 +44,7 @@ from agents.eyes import (
     classify_comment_gemma,
     transcribe_voice,
 )
+from agents.hands import Hands
 from agents.intake import process_video
 from agents.router import _match_product_field  # used by speculative bridge
 from agents.seller import (
@@ -332,6 +331,7 @@ async def _prewarm_pod_substrates() -> None:
                 len(pitch_substrates), len(bridge_substrates), len(all_substrates))
 
     import httpx
+
     from config import WAV2LIP_URL  # local import — avoids top-of-file circular pull
 
     t_total = time.perf_counter()
@@ -1335,7 +1335,7 @@ async def phone_upload_ws(ws: WebSocket, session_id: str):
             "type": "phone_upload_failed",
             **phone_uploader.session_summary(session),
         })
-    except asyncio.TimeoutError:
+    except TimeoutError:
         session.status = "failed"
         session.error = "no start message within 30s"
         await broadcast_to_dashboards({

@@ -795,7 +795,7 @@ def _video_slug(video_path: str) -> str:
     return h.hexdigest()[:10]
 
 
-def _atomic_save_image(img: "Image.Image", out_path: Path, **save_kwargs) -> None:
+def _atomic_save_image(img: Image.Image, out_path: Path, **save_kwargs) -> None:
     """Save a PIL image atomically — write to a sibling .tmp file, then
     os.replace() into the destination. Critical for the carousel
     re-build pattern where the same path is overwritten on every

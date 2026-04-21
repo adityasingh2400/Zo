@@ -31,7 +31,7 @@ from pathlib import Path
 logger = logging.getLogger("empire.phone_uploader")
 
 SESSION_TTL_SECONDS = 600   # 10 min — long enough to scan-and-record at a leisurely pace
-_SESSIONS: dict[str, "PhoneSession"] = {}
+_SESSIONS: dict[str, PhoneSession] = {}
 
 
 @dataclass

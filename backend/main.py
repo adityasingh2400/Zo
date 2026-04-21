@@ -1,3 +1,8 @@
+# EMPIRE — backend orchestrator
+# Copyright 2026 Aditya Singh. All rights reserved.
+# Licensed under PolyForm Noncommercial 1.0.0 — see LICENSE and NOTICE at repo root.
+# COMMERCIAL USE FORBIDDEN without a separate written license from the copyright holder.
+
 import asyncio
 import base64
 import json

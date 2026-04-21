@@ -1,5 +1,16 @@
 # EMPIRE
 
+> ⚖️ **License: PolyForm Noncommercial 1.0.0 — Commercial use is FORBIDDEN.**
+> This is source-available, **not open source**. You may read, study, and use
+> this code for personal, educational, or research purposes only. Any
+> commercial use — including internal business use, hosted services, or
+> building competing products — requires a separate written license from
+> the copyright holder. See [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+>
+> Copyright 2026 Aditya Singh. All rights reserved.
+
+---
+
 **A 24/7 multilingual AI livestream-shopping seller, run end-to-end by Gemma 4 on Cactus.** Built at the Cactus × Google DeepMind × YC Gemma 4 Voice Agents hackathon.
 
 > Voice in → Gemma sees the product → Gemma writes the pitch → Gemma classifies every viewer comment → Gemma picks which pre-rendered clip to stitch in next. ~90% of comments never leave the laptop. $144/mo unit economics vs. ~$9,628/mo for an equivalent cloud + human team.

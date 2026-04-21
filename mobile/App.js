@@ -1,3 +1,8 @@
+// EMPIRE — mobile (phone capture client)
+// Copyright 2026 Aditya Singh. All rights reserved.
+// Licensed under PolyForm Noncommercial 1.0.0 — see LICENSE and NOTICE at repo root.
+// COMMERCIAL USE FORBIDDEN without a separate written license from the copyright holder.
+
 import React, { useState, useRef, useEffect } from 'react';
 import {
   StyleSheet, View, Text, TouchableOpacity, SafeAreaView, StatusBar, Alert,

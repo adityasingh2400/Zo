@@ -1,0 +1,35 @@
+EMPIRE
+Copyright 2026 Aditya Singh. All rights reserved.
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0.
+See the LICENSE file in the root of this repository for the full terms.
+
+============================================================================
+                            COMMERCIAL USE FORBIDDEN
+============================================================================
+
+You MAY:
+  - Read, study, and learn from this source code
+  - Run it locally for personal, educational, research, or evaluation use
+  - Modify it for any non-commercial purpose
+  - Redistribute it under the same terms
+
+You MAY NOT, without a separate written commercial license from the copyright
+holder:
+  - Use this software (in whole or in part) in any commercial product or service
+  - Use this software internally at any for-profit organization
+  - Host this software as a paid or revenue-generating service
+  - Build a competing product based on this software, this codebase, or
+    derivatives of it
+  - Train, fine-tune, or otherwise use this codebase as input to any model
+    intended for commercial deployment
+  - Re-license this software under any other license
+
+Any use beyond the permissions granted by the PolyForm Noncommercial License
+1.0.0 requires the express prior written consent of the copyright holder.
+
+To inquire about a commercial license, contact the repository owner via
+GitHub: https://github.com/adityasingh2400/Zo
+
+The copyright holder reserves all rights not expressly granted by the
+PolyForm Noncommercial License 1.0.0.

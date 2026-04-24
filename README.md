@@ -1,4 +1,4 @@
-# EMPIRE
+# Zo
 
 > ⚖️ **License: PolyForm Noncommercial 1.0.0 — Commercial use is FORBIDDEN.**
 > This is source-available, **not open source**. You may read, study, and use
